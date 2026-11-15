@@ -153,6 +153,9 @@ fn lookup(name: &str) -> Val {
     match name {
         "@" => return Val::List(pos_params(), false),
         "*" => return Val::List(pos_params(), true),
+        "LINENO" if !crate::shell::var_exists("LINENO") => {
+            return Val::Str(crate::shell::lineno().to_string())
+        }
         _ => {}
     }
     let resolved = crate::shell::resolve_ref(name);
@@ -533,15 +536,15 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
         '+' | '#' | '=' | '^' | '~'
             if chars
                 .get(i + 2)
-                .is_some_and(|&c| c == '_' || c.is_ascii_alphabetic()) =>
+                .is_some_and(|&c| crate::lexer::is_name_start(c)) =>
         {
             let end = name_with_subscript(chars, i + 2);
             expand_braced(&chars[i + 1..end], mode, ctx)?;
             Ok(end)
         }
-        c if c == '_' || c.is_ascii_alphabetic() => {
+        c if crate::lexer::is_name_start(c) => {
             let mut j = i + 1;
-            while j < n && (chars[j] == '_' || chars[j].is_ascii_alphanumeric()) {
+            while j < n && crate::lexer::is_name_char(chars[j]) {
                 j += 1;
             }
             // zsh: `$name[sub]` subscripts without braces.
@@ -588,7 +591,7 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
 // it when the brackets close.
 fn name_with_subscript(chars: &[char], i: usize) -> usize {
     let mut j = i;
-    while j < chars.len() && (chars[j] == '_' || chars[j].is_ascii_alphanumeric()) {
+    while j < chars.len() && crate::lexer::is_name_char(chars[j]) {
         j += 1;
     }
     if chars.get(j) != Some(&'[') {
@@ -619,9 +622,9 @@ fn name_with_subscript(chars: &[char], i: usize) -> usize {
 fn parse_param(body: &[char]) -> Option<(String, Option<String>, usize)> {
     let first = *body.first()?;
     let mut j;
-    if first == '_' || first.is_ascii_alphabetic() {
+    if crate::lexer::is_name_start(first) {
         j = 1;
-        while j < body.len() && (body[j] == '_' || body[j].is_ascii_alphanumeric()) {
+        while j < body.len() && crate::lexer::is_name_char(body[j]) {
             j += 1;
         }
     } else if first.is_ascii_digit() {
@@ -710,6 +713,8 @@ struct PFlags {
     nth: Option<String>,
     // (-): numeric sort of signed numbers.
     signed: bool,
+    // (Z:opts:) letters for (z) splitting.
+    zopts: String,
     // `${=name}`: split on IFS.
     ifs_split: bool,
     any: bool,
@@ -755,6 +760,10 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             'F' => f.join = Some("\n".into()),
             '0' => f.split = Some("\0".into()),
             'z' => f.zsplit = true,
+            'Z' => {
+                f.zsplit = true;
+                f.zopts = arg(&mut i)?;
+            }
             'q' => {
                 if matches!(body.get(i), Some('-' | '+')) {
                     f.quote_min = true;
@@ -941,16 +950,40 @@ fn apply_subscript(val: Val, sub: &str) -> ExpResult<Val> {
         let items = val_items(&val);
         return Ok(Val::List(items, sub == "*"));
     }
-    if let Some(v) = search_items(&val_items(&val), sub, is_list(&val))? {
-        return Ok(v);
-    }
-    let text = expand_string(sub)?;
-    let (a, b) = match find_unquoted(&text.chars().collect::<Vec<_>>(), ',') {
+    let list = is_list(&val);
+    let items = val_items(&val);
+    let subc: Vec<char> = sub.chars().collect();
+    let (first, second) = match top_comma(&subc) {
         Some(k) => (
-            ksh_index(eval_arith_str(&text[..k])?),
-            Some(ksh_index(eval_arith_str(&text[k + 1..])?)),
+            subc[..k].iter().collect::<String>(),
+            Some(subc[k + 1..].iter().collect::<String>()),
         ),
-        None => (ksh_index(eval_arith_str(&text)?), None),
+        None => (sub.to_string(), None),
+    };
+    // A search without a range gives the value or the index found.
+    if second.is_none() {
+        if let Some((f, word)) = parse_sub_flags(&first) {
+            if f.search() {
+                return search_single(&items, list, &f, word);
+            }
+        }
+    }
+    // (w) or (s:sep:) on a scalar without a search: words by number.
+    if let Some((f, rest)) = parse_sub_flags(&first).filter(|(f, _)| !list && f.word) {
+        let units = search_units(&items, false, &f).unwrap_or_default();
+        let a = ksh_index(eval_arith_str(&expand_string(rest)?)?);
+        let b = match &second {
+            Some(s) => ksh_index(eval_arith_str(&expand_string(s)?)?),
+            None => a,
+        };
+        let range = range_of(if a == 0 { 1 } else { a }, b, units.len());
+        let sep = f.sep.clone().unwrap_or_else(|| " ".to_string());
+        return Ok(Val::Str(units[range].join(&sep)));
+    }
+    let a = sub_index(&first, &items, list, false)?;
+    let b = match &second {
+        Some(s) => Some(sub_index(s, &items, list, true)?),
+        None => None,
     };
     Ok(match val {
         Val::Unset => Val::Unset,
@@ -989,58 +1022,339 @@ fn apply_subscript(val: Val, sub: &str) -> ExpResult<Val> {
     })
 }
 
-// zsh subscript flags on a list: `(i)`/`(I)` first/last matching index,
-// `(r)`/`(R)` first/last matching value, `(e)` literal match. None when
-// `sub` has no such flags.
-fn search_items(items: &[String], sub: &str, list: bool) -> ExpResult<Option<Val>> {
-    let Some((flags, word)) = search_flags(sub) else {
-        return Ok(None);
-    };
-    let hit = matcher(word, flags.contains('e'))?;
-    let last = flags.contains('I') || flags.contains('R');
-    let want_value = flags.contains('r') || flags.contains('R');
-    let items: Vec<String> = if list {
-        items.to_vec()
-    } else if flags.contains('w') {
-        // A scalar searched word by word.
-        items
-            .first()
-            .map(|s| s.split_whitespace().map(|w| w.to_string()).collect())
-            .unwrap_or_default()
-    } else {
-        // A scalar searches its characters.
-        items
-            .first()
-            .map(|s| s.chars().map(|c| c.to_string()).collect())
-            .unwrap_or_default()
-    };
-    let mut idx = items
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| hit(v))
-        .map(|(k, _)| k);
-    let found = if last { idx.next_back() } else { idx.next() };
-    Ok(Some(match (found, want_value) {
-        (Some(k), true) => Val::Str(items[k].clone()),
-        (None, true) => Val::Unset,
-        (Some(k), false) => Val::Str((k + usize::from(!ksh_arrays())).to_string()),
-        (None, false) => Val::Str(
-            if last {
-                0
-            } else {
-                items.len() + usize::from(!ksh_arrays())
-            }
-            .to_string(),
-        ),
-    }))
+// The `,` separating the two ends of a range, outside brackets,
+// parentheses, quotes and nested expansions.
+fn top_comma(c: &[char]) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '\\' => i += 1,
+            '\'' => i = scan_squote(c, i)?.saturating_sub(1),
+            '"' => i = scan_dquote(c, i)?.saturating_sub(1),
+            '$' if c.get(i + 1) == Some(&'{') => i = scan_brace(c, i + 1, false)?.saturating_sub(1),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
-fn search_flags(sub: &str) -> Option<(&str, &str)> {
+// Subscript flags (zsh's getarg): (r)/(R) value, (i)/(I) index searches,
+// (e) exact, (w)/(s:sep:) words, (k)/(K) keys, (n:N:) Nth match,
+// (b:N:) where to begin.
+#[derive(Default)]
+struct SubSearch {
+    letters: String,
+    rev: bool,
+    down: bool,
+    ind: bool,
+    exact: bool,
+    word: bool,
+    sep: Option<String>,
+    num: i64,
+    beg: Option<i64>,
+}
+
+impl SubSearch {
+    fn search(&self) -> bool {
+        self.rev
+    }
+}
+
+fn parse_sub_flags(sub: &str) -> Option<(SubSearch, &str)> {
     let rest = sub.strip_prefix('(')?;
-    let close = rest.find(')')?;
-    let flags = &rest[..close];
-    (!flags.is_empty() && flags.chars().all(|c| "iIrReEkKw".contains(c)))
-        .then(|| (flags, &rest[close + 1..]))
+    let chars: Vec<char> = rest.chars().collect();
+    let mut f = SubSearch {
+        num: 1,
+        ..SubSearch::default()
+    };
+    let mut i = 0;
+    let arg = |i: &mut usize| -> Option<String> {
+        let d = *chars.get(*i)?;
+        let close = closing_delim(d);
+        let end = (*i + 1..chars.len()).find(|&k| chars[k] == close)?;
+        let v: String = chars[*i + 1..end].iter().collect();
+        *i = end + 1;
+        Some(v)
+    };
+    while i < chars.len() && chars[i] != ')' {
+        let c = chars[i];
+        i += 1;
+        match c {
+            'r' | 'R' | 'i' | 'I' | 'k' | 'K' => {
+                f.rev = true;
+                f.down = c.is_ascii_uppercase();
+                f.ind = matches!(c, 'i' | 'I');
+            }
+            'e' => f.exact = true,
+            'w' => f.word = true,
+            'f' => {
+                f.word = true;
+                f.sep = Some("\n".into());
+            }
+            'p' => {}
+            's' => f.sep = Some(arg(&mut i)?),
+            'n' => {
+                let v = eval_arith_str(&arg(&mut i)?).ok()?;
+                f.num = if v == 0 { 1 } else { v };
+            }
+            'b' => {
+                let v = eval_arith_str(&arg(&mut i)?).ok()?;
+                f.beg = Some(if v > 0 { v - 1 } else { v });
+            }
+            _ => return None,
+        }
+        f.letters.push(c);
+    }
+    if i >= chars.len() || f.letters.is_empty() {
+        return None;
+    }
+    if f.num < 0 {
+        f.down = !f.down;
+        f.num = -f.num;
+    }
+    let close = rest.char_indices().nth(i).map(|(b, _)| b)?;
+    Some((f, &rest[close + 1..]))
+}
+
+// A subscript pattern: unlike other patterns, characters that come from
+// parameter values are active (zsh tokenizes the expanded subscript).
+fn subscript_pattern(word: &str) -> ExpResult<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let mut ctx = Ctx::new(false, false);
+    ctx.param_tag &= !NG;
+    ctx.subst_tag &= !NG;
+    walk(&chars, Mode::Unquoted, &mut ctx)?;
+    Ok(pattern_text(&ctx))
+}
+
+// Elements searched: the list, a scalar's words, or None for characters.
+fn search_units(items: &[String], list: bool, f: &SubSearch) -> Option<Vec<String>> {
+    if list {
+        return Some(items.to_vec());
+    }
+    if f.word {
+        let s = items.first().cloned().unwrap_or_default();
+        return Some(match &f.sep {
+            Some(sep) => s.split(sep.as_str()).map(|w| w.to_string()).collect(),
+            None => s.split_whitespace().map(|w| w.to_string()).collect(),
+        });
+    }
+    None
+}
+
+// The 1-based position the search finds among `units`; 0 or len+1 when
+// nothing matches (down or up).
+fn search_units_index(units: &[String], f: &SubSearch, hit: &dyn Fn(&str) -> bool) -> i64 {
+    let len = units.len() as i64;
+    let mut beg = f.beg.unwrap_or(0);
+    if beg < 0 {
+        beg += len;
+    }
+    if f.down {
+        if beg < 0 {
+            return 0;
+        }
+    } else if beg >= len {
+        return len + 1;
+    }
+    let mut num = f.num;
+    if beg >= 0 && beg < len {
+        if f.down {
+            let start = if f.beg.is_some() { beg } else { len - 1 };
+            for r in (0..=start).rev() {
+                if hit(&units[r as usize]) {
+                    num -= 1;
+                    if num == 0 {
+                        return r + 1;
+                    }
+                }
+            }
+        } else {
+            for r in beg..len {
+                if hit(&units[r as usize]) {
+                    num -= 1;
+                    if num == 0 {
+                        return r + 1;
+                    }
+                }
+            }
+        }
+    }
+    if f.down {
+        0
+    } else {
+        len + 1
+    }
+}
+
+// Searching a scalar's characters: the first end of a range matches
+// the pattern followed by anything at each position, the second the
+// text up to each position ending in the pattern. Positions are 1-based;
+// 0 or len+1 when nothing matches.
+fn search_chars(s: &str, f: &SubSearch, word: &str, a2: bool) -> ExpResult<i64> {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    let mut pat = if f.exact {
+        crate::pattern::escape(&expand_string(word)?)
+    } else {
+        subscript_pattern(word)?
+    };
+    if a2 {
+        if !pat.starts_with('*') {
+            pat.insert(0, '*');
+        }
+    } else if !pat.ends_with('*') || pat.ends_with("\\*") {
+        pat.push('*');
+    }
+    let p = crate::pattern::Pattern::new(&pat);
+    let mut beg = f.beg.unwrap_or(0);
+    if beg < 0 {
+        beg += len;
+    }
+    let miss = if f.down { 0 } else { len + 1 };
+    if !(0..len).contains(&beg) {
+        return Ok(miss);
+    }
+    let test = |t: usize| {
+        if a2 {
+            p.matches_chars(&chars[..t])
+        } else {
+            p.matches_chars(&chars[t..])
+        }
+    };
+    let mut num = f.num;
+    if f.down {
+        let last = if f.beg.is_some() { beg } else { len };
+        let found: Vec<usize> = (0..=last as usize)
+            .filter(|&t| t <= chars.len() && test(t))
+            .collect();
+        if found.len() as i64 >= num {
+            let t = found[found.len() - num as usize] as i64;
+            return Ok(if a2 { t } else { t + 1 });
+        }
+        return Ok(0);
+    }
+    for t in beg as usize..=chars.len() {
+        if test(t) {
+            num -= 1;
+            if num == 0 {
+                return Ok(if a2 { t as i64 } else { t as i64 + 1 });
+            }
+        }
+    }
+    Ok(miss)
+}
+
+// One end of a subscript: a search or an arithmetic index (1-based).
+fn sub_index(part: &str, items: &[String], list: bool, a2: bool) -> ExpResult<i64> {
+    if let Some((f, word)) = parse_sub_flags(part) {
+        if f.search() {
+            return match search_units(items, list, &f) {
+                Some(units) => {
+                    let hit = unit_matcher(word, f.exact)?;
+                    let r = search_units_index(&units, &f, &hit);
+                    Ok(if list {
+                        r
+                    } else {
+                        word_char_index(items, &units, r, a2)
+                    })
+                }
+                None => search_chars(&items.first().cloned().unwrap_or_default(), &f, word, a2),
+            };
+        }
+    }
+    let text = expand_string(part)?;
+    Ok(ksh_index(eval_arith_str(&text)?))
+}
+
+// (w) searches on a scalar give character positions: the first or last
+// character of the word found.
+fn word_char_index(items: &[String], units: &[String], r: i64, a2: bool) -> i64 {
+    let s = items.first().cloned().unwrap_or_default();
+    if r < 1 || r > units.len() as i64 {
+        return if r < 1 {
+            0
+        } else {
+            s.chars().count() as i64 + 1
+        };
+    }
+    let mut pos = 0;
+    let mut rest = s.as_str();
+    for (k, w) in units.iter().enumerate() {
+        let off = rest.find(w.as_str()).unwrap_or(0);
+        let start = pos + rest[..off].chars().count();
+        if k as i64 + 1 == r {
+            let n = w.chars().count();
+            return if a2 {
+                (start + n) as i64
+            } else {
+                start as i64 + 1
+            };
+        }
+        pos = start + w.chars().count();
+        rest = &rest[off + w.len()..];
+    }
+    0
+}
+
+fn unit_matcher(word: &str, exact: bool) -> ExpResult<impl Fn(&str) -> bool> {
+    let pat = if exact {
+        crate::pattern::escape(&expand_string(word)?)
+    } else {
+        subscript_pattern(word)?
+    };
+    let p = crate::pattern::Pattern::new(&pat);
+    Ok(move |v: &str| p.matches(v))
+}
+
+// A search subscript alone: the value found ((r)/(R)) or its index
+// ((i)/(I)).
+fn search_single(items: &[String], list: bool, f: &SubSearch, word: &str) -> ExpResult<Val> {
+    let r = match search_units(items, list, f) {
+        Some(units) => {
+            let hit = unit_matcher(word, f.exact)?;
+            let r = search_units_index(&units, f, &hit);
+            if !f.ind {
+                return Ok(
+                    match units.get((r - 1).max(0) as usize).filter(|_| r >= 1) {
+                        Some(v) if r as usize <= units.len() => Val::Str(v.clone()),
+                        _ => Val::Unset,
+                    },
+                );
+            }
+            if list {
+                r
+            } else {
+                word_char_index(items, &units, r, false)
+            }
+        }
+        None => {
+            let s = items.first().cloned().unwrap_or_default();
+            let r = search_chars(&s, f, word, false)?;
+            if !f.ind {
+                let chars: Vec<char> = s.chars().collect();
+                return Ok(if r >= 1 && r as usize <= chars.len() {
+                    Val::Str(chars[r as usize - 1].to_string())
+                } else {
+                    Val::Unset
+                });
+            }
+            r
+        }
+    };
+    // KSH_ARRAYS counts from 0; "not found" past the end stays.
+    let r = if ksh_arrays() && r > 0 { r - 1 } else { r };
+    Ok(Val::Str(r.to_string()))
+}
+
+fn search_flags(sub: &str) -> Option<(String, &str)> {
+    let (f, word) = parse_sub_flags(sub)?;
+    Some((f.letters, word))
 }
 
 // A leading `^` negates the pattern (zsh EXTENDED_GLOB).
@@ -1403,17 +1717,127 @@ fn unquote(s: &str) -> String {
 }
 
 // `(z)`: splits like the shell lexer, keeping quotes in the words.
-fn shell_words(s: &str) -> Vec<String> {
+// `(z)`: splits like the shell's lexer. `opts` are (Z) letters: `c`
+// keeps comments as words, `C` drops them, `n` treats newlines as
+// blanks. From a parse error on, the rest of the text is one word.
+fn shell_words(s: &str, opts: &str) -> Vec<String> {
+    use crate::lexer::Tok;
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let keep_comments = opts.contains('c');
+    let drop_comments = opts.contains('C');
+    let nl_blank = opts.contains('n');
     let mut lx = crate::lexer::Lexer::new(s, true);
-    let mut out = Vec::new();
+    lx.comments = false;
+    let mut out: Vec<String> = Vec::new();
+    let rest_from = |k: usize| -> String { chars[k..].iter().collect() };
+    // Unbalanced parentheses from `k` on: an unfinished `(`, `((` or `$(`.
+    let unbalanced = |k: usize| {
+        let mut depth = 0i32;
+        for &c in &chars[k..] {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+        }
+        depth > 0
+    };
     loop {
-        match lx.next_token() {
-            Ok(crate::lexer::Tok::Word(w)) => out.push(w),
-            Ok(crate::lexer::Tok::Op(o)) => out.push(o.to_string()),
-            Ok(crate::lexer::Tok::IoNumber(n)) => out.push(n.to_string()),
-            Ok(crate::lexer::Tok::Arith(e)) => out.push(format!("(({}))", e)),
-            Ok(crate::lexer::Tok::Newline) => out.push(";".to_string()),
-            Ok(crate::lexer::Tok::Eof) | Err(_) => break,
+        let mut p = lx.pos();
+        while p < n && (matches!(chars[p], ' ' | '\t') || (nl_blank && chars[p] == '\n')) {
+            p += 1;
+        }
+        lx.set_pos(p);
+        if p >= n {
+            break;
+        }
+        if chars[p] == '#' && (keep_comments || drop_comments) {
+            let mut e = p;
+            while e < n && chars[e] != '\n' {
+                e += 1;
+            }
+            if keep_comments {
+                out.push(chars[p..e].iter().collect());
+            }
+            lx.set_pos(e);
+            continue;
+        }
+        let tok = match lx.next_token() {
+            Ok(t) => t,
+            Err(_) => {
+                out.push(rest_from(p));
+                break;
+            }
+        };
+        match tok {
+            Tok::Eof => break,
+            Tok::Word(w) => {
+                // A command substitution that does not parse ends the split.
+                let bad_subst = w.find("$(").is_some_and(|k| {
+                    let wc: Vec<char> = w.chars().collect();
+                    let k = w[..k].chars().count();
+                    if wc.get(k + 2) == Some(&'(') {
+                        return false;
+                    }
+                    match crate::lexer::scan_paren(&wc, k + 1) {
+                        Some(end) => {
+                            let inner: String = wc[k + 2..end - 1].iter().collect();
+                            crate::parser::Parser::new(&inner, true)
+                                .parse_program()
+                                .is_err()
+                        }
+                        None => true,
+                    }
+                });
+                if bad_subst {
+                    out.push(rest_from(p));
+                    break;
+                }
+                // `name=(`: an array assignment starts one word.
+                if w.ends_with('=') && chars.get(lx.pos()) == Some(&'(') {
+                    lx.set_pos(lx.pos() + 1);
+                    out.push(format!("{}(", w));
+                    continue;
+                }
+                out.push(w);
+            }
+            Tok::Op(o) => {
+                if o == "(" && unbalanced(p) {
+                    out.push(rest_from(p));
+                    break;
+                }
+                out.push(o.to_string());
+            }
+            Tok::IoNumber(n) => out.push(n.to_string()),
+            Tok::IoVar(v) => out.push(format!("{{{}}}", v)),
+            Tok::Arith(e) => {
+                // `for (( a; b; c ))`: the parts, each with its `;`.
+                if out.last().is_some_and(|w| w == "for") {
+                    out.push("((".to_string());
+                    let mut part = String::new();
+                    for c in e.chars() {
+                        if part.is_empty() && c.is_whitespace() {
+                            continue;
+                        }
+                        part.push(c);
+                        if c == ';' {
+                            out.push(std::mem::take(&mut part));
+                        }
+                    }
+                    if !part.is_empty() {
+                        out.push(part);
+                    }
+                    out.push("))".to_string());
+                } else {
+                    out.push(format!("(({}))", e));
+                }
+            }
+            Tok::Newline => {
+                if !nl_blank {
+                    out.push(";".to_string());
+                }
+            }
         }
     }
     out
@@ -1677,7 +2101,13 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
         val = Val::List(words, false);
     } else if f.zsplit {
         let items = val_items(&val);
-        val = Val::List(items.iter().flat_map(|s| shell_words(s)).collect(), false);
+        val = Val::List(
+            items
+                .iter()
+                .flat_map(|s| shell_words(s, &f.zopts))
+                .collect(),
+            false,
+        );
     }
     list = is_list(&val) || list;
     let mut items = val_items(&val);
@@ -1946,6 +2376,7 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
             // ${(k)assoc[(r)pat]}: the key whose value matches.
             let s = sub.clone().unwrap();
             let (sf, word) = search_flags(&s).unwrap();
+            let sf = sf.as_str();
             let hit = matcher(word, sf.contains('e'))?;
             let keys = assoc_keys(&name).unwrap_or_default();
             let mut found = keys

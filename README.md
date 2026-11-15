@@ -71,7 +71,9 @@ and builtins include:
   `${a[2]::=x}` and `${2::=x}`), `${a:|b}`,
   `${a:*b}`, `(A)` assignment, `(e)`, `(%)`/`(%%)`, `(V)`, `(g)`,
   `(qqqq)`, `(c)`/`(w)`/`(W)` counts, `(l)`/`(r)` padding with two strings
-- subscript flags `(i)`, `(I)`, `(r)`, `(R)`, `(e)`, `(w)` and `^pat`
+- subscript flags `(i)`, `(I)`, `(r)`, `(R)`, `(e)`, `(w)`, `(s:sep:)`,
+  `(n:N:)`, `(b:N:)` and `^pat`, also as range ends (`${s[(r)x,(R)y]}`);
+  `(z)` and `(Z:cCn:)` split like the shell's lexer
 - `EXTENDED_GLOB`: `x#`, `x##`, `x(#cN,M)`, `^pat`, `a~b`, `(#i)`, and
   `(#b)`/`(#m)`, which set `$match`, `$mbegin`, `$mend` and `$MATCH`,
   `$MBEGIN`, `$MEND`, also inside a `${x//pat/repl}` replacement
@@ -85,7 +87,12 @@ and builtins include:
 - patterns and globs with `(a|b)` groups and `<n-m>` ranges, `**/`, and
   glob qualifiers such as `(N)`, `(.)`, `(/)`, `(@)`, `(m-1)`, `(D)`
 - `[[ x == (a|b)* ]]`, `[[ -v name[key] ]]`, `[[ -o option ]]`
-- `>& file` sends standard output and error to the file
+- `>& file` sends standard output and error to the file; `>!`, `>>|`,
+  `>&|`, `&>|`; `{fd}>file` opens a new descriptor and stores its number
+- `enable`/`disable` (`-r` reserved words, `-a` aliases, `-f` functions),
+  `read -e`/`-E`/`-t`, `ZERR` and `DEBUG` traps, `TRAPINT`-style trap
+  functions, `$LINENO`, non-ASCII parameter names (unless
+  `POSIX_IDENTIFIERS`), and `#!interp` lines naming an interpreter in `$PATH`
 - error messages in zsh's form, naming the script, function, `(eval)` or
   sourced file and the line: `f:2: command not found: x`
 - hooks: `precmd`, `preexec`, `chpwd`, `zshexit`, their `*_functions`

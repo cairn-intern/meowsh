@@ -25,6 +25,8 @@ const REGULAR: &[&str] = &[
     "cd",
     "command",
     "declare",
+    "disable",
+    "enable",
     "dirs",
     "echo",
     "false",
@@ -81,8 +83,39 @@ const REGULAR: &[&str] = &[
 ];
 
 const KEYWORDS: &[&str] = &[
-    "!", "{", "}", "case", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if",
-    "in", "then", "until", "while", "[[", "]]",
+    "!",
+    "{",
+    "}",
+    "case",
+    "do",
+    "done",
+    "elif",
+    "else",
+    "esac",
+    "fi",
+    "for",
+    "function",
+    "if",
+    "in",
+    "then",
+    "until",
+    "while",
+    "[[",
+    "]]",
+    "repeat",
+    "select",
+    "coproc",
+    "foreach",
+    "end",
+    "time",
+    "nocorrect",
+    "declare",
+    "export",
+    "float",
+    "integer",
+    "local",
+    "readonly",
+    "typeset",
 ];
 
 pub fn builtin_names() -> impl Iterator<Item = &'static str> {
@@ -90,11 +123,104 @@ pub fn builtin_names() -> impl Iterator<Item = &'static str> {
 }
 
 pub fn is_special_builtin(name: &str) -> bool {
-    SPECIAL.contains(&name)
+    SPECIAL.contains(&name) && !builtin_disabled(name)
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    SPECIAL.contains(&name) || REGULAR.contains(&name)
+    (SPECIAL.contains(&name) || REGULAR.contains(&name)) && !builtin_disabled(name)
+}
+
+// `disable`: (kind, name) pairs, kind `b` builtin, `r` reserved word,
+// `a` alias, `f` function. Kept outside the shell state so the parser
+// can ask without the shell lock.
+static DISABLED: std::sync::RwLock<Vec<(char, String)>> = std::sync::RwLock::new(Vec::new());
+
+pub fn is_disabled(kind: char, name: &str) -> bool {
+    DISABLED
+        .read()
+        .map(|d| d.iter().any(|(k, n)| *k == kind && n == name))
+        .unwrap_or(false)
+}
+
+// A disabled declaration builtin still runs through its reserved word.
+fn builtin_disabled(name: &str) -> bool {
+    !crate::parser::is_decl_word(name) && is_disabled('b', name)
+}
+
+/// `enable` / `disable [-afmr] [name ...]`.
+fn builtin_enable(words: &[String]) -> i32 {
+    let enable = words[0] == "enable";
+    let mut kind = 'b';
+    let mut pattern = false;
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            break;
+        };
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        for c in flags.chars() {
+            match c {
+                'a' | 'f' | 'r' => kind = c,
+                'm' => pattern = true,
+                'p' | 's' => {}
+                _ => return usage(&words[0], &format!("bad option: -{}", c)),
+            }
+        }
+        i += 1;
+    }
+    let known: Vec<String> = match kind {
+        'b' => SPECIAL
+            .iter()
+            .chain(REGULAR.iter())
+            .map(|s| s.to_string())
+            .collect(),
+        'r' => KEYWORDS.iter().map(|s| s.to_string()).collect(),
+        'a' => with_shell(|s| {
+            s.assoc(crate::types::ALIASES)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        }),
+        _ => with_shell(|s| s.functions.keys().cloned().collect()),
+    };
+    let names = &words[i..];
+    if names.is_empty() {
+        let mut list: Vec<&String> = known
+            .iter()
+            .filter(|n| is_disabled(kind, n) != enable)
+            .collect();
+        list.sort();
+        list.dedup();
+        out(&list.iter().map(|n| format!("{}\n", n)).collect::<String>());
+        return 0;
+    }
+    let mut status = 0;
+    for name in names {
+        let targets: Vec<String> = if pattern {
+            known
+                .iter()
+                .filter(|n| crate::pattern::matches(name, n))
+                .cloned()
+                .collect()
+        } else if known.contains(name) {
+            vec![name.clone()]
+        } else {
+            builtin_err(&words[0], &format!("no such hash table element: {}", name));
+            status = 1;
+            continue;
+        };
+        if let Ok(mut d) = DISABLED.write() {
+            for t in targets {
+                d.retain(|(k, n)| !(*k == kind && *n == t));
+                if !enable {
+                    d.push((kind, t));
+                }
+            }
+        }
+    }
+    status
 }
 
 pub fn run(name: &str, words: &[String]) -> i32 {
@@ -141,6 +267,7 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "unsetopt" => builtin_setopt(words, false),
         "test" | "[" => crate::testexpr::builtin_test(words),
         "type" | "whence" | "which" | "where" => builtin_whence(words),
+        "enable" | "disable" => builtin_enable(words),
         "ulimit" => builtin_ulimit(words),
         "umask" => builtin_umask(words),
         "zstyle" => builtin_zstyle(&words[1..]),
@@ -410,6 +537,7 @@ fn builtin_unset(words: &[String]) -> i32 {
         }
         if functions {
             with_shell(|s| s.functions.remove(a.as_str()));
+            crate::trap::function_removed(a);
             continue;
         }
         let target = if no_deref {
@@ -742,6 +870,9 @@ fn builtin_read(words: &[String]) -> i32 {
     let mut prompt = None;
     let mut delim = b'\n';
     let mut array: Option<String> = None;
+    // -e echoes the input instead of assigning it, -E does both.
+    let (mut echo, mut echo_only) = (false, false);
+    let mut timeout: Option<f64> = None;
     let mut i = 1;
     while i < words.len() && words[i].starts_with('-') && words[i].len() > 1 {
         let a = &words[i];
@@ -789,10 +920,22 @@ fn builtin_read(words: &[String]) -> i32 {
                     Some((_, r)) => fd = r,
                     None => return usage("read", "-p: no coprocess"),
                 },
-                // zsh: -E echo the line, -t timeout; accepted and ignored.
-                'E' => {}
+                'E' => echo = true,
+                'e' => {
+                    echo = true;
+                    echo_only = true;
+                }
+                // -t [secs]: fail if no input arrives in time.
                 't' => {
-                    take_arg();
+                    let rest: String = chars.by_ref().collect();
+                    timeout = Some(if !rest.is_empty() {
+                        rest.parse().unwrap_or(0.0)
+                    } else if let Some(n) = words.get(i + 1).and_then(|w| w.parse::<f64>().ok()) {
+                        i += 1;
+                        n
+                    } else {
+                        0.0
+                    });
                 }
                 _ => return usage("read", &format!("-{}: invalid option", c)),
             }
@@ -836,6 +979,17 @@ fn builtin_read(words: &[String]) -> i32 {
         return if var_set(&target, &text, false) { 0 } else { 2 };
     }
 
+    if let Some(t) = timeout {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = (t * 1000.0).round().clamp(0.0, i32::MAX as f64) as i32;
+        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+            return 1;
+        }
+    }
     let mut bytes: Vec<u8> = Vec::new();
     let mut escaped: Vec<bool> = Vec::new();
     let mut got_delim = false;
@@ -884,6 +1038,13 @@ fn builtin_read(words: &[String]) -> i32 {
             .collect(),
     };
     let ifs = var_get_opt("IFS").unwrap_or_else(|| " \t\n".to_string());
+    if echo {
+        let line: String = chars.iter().map(|(c, _)| *c).collect();
+        out(&format!("{}\n", line));
+        if echo_only {
+            return if got_delim || !bytes.is_empty() { 0 } else { 1 };
+        }
+    }
 
     let ok = if let Some(arr) = array {
         array_set(&arr, read_split(&chars, &ifs, 0))
@@ -1822,11 +1983,31 @@ fn builtin_trap(words: &[String]) -> i32 {
         let mut traps: Vec<(i32, String)> =
             with_shell(|s| s.traps.iter().map(|(k, v)| (*k, v.clone())).collect());
         traps.sort();
-        let text: String = traps
-            .iter()
-            .map(|(sig, a)| format!("trap -- {} {}\n", shell_quote(a), signal_name(*sig)))
-            .collect();
+        let mut text = String::new();
+        for (sig, a) in &traps {
+            // A TRAPxxx function is shown as its definition.
+            let fname = format!("TRAP{}", signal_name(*sig));
+            let func = (a.split(' ').next() == Some(fname.as_str()))
+                .then(|| with_shell(|s| s.functions.get(&fname).map(|f| f.body.clone())))
+                .flatten();
+            match func {
+                Some(body) => text.push_str(&crate::deparse::function_text(&fname, &body, None)),
+                None => text.push_str(&format!(
+                    "trap -- {} {}\n",
+                    shell_quote(a),
+                    signal_name(*sig)
+                )),
+            }
+        }
         out(&text);
+        return 0;
+    }
+    // `trap -` alone removes every trap.
+    if args.len() == 1 && args[0] == "-" {
+        let sigs: Vec<i32> = with_shell(|s| s.traps.keys().copied().collect());
+        for sig in sigs {
+            set_trap(sig, None);
+        }
         return 0;
     }
     if args[0] == "-l" {
@@ -1854,10 +2035,7 @@ fn builtin_trap(words: &[String]) -> i32 {
             }
             Some(sig) => set_trap(sig, action.clone()),
             None => {
-                err_line(&format!(
-                    "meowsh: trap: {}: invalid signal specification",
-                    c
-                ));
+                builtin_err("trap", &format!("undefined signal: {}", c));
                 status = 1;
             }
         }

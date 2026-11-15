@@ -305,6 +305,7 @@ impl Parser {
                         op: RedirOp::DupOut,
                         target: "1".to_string(),
                         heredoc: None,
+                        var: None,
                     },
                 ));
             }
@@ -379,6 +380,10 @@ impl Parser {
         while self.try_alias()? {}
         let tok = self.peek()?.clone();
         let node = match &tok {
+            // `disable -r word`: an ordinary command word.
+            Tok::Word(w) if crate::builtins::is_disabled('r', w) => {
+                return self.parse_simple_or_funcdef()
+            }
             Tok::Word(w) => match w.as_str() {
                 "if" => self.parse_if()?,
                 "while" => self.parse_loop(false)?,
@@ -439,6 +444,7 @@ impl Parser {
             }
             Tok::Eof => return Err(self.eof_error("a command")),
             Tok::IoNumber(_)
+            | Tok::IoVar(_)
             | Tok::Op("<")
             | Tok::Op(">")
             | Tok::Op(">>")
@@ -447,7 +453,14 @@ impl Parser {
             | Tok::Op("<&")
             | Tok::Op(">&")
             | Tok::Op("<>")
-            | Tok::Op(">|") => return self.parse_simple_or_funcdef(),
+            | Tok::Op(">|")
+            | Tok::Op(">!")
+            | Tok::Op(">>|")
+            | Tok::Op(">>!")
+            | Tok::Op("&>")
+            | Tok::Op("&>>")
+            | Tok::Op("&>|")
+            | Tok::Op("&>!") => return self.parse_simple_or_funcdef(),
             _ => return Err(self.unexpected(&tok)),
         };
         // Redirections after a compound command apply to all of it.
@@ -492,8 +505,13 @@ impl Parser {
             return Ok(Some(r));
         }
         let mut fd = None;
+        let mut var = None;
         if let Tok::IoNumber(n) = self.peek()? {
             fd = Some(*n);
+            self.next()?;
+        } else if let Tok::IoVar(name) = self.peek()? {
+            var = Some(name.clone());
+            fd = Some(-1);
             self.next()?;
         }
         let op = match self.peek()? {
@@ -509,14 +527,17 @@ impl Parser {
         let (rop, default_fd) = match op {
             "<" => (RedirOp::Read, 0),
             ">" => (RedirOp::Write, 1),
-            ">|" => (RedirOp::Clobber, 1),
-            ">>" => (RedirOp::Append, 1),
+            ">|" | ">!" => (RedirOp::Clobber, 1),
+            ">>" | ">>|" | ">>!" => (RedirOp::Append, 1),
             "<>" => (RedirOp::ReadWrite, 0),
             "<&" => (RedirOp::DupIn, 0),
             ">&" => (RedirOp::DupOut, 1),
             "<<" | "<<-" => (RedirOp::HereDoc, 0),
             "<<<" => (RedirOp::HereStr, 0),
-            "&>" | "&>>" if fd.is_none() => {
+            "&>" | "&>>" | "&>|" | "&>!" | ">&|" | ">&!" | "&>>|" | "&>>!" | ">>&" | ">>&|"
+            | ">>&!"
+                if fd.is_none() =>
+            {
                 self.next()?;
                 let target = match self.next()? {
                     Tok::Word(w) => w,
@@ -528,16 +549,20 @@ impl Parser {
                     op: RedirOp::DupOut,
                     target: "1".to_string(),
                     heredoc: None,
+                    var: None,
                 });
                 return Ok(Some(Redir {
                     fd: 1,
-                    op: if op == "&>" {
-                        RedirOp::Write
-                    } else {
+                    op: if op.contains(">>") {
                         RedirOp::Append
+                    } else if op.ends_with('|') || op.ends_with('!') {
+                        RedirOp::Clobber
+                    } else {
+                        RedirOp::Write
                     },
                     target,
                     heredoc: None,
+                    var: None,
                 }));
             }
             _ => {
@@ -571,6 +596,7 @@ impl Parser {
             op: rop,
             target,
             heredoc,
+            var,
         }))
     }
 
@@ -625,7 +651,10 @@ impl Parser {
                 Tok::Word(w) => w.clone(),
                 _ => break,
             };
-            if word == "}" && self.brace_depth > 0 && !cmd.words.is_empty() {
+            if word == "}"
+                && self.brace_depth > 0
+                && !(cmd.words.is_empty() && cmd.assigns.is_empty() && cmd.redirs.is_empty())
+            {
                 break;
             }
             if cmd.words.is_empty() {
@@ -1209,6 +1238,7 @@ impl Parser {
                 Tok::Word(w) => args.push(w),
                 Tok::Op(op) => args.push(op.to_string()),
                 Tok::IoNumber(n) => args.push(n.to_string()),
+                Tok::IoVar(v) => args.push(format!("{{{}}}", v)),
                 Tok::Arith(e) => {
                     args.push("(".into());
                     args.push(format!("({})", e));
@@ -1227,7 +1257,7 @@ pub fn is_decl_word(w: &str) -> bool {
     matches!(
         w,
         "typeset" | "declare" | "local" | "export" | "readonly" | "integer" | "float" | "private"
-    )
+    ) && !crate::builtins::is_disabled('r', w)
 }
 
 fn is_func_name(s: &str) -> bool {
@@ -1257,6 +1287,7 @@ fn tok_text(t: &Tok) -> String {
     match t {
         Tok::Word(w) => w.clone(),
         Tok::IoNumber(n) => n.to_string(),
+        Tok::IoVar(v) => format!("{{{}}}", v),
         Tok::Op(o) => o.to_string(),
         Tok::Arith(e) => format!("(({}))", e),
         Tok::Newline => "newline".to_string(),

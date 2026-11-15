@@ -202,9 +202,9 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
                 continue;
             }
         }
-        if ch.is_ascii_alphabetic() || ch == '_' {
+        if crate::lexer::is_name_start(ch) {
             let start = i;
-            while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') {
+            while i < c.len() && crate::lexer::is_name_char(c[i]) {
                 i += 1;
             }
             out.push(T::Ident(c[start..i].iter().collect()));

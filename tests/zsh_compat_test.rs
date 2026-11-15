@@ -578,3 +578,87 @@ fn redirect_both_streams_to_a_file() {
     let (_, out, _) = sh("cd $HOME && { echo out; echo err >&2 } >& f.txt; cat f.txt");
     assert_eq!(out, "out\nerr\n");
 }
+
+// ---- (z) splitting, subscript searches, enable/disable, traps ------------
+
+#[test]
+fn z_flag_splits_like_the_lexer() {
+    let (_, out, _) = sh("foo='<five> {six} )ten( more'; print -rl -- ${(z)foo}; \
+         s='for (( i = 1 ; i < 3 ; i++ ))'; print -rl -- ${(z)s}; \
+         l=$'a # c\\nb'; print -rl -- ${(Z+c+)l} -- ${(Z+C+)l}");
+    assert_eq!(
+        out,
+        "<\nfive\n>\n{six}\n)\nten( more\nfor\n((\ni = 1 ;\ni < 3 ;\ni++ \n))\n\
+         a\n# c\n;\nb\n--\na\n;\nb\n"
+    );
+}
+
+#[test]
+fn subscript_search_flags_and_multibyte() {
+    let (_, out, err) = sh("s='Twinkle, twinkle, little *'; x=','; \
+         print ${s[(r)$x,(R)$x]} $s[(i)winkle] $s[(I)winkle]; \
+         a=ténébreux; print ${a[(r)én,(r)éb]} ${a[(rb:3:)é,-1]} ${a[(rn:2:)é,-1]}; \
+         b=(sping spang spong); print ${b[(ib.2.)sp?ng]} ${b[(n:2:i)sp*]}; \
+         w='foo bar baz'; print ${w[(w)2]} ${w[(wi)baz]}; hähä=3; print $hähä");
+    assert_eq!(
+        out, ", twinkle, 2 11\nénéb ébreux ébreux\n2 2\nbar 9\n3\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
+fn enable_disable_and_closing_braces() {
+    let (_, out, _) = sh(
+        "f() { print f }; disable -f f; f 2>/dev/null || print disabled; enable -f f; f; \
+         disable -r typeset; eval 'g() { typeset v=`echo a b=c`; print $v $b }'; g; \
+         { A=0 }; print $A",
+    );
+    assert_eq!(out, "disabled\nf\na c\n0\n");
+}
+
+#[test]
+fn readonly_listing_in_sh_mode_does_not_hang() {
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args([
+            "--emulate",
+            "sh",
+            "-c",
+            "PATH=/bin; export PATH; readonly PATH; export -p PATH; typeset -p PATH; \
+             readonly -p; echo ${path-unset}",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout),
+        "export -r PATH=/bin\nreadonly PATH=/bin\nunset\n"
+    );
+}
+
+#[test]
+fn fd_variables_clobber_forms_and_read_options() {
+    let (_, out, _) = sh(
+        "cd $HOME && exec {fd}>out; print to fd >&$fd; exec {fd}>&-; cat out; \
+         set -o noclobber; print a >!o2; print b >>|o2; cat o2; \
+         print -n x | read -e; print; print -n y | { read -t 1 v; print $v }",
+    );
+    assert_eq!(out, "to fd\na\nb\nx\n\ny\n");
+}
+
+#[test]
+fn shebang_fallback_and_prefix_path() {
+    let (_, out, err) = sh(
+        "cd $HOME && print -n '#!sh\\necho slashless' >t1 && chmod +x t1 && \
+         PATH=$PATH:$HOME t1",
+    );
+    assert_eq!(out, "slashless\n", "stderr: {}", err);
+}
+
+#[test]
+fn zerr_and_debug_traps() {
+    let (_, out, _) = sh(
+        "TRAPZERR() { print zerr }; false; unfunction TRAPZERR; false; print ok\n\
+         trap 'print dbg $LINENO' DEBUG; :; trap - DEBUG\nprint $LINENO",
+    );
+    assert_eq!(out, "zerr\nok\ndbg 2\ndbg 2\n3\n");
+}

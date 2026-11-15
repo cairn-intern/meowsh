@@ -4,6 +4,8 @@ use std::collections::HashMap;
 pub enum Tok {
     Word(String),
     IoNumber(i32),
+    // `{name}` right before a redirection operator.
+    IoVar(String),
     Op(&'static str),
     // `(( expr ))`, holding the expression text.
     Arith(String),
@@ -19,20 +21,27 @@ pub enum LexError {
 }
 
 const OPERATORS: &[&str] = &[
-    "&>>", "<<<", "<<-", "&&", "||", "|&", ";;", ";&", ";|", "<<", ">>", "<&", ">&", "<>", ">|",
-    "&>", "&|", "&!", "|", "&", ";", "<", ">", "(", ")",
+    // zsh's clobbering and both-streams forms, longest first.
+    "&>>|", "&>>!", ">>&|", ">>&!", ">&|", ">&!", "&>|", "&>!", ">>|", ">>!", ">>&", ">!", "&>>",
+    "<<<", "<<-", "&&", "||", "|&", ";;", ";&", ";|", "<<", ">>", "<&", ">&", "<>", ">|", "&>",
+    "&|", "&!", "|", "&", ";", "<", ">", "(", ")",
 ];
 
 fn is_operator_start(c: char) -> bool {
     matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')')
 }
 
-fn is_name_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
+pub fn is_name_start(c: char) -> bool {
+    c == '_' || c.is_ascii_alphabetic() || (!c.is_ascii() && c.is_alphabetic() && wide_names())
 }
 
-fn is_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+pub fn is_name_char(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric() || (!c.is_ascii() && c.is_alphanumeric() && wide_names())
+}
+
+// zsh accepts non-ASCII letters in names unless POSIX_IDENTIFIERS.
+fn wide_names() -> bool {
+    !crate::options::quick("posixidentifiers")
 }
 
 pub fn is_valid_name(s: &str) -> bool {
@@ -361,6 +370,8 @@ pub struct Lexer {
     line_cache: std::cell::Cell<(usize, usize)>,
     // Lines of the same input read before this text.
     pub line_offset: usize,
+    // Whether `#` at the start of a word starts a comment.
+    pub comments: bool,
 }
 
 impl Lexer {
@@ -374,11 +385,16 @@ impl Lexer {
             next_heredoc_id: 0,
             line_cache: std::cell::Cell::new((0, 1)),
             line_offset: 0,
+            comments: true,
         }
     }
 
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos.min(self.chars.len());
     }
 
     /// 1-based line number of the current position.
@@ -487,7 +503,8 @@ impl Lexer {
             // `#` starts a comment at the start of a word, but not right
             // after `(` or `)`, where zsh reads glob syntax such as `(#i)`
             // and `(ab)##`.
-            if self.pos < self.chars.len()
+            if self.comments
+                && self.pos < self.chars.len()
                 && self.chars[self.pos] == '#'
                 && !(self.pos > 0 && matches!(self.chars[self.pos - 1], '(' | ')'))
             {
@@ -530,6 +547,23 @@ impl Lexer {
                     self.pos = j;
                     return Ok(Tok::IoNumber(n));
                 }
+            }
+        }
+
+        if c == '{' {
+            let mut j = self.pos + 1;
+            while j < self.chars.len() && is_name_char(self.chars[j]) {
+                j += 1;
+            }
+            if j > self.pos + 1
+                && is_name_start(self.chars[self.pos + 1])
+                && self.chars.get(j) == Some(&'}')
+                && matches!(self.chars.get(j + 1), Some('<' | '>'))
+                && self.chars.get(j + 2) != Some(&'(')
+            {
+                let name: String = self.chars[self.pos + 1..j].iter().collect();
+                self.pos = j + 1;
+                return Ok(Tok::IoVar(name));
             }
         }
 

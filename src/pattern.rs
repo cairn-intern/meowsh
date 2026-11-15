@@ -285,6 +285,10 @@ fn class_matches(set: &[ClassItem], c: char) -> bool {
             "graph" => !c.is_control() && !c.is_whitespace(),
             "cntrl" => c.is_control(),
             "xdigit" => c.is_ascii_hexdigit(),
+            // zsh's own classes.
+            "IDENT" => crate::lexer::is_name_char(c),
+            "IFS" => " \t\n\0".contains(c),
+            "IFSSPACE" => " \t\n".contains(c),
             _ => false,
         },
     })
@@ -621,6 +625,18 @@ pub fn has_meta(pattern: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Backslash-escapes pattern characters so `s` matches only itself.
+pub fn escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if "*?[]()|<>^#~\\".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Removes backslash escapes from a pattern, yielding its literal text.

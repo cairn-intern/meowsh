@@ -1288,7 +1288,14 @@ pub fn find_command(name: &str) -> Option<String> {
         return None;
     }
 
-    let path = var_get("PATH");
+    find_command_in(name, &var_get("PATH"))
+}
+
+/// `find_command` searching the directories of `path`.
+pub fn find_command_in(name: &str, path: &str) -> Option<String> {
+    if name.contains('/') {
+        return find_command(name);
+    }
     for dir in path.split(':') {
         let dir = if dir.is_empty() { "." } else { dir };
         let p = std::path::Path::new(dir).join(name);
@@ -1380,6 +1387,15 @@ pub fn err_prefix(builtin: Option<&str>) -> String {
             Some(b) => format!("{}:{}{}: ", name, b, line),
             None => format!("{}{}: ", name, line),
         }
+    })
+}
+
+/// `$LINENO`: the line of the running command, counted within the
+/// function, `eval` or file it is in.
+pub fn lineno() -> usize {
+    with_err_ctx(|e| {
+        let base = e.stack.last().map(|c| c.1).unwrap_or(0);
+        e.lineno.saturating_sub(base)
     })
 }
 

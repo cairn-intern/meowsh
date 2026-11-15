@@ -212,6 +212,9 @@ impl Shell {
     }
 
     pub fn alias(&self, name: &str, global: bool) -> Option<&String> {
+        if crate::builtins::is_disabled('a', name) {
+            return None;
+        }
         self.assoc(if global { GALIASES } else { ALIASES })
             .and_then(|m| m.get(name))
     }
@@ -254,6 +257,9 @@ pub struct Redir {
     // Raw (unexpanded) target word; for here-documents, the delimiter.
     pub target: String,
     pub heredoc: Option<HereDoc>,
+    // zsh `{name}>file`: the descriptor is chosen by the shell (10 or
+    // above) and stored in the parameter.
+    pub var: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -348,7 +348,9 @@ impl Deparser {
                 RedirOp::HereStr => ("<<<", 0),
             };
             self.push(" ");
-            if r.fd != default_fd {
+            if let Some(v) = &r.var {
+                self.push(&format!("{{{}}}", v));
+            } else if r.fd != default_fd {
                 self.push(&r.fd.to_string());
             }
             self.push(op);

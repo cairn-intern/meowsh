@@ -99,7 +99,12 @@ fn main() {
             .filter(|e| *e != Emulation::Csh)
             .unwrap_or(Emulation::Zsh),
     };
-    with_shell(|s| options::init(s, emu));
+    with_shell(|s| {
+        options::init(s, emu);
+        if matches!(emu, Emulation::Sh | Emulation::Ksh) {
+            s.drop_default_ties();
+        }
+    });
     let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(e) => {

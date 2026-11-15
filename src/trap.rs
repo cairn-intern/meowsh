@@ -47,6 +47,11 @@ pub const SIGNALS: &[(&str, i32)] = &[
     ("SYS", libc::SIGSYS),
 ];
 
+/// zsh's pseudo-signals: ZERR after a command fails, DEBUG around
+/// each command. They have no system handler.
+pub const SIG_ZERR: i32 = 1001;
+pub const SIG_DEBUG: i32 = 1002;
+
 /// Parses a condition for `trap`/`kill`: a name with or without `SIG`, a
 /// number, or `EXIT` (0).
 pub fn signal_number(spec: &str) -> Option<i32> {
@@ -59,15 +64,21 @@ pub fn signal_number(spec: &str) -> Option<i32> {
     }
     let upper = spec.to_ascii_uppercase();
     let name = upper.strip_prefix("SIG").unwrap_or(&upper);
-    if name == "EXIT" {
-        return Some(0);
+    match name {
+        "EXIT" => return Some(0),
+        "ZERR" | "ERR" => return Some(SIG_ZERR),
+        "DEBUG" => return Some(SIG_DEBUG),
+        _ => {}
     }
     SIGNALS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
 }
 
 pub fn signal_name(sig: i32) -> String {
-    if sig == 0 {
-        return "EXIT".to_string();
+    match sig {
+        0 => return "EXIT".to_string(),
+        SIG_ZERR => return "ZERR".to_string(),
+        SIG_DEBUG => return "DEBUG".to_string(),
+        _ => {}
     }
     SIGNALS
         .iter()
@@ -127,7 +138,7 @@ pub fn set_trap(sig: i32, action: Option<String>) {
     match &action {
         Some(a) => {
             with_shell(|s| s.traps.insert(sig, a.clone()));
-            if sig != 0 {
+            if (1..64).contains(&sig) {
                 if a.is_empty() {
                     set_handler(sig, libc::SIG_IGN);
                 } else {
@@ -137,7 +148,7 @@ pub fn set_trap(sig: i32, action: Option<String>) {
         }
         None => {
             with_shell(|s| s.traps.remove(&sig));
-            if sig != 0 {
+            if (1..64).contains(&sig) {
                 shell_default(sig);
             }
         }
@@ -166,6 +177,11 @@ pub fn reset_in_child(background_without_job_control: bool) {
         set_handler(libc::SIGQUIT, libc::SIG_IGN);
     }
     PENDING.store(0, Ordering::SeqCst);
+}
+
+/// True while a trap action runs.
+pub fn in_trap() -> bool {
+    IN_TRAP.load(Ordering::SeqCst)
 }
 
 /// True if a signal arrived that has not been handled yet.
@@ -215,6 +231,45 @@ pub fn run_action(action: &str) {
         }
     });
     IN_TRAP.store(false, Ordering::SeqCst);
+}
+
+/// Runs the trap for pseudo-signal `sig` (ZERR, DEBUG), if one is set and
+/// no trap is already running.
+pub fn run_pseudo(sig: i32) {
+    if IN_TRAP.load(Ordering::SeqCst) {
+        return;
+    }
+    let action = with_shell(|s| s.traps.get(&sig).cloned());
+    if let Some(a) = action.filter(|a| !a.is_empty()) {
+        run_action(&a);
+    }
+}
+
+/// zsh: a function named TRAPxxx is the trap for signal xxx. Defining
+/// it sets the trap; the function gets the signal number.
+pub fn function_defined(name: &str) {
+    if let Some(sig) = name.strip_prefix("TRAP").and_then(signal_number) {
+        let action = if (1..64).contains(&sig) {
+            format!("{} {}", name, sig)
+        } else {
+            name.to_string()
+        };
+        set_trap(sig, Some(action));
+    }
+}
+
+/// Removing a TRAPxxx function removes its trap.
+pub fn function_removed(name: &str) {
+    if let Some(sig) = name.strip_prefix("TRAP").and_then(signal_number) {
+        let is_ours = with_shell(|s| {
+            s.traps
+                .get(&sig)
+                .is_some_and(|a| a.split(' ').next() == Some(name))
+        });
+        if is_ours {
+            set_trap(sig, None);
+        }
+    }
 }
 
 /// Runs the EXIT trap once, if set.

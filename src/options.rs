@@ -105,6 +105,7 @@ const QUICK_NAMES: &[&str] = &[
     "extendedglob",
     "ksharrays",
     "kshzerosubscript",
+    "posixidentifiers",
 ];
 
 /// For code that may run with the shell lock held: whether one of a few

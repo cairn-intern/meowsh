@@ -64,11 +64,18 @@ fn check_errexit(status: i32) {
     if status == 0 {
         return;
     }
-    with_shell(|s| {
-        if s.opts & OPT_ERREXIT != 0 && s.errexit_suppressed == 0 && s.flow == Flow::None {
+    let zerr = with_shell(|s| {
+        let live = s.errexit_suppressed == 0 && s.flow == Flow::None;
+        if live && s.opts & OPT_ERREXIT != 0 {
             s.flow = Flow::Exit(status);
         }
+        live
     });
+    // zsh's ZERR trap runs where ERR_EXIT would act.
+    if zerr {
+        crate::trap::run_pseudo(crate::trap::SIG_ZERR);
+        with_shell(|s| s.last_status = status);
+    }
 }
 
 // An expansion error aborts the current command line in an interactive
@@ -206,8 +213,11 @@ pub fn exec_external(words: &[String], env: &[(String, String)]) -> ! {
 /// argument zero instead of the command name.
 pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, String)]) -> ! {
     let name = &words[0];
+    // `PATH=dirs cmd` searches the PATH given for the command.
     let path = if name.contains('/') {
         Some(name.clone())
+    } else if let Some((_, p)) = env.iter().find(|(k, _)| k == "PATH") {
+        crate::shell::find_command_in(name, p)
     } else {
         find_command(name)
     };
@@ -240,6 +250,30 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
         libc::execve(c_path.as_ptr(), argv_p.as_ptr(), envp_p.as_ptr());
     }
     let e = last_errno();
+    // zsh runs `#!interp [arg]` itself when the system cannot, as for an
+    // interpreter given without a directory (searched in $PATH).
+    if e == libc::ENOENT {
+        if let Some((interp, arg)) = shebang(&path) {
+            let interp = if interp.contains('/') {
+                Some(interp)
+            } else {
+                find_command(&interp)
+            };
+            if let Some(c_interp) = interp.as_deref().and_then(to_c) {
+                let c_arg = arg.as_deref().and_then(to_c);
+                let mut args: Vec<*const libc::c_char> = vec![c_interp.as_ptr()];
+                if let Some(a) = &c_arg {
+                    args.push(a.as_ptr());
+                }
+                args.push(c_path.as_ptr());
+                args.extend(argv.iter().skip(1).map(|c| c.as_ptr()));
+                args.push(std::ptr::null());
+                unsafe {
+                    libc::execve(c_interp.as_ptr(), args.as_ptr(), envp_p.as_ptr());
+                }
+            }
+        }
+    }
     if e == libc::ENOEXEC {
         // No interpreter line: run the file as a shell script.
         if let Ok(exe) = std::env::current_exe() {
@@ -255,6 +289,22 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
     }
     err_line(&format!("meowsh: {}: {}", name, strerror(e)));
     unsafe { libc::_exit(if e == libc::ENOENT { 127 } else { 126 }) }
+}
+
+// The interpreter and optional argument of a `#!` line.
+fn shebang(path: &str) -> Option<(String, Option<String>)> {
+    use std::io::Read;
+    let mut buf = [0u8; 256];
+    let n = std::fs::File::open(path).ok()?.read(&mut buf).ok()?;
+    let head = std::str::from_utf8(&buf[..n]).ok()?;
+    let line = head.strip_prefix("#!")?.lines().next()?.trim();
+    let mut parts = line.splitn(2, [' ', '\t']);
+    let interp = parts.next()?.to_string();
+    let arg = parts
+        .next()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+    (!interp.is_empty()).then_some((interp, arg))
 }
 
 // ---- redirections ---------------------------------------------------------
@@ -362,6 +412,13 @@ pub struct RedirError;
 pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError> {
     let mut saved = Vec::new();
     for r in redirs {
+        if let Some(var) = &r.var {
+            if let Err(e) = redir_to_var(r, var) {
+                restore_redirs(saved);
+                return Err(e);
+            }
+            continue;
+        }
         let fd = r.fd;
         if save {
             saved.push((fd, dup_high(fd)));
@@ -409,6 +466,55 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
         }
     }
     Ok(saved)
+}
+
+// `{name}>file`: opens on a new descriptor (10 or above, kept open
+// after the command) and stores its number in `name`; `{name}>&-`
+// closes the descriptor `name` holds.
+fn redir_to_var(r: &Redir, var: &str) -> Result<(), RedirError> {
+    let readonly = with_shell(|s| {
+        s.param(var)
+            .is_some_and(|p| p.attrs & crate::params::READONLY != 0)
+    });
+    if readonly {
+        shell_err(&format!(
+            "can't close file descriptor from readonly parameter {}",
+            var
+        ));
+        return Err(RedirError);
+    }
+    let closing = matches!(r.op, RedirOp::DupIn | RedirOp::DupOut) && r.target == "-";
+    if closing {
+        let fd = var_get(var).trim().parse::<i32>().unwrap_or(-1);
+        if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            shell_err(&format!("{}: bad file descriptor", fd));
+            return Err(RedirError);
+        }
+        close(fd);
+        return Ok(());
+    }
+    let src = match open_redir(r) {
+        Ok(Target::Opened(fd)) | Ok(Target::Both(fd)) => (fd, true),
+        Ok(Target::Dup(fd)) => (fd, false),
+        Ok(Target::Close) => return Ok(()),
+        Err(msg) => {
+            if let Some(m) = msg {
+                shell_err(&m);
+            }
+            return Err(RedirError);
+        }
+    };
+    let fd = unsafe { libc::fcntl(src.0, libc::F_DUPFD, 10) };
+    if src.1 {
+        close(src.0);
+    }
+    if fd < 0 || !var_set(var, &fd.to_string(), false) {
+        if fd >= 0 {
+            close(fd);
+        }
+        return Err(RedirError);
+    }
+    Ok(())
 }
 
 pub fn restore_redirs(saved: SavedFds) {
@@ -790,6 +896,7 @@ fn exec_node_inner(node: &Node) -> i32 {
                     },
                 )
             });
+            crate::trap::function_defined(name);
             0
         }
         Node::DBracket(words) => {
@@ -825,7 +932,30 @@ fn exec_in_child(node: &Node) -> ! {
 }
 
 fn exec_simple(cmd: &SimpleCmd, in_child: bool) -> i32 {
-    crate::shell::with_err_ctx(|e| e.lineno = cmd.line);
+    // A trap runs with the line of the command that triggered it.
+    if !crate::trap::in_trap() {
+        crate::shell::with_err_ctx(|e| e.lineno = cmd.line);
+    }
+    // zsh's DEBUG trap: before each command with DEBUG_BEFORE_CMD,
+    // otherwise after it.
+    let has_debug = with_shell(|s| s.traps.contains_key(&crate::trap::SIG_DEBUG));
+    if !has_debug {
+        return exec_simple_inner(cmd, in_child);
+    }
+    let before = crate::options::is_set("debugbeforecmd");
+    if before {
+        crate::trap::run_pseudo(crate::trap::SIG_DEBUG);
+    }
+    let st = exec_simple_inner(cmd, in_child);
+    if !before {
+        crate::shell::with_err_ctx(|e| e.lineno = cmd.line);
+        crate::trap::run_pseudo(crate::trap::SIG_DEBUG);
+        with_shell(|s| s.last_status = st);
+    }
+    st
+}
+
+fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
     with_shell(|s| s.last_cmdsub_status = None);
     // zsh precommand modifiers that act before expansion: `noglob`
     // (no filename generation), `nocorrect`, and `-` (dashed argv[0]).
@@ -994,6 +1124,7 @@ fn run_command(
         None
     } else {
         with_shell(|s| s.functions.get(&name).map(|f| (f.body.clone(), f.line)))
+            .filter(|_| !crate::builtins::is_disabled('f', &name))
     };
     if let Some((body, line)) = func {
         let tmp = match TempVars::set(assigns) {

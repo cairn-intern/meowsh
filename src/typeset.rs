@@ -252,6 +252,12 @@ pub fn typeset(cmd: &str, args: &[DeclArg]) -> i32 {
         }
     }
 
+    // POSIX `export -p name` / `readonly -p name` ignore -p: they only
+    // export or mark readonly.
+    if (pf.posix_export || pf.posix_readonly) && !rest.is_empty() {
+        ops.minus.retain(|&c| c != 'p');
+        ops.plus.retain(|&c| c != 'p');
+    }
     if rest.is_empty() {
         if !ops.isset('p') {
             if on | roff == 0 {
@@ -305,17 +311,15 @@ pub fn typeset(cmd: &str, args: &[DeclArg]) -> i32 {
                 list_params(on | roff, 0, &pf, Some(&pat));
                 continue;
             }
-            let names: Vec<String> = with_shell(|s| {
-                let mut v: Vec<String> = s
-                    .params
+            let mut names: Vec<String> = with_shell(|s| {
+                s.params
                     .iter()
                     .filter(|(_, p)| p.attrs & UNSET == 0)
                     .map(|(k, _)| k.clone())
-                    .filter(|k| crate::pattern::matches(&pat, k))
-                    .collect();
-                v.sort();
-                v
+                    .collect()
             });
+            names.retain(|k| crate::pattern::matches(&pat, k));
+            names.sort();
             for n in names {
                 let asg = DeclArg::Assign {
                     name: n.clone(),
@@ -1117,27 +1121,29 @@ pub fn print_param(name: &str, p: &Param, pf: &PrintFlags, locallevel: usize) ->
 // names, optionally limited to names matching `pattern`.
 fn list_params(flags: u32, exclude: u32, pf: &PrintFlags, pattern: Option<&str>) {
     let level = locallevel();
-    let text = with_shell(|s| {
-        let mut names: Vec<&String> = s.params.keys().collect();
-        names.sort();
-        let mut text = String::new();
-        for n in names {
-            let p = &s.params[n];
-            let f = flags_of(p) | if p.level > 0 { LOCAL } else { 0 };
-            if flags != 0 && f & flags == 0 {
-                continue;
-            }
-            if f & exclude != 0 {
-                continue;
-            }
-            if let Some(pat) = pattern {
-                if !crate::pattern::matches(pat, n) {
-                    continue;
-                }
-            }
-            text.push_str(&print_param(n, p, pf, level));
-        }
-        text
+    // Copied out first: printing a tied pair looks up its partner.
+    let mut params: Vec<(String, Param)> = with_shell(|s| {
+        s.params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     });
+    params.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut text = String::new();
+    for (n, p) in &params {
+        let f = flags_of(p) | if p.level > 0 { LOCAL } else { 0 };
+        if flags != 0 && f & flags == 0 {
+            continue;
+        }
+        if f & exclude != 0 {
+            continue;
+        }
+        if let Some(pat) = pattern {
+            if !crate::pattern::matches(pat, n) {
+                continue;
+            }
+        }
+        text.push_str(&print_param(n, p, pf, level));
+    }
     out(&text);
 }

@@ -278,6 +278,17 @@ impl Shell {
         }
     }
 
+    /// Started as sh or ksh, zsh has no special arrays tied to the colon
+    /// lists (`$path` for `$PATH` and so on).
+    pub fn drop_default_ties(&mut self) {
+        for (scalar, array) in DEFAULT_TIES {
+            self.params.remove(*array);
+            if let Some(p) = self.params.get_mut(*scalar) {
+                p.tie = None;
+            }
+        }
+    }
+
     /// Ties scalar `scalar` and array `array` with separator `sep`,
     /// keeping the scalar's current value if it has one.
     pub fn tie(&mut self, scalar: &str, array: &str, sep: &str) {

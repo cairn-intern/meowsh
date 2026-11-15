@@ -48,7 +48,12 @@ class Case:
 def parse(path):
     """Returns (prep chunks, test cases, clean chunks)."""
     with open(path, encoding="utf-8", errors="surrogateescape") as f:
-        lines = f.read().split("\n")
+        raw = f.read().split("\n")
+    # Like ztst.zsh's ZTST_getline, every line starting with `#` is
+    # skipped, even inside code; numbers stay those of the file.
+    kept = [(k, l) for k, l in enumerate(raw) if not l.startswith("#")]
+    lines = [l for _, l in kept]
+    lineno = [k for k, _ in kept]
     prep, tests, clean = [], [], []
     section = None
     i = 0
@@ -66,7 +71,7 @@ def parse(path):
             section = line[1:].split()[0] if line[1:].split() else None
             i += 1
             continue
-        if line.startswith("#") or blank(line):
+        if blank(line):
             i += 1
             continue
         if section in ("prep", "clean"):
@@ -76,7 +81,7 @@ def parse(path):
                 while i < n and is_code(lines[i]):
                     code.append(lines[i])
                     i += 1
-                (prep if section == "prep" else clean).append(("\n".join(code), start + 1))
+                (prep if section == "prep" else clean).append(("\n".join(code), lineno[start] + 1))
                 continue
             i += 1
             continue
@@ -91,7 +96,7 @@ def parse(path):
         while i < n and is_code(lines[i]):
             code.append(lines[i])
             i += 1
-        case = Case("\n".join(code), start + 1)
+        case = Case("\n".join(code), lineno[start] + 1)
         if i < n:
             m = STATUS_RE.match(lines[i])
             if m:
@@ -204,6 +209,8 @@ def build_driver(work, testdir, prep, tests, clean):
         "ZTST_exe=" + sq(os.path.join(os.path.dirname(testdir), "Src", "zsh")),
         "ZTST_tmp=" + sq(tmp),
         "ZTST_fd=8",
+        # ztst.zsh's progress marker, which some tests call.
+        "ZTST_hashmark() { :; }",
         "exec 8>/dev/null",
         # From Test/ztst.zsh: prints a UTF-8 locale, if there is one.
         "ZTST_find_UTF8() { print -r -- " + sq(utf8_locale()) + "; }",
