@@ -290,6 +290,15 @@ pub enum Node {
         body: Box<Node>,
         until: bool,
     },
+    // `(( expr ))`
+    Arith(String),
+    // `for (( init; cond; step ))`
+    ForArith {
+        init: String,
+        cond: String,
+        step: String,
+        body: Box<Node>,
+    },
     For {
         var: String,
         words: Option<Vec<String>>,

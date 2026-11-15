@@ -8,7 +8,7 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
-use rustyline::{ColorMode, Editor, Helper};
+use rustyline::{Cmd, ColorMode, Editor, Helper, KeyCode, KeyEvent, Modifiers};
 use std::borrow::Cow;
 use std::cell::RefCell;
 
@@ -579,12 +579,15 @@ impl Validator for MeowshHelper {}
 impl Helper for MeowshHelper {}
 
 fn continuation_prompt() -> String {
-    let ps2 = crate::shell::var_get_opt("PS2").unwrap_or_else(|| "> ".to_string());
-    crate::expand::expand_prompt_string(&ps2).unwrap_or(ps2)
+    let ps2 = crate::shell::var_get_opt("PROMPT2")
+        .filter(|p| !p.is_empty())
+        .or_else(|| crate::shell::var_get_opt("PS2"))
+        .unwrap_or_else(|| "> ".to_string());
+    crate::shell::render_prompt(&ps2)
 }
 
 fn primary_prompt() -> String {
-    crate::builtins::call_if_defined("precmd");
+    crate::builtins::run_hooks("precmd", &[]);
     build_prompt()
 }
 
@@ -623,6 +626,16 @@ pub fn run_interactive() -> i32 {
     rl.set_color_mode(ColorMode::Forced);
     rl.set_helper(Some(MeowshHelper));
     let _ = rl.set_max_history_size(1000);
+    // Up/Down search history for lines starting with what is typed, as
+    // oh-my-zsh binds them.
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Up, Modifiers::NONE),
+        Cmd::HistorySearchBackward,
+    );
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Down, Modifiers::NONE),
+        Cmd::HistorySearchForward,
+    );
 
     let history_file = crate::shell::with_shell(|s| s.history_file.clone());
     if !history_file.is_empty() {

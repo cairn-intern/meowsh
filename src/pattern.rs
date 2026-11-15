@@ -1,4 +1,5 @@
-//! Shell pattern matching (`*`, `?`, `[...]`, backslash escapes) used by
+//! Shell pattern matching (`*`, `?`, `[...]`, zsh `(a|b)` groups,
+//! backslash escapes) used by
 //! `case`, `[[ == ]]`, and the `${x#pat}` family. Patterns come from the
 //! expander with quoted characters already backslash-escaped.
 
@@ -8,6 +9,8 @@ enum Item {
     Any,
     Star,
     Class { negated: bool, set: Vec<ClassItem> },
+    // `(alt1|alt2)`: matches any alternative.
+    Group(Vec<Vec<Item>>),
 }
 
 #[derive(Debug, Clone)]
@@ -19,41 +22,94 @@ enum ClassItem {
 
 fn compile(pattern: &str) -> Vec<Item> {
     let p: Vec<char> = pattern.chars().collect();
-    let mut items = Vec::new();
     let mut i = 0;
+    let mut alts = compile_seq(&p, &mut i, false);
+    alts.pop().unwrap_or_default()
+}
+
+// Index just past the `)` closing the group opened at `p[open]`.
+fn group_end(p: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut i = open;
     while i < p.len() {
         match p[i] {
-            '\\' if i + 1 < p.len() => {
-                items.push(Item::Char(p[i + 1]));
-                i += 2;
-            }
-            '*' => {
-                if !matches!(items.last(), Some(Item::Star)) {
-                    items.push(Item::Star);
+            '\\' => i += 1,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
                 }
-                i += 1;
             }
-            '?' => {
-                items.push(Item::Any);
-                i += 1;
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+// Compiles items up to the end, or inside a group up to its `)`, split
+// into alternatives at `|`. A `(` without a matching `)` is literal.
+fn compile_seq(p: &[char], i: &mut usize, nested: bool) -> Vec<Vec<Item>> {
+    let mut alts = Vec::new();
+    let mut items = Vec::new();
+    while *i < p.len() {
+        let i0 = *i;
+        match p[i0] {
+            ')' if nested => {
+                *i += 1;
+                break;
             }
-            '[' => match parse_class(&p, i) {
-                Some((item, next)) => {
-                    items.push(item);
-                    i = next;
+            '|' if nested => {
+                alts.push(std::mem::take(&mut items));
+                *i += 1;
+            }
+            '(' if group_end(p, i0).is_some() => {
+                *i += 1;
+                items.push(Item::Group(compile_seq(p, i, true)));
+            }
+            _ => {
+                let one = compile_one(p, i);
+                if !(matches!(one, Item::Star) && matches!(items.last(), Some(Item::Star))) {
+                    items.push(one);
                 }
-                None => {
-                    items.push(Item::Char('['));
-                    i += 1;
-                }
-            },
-            c => {
-                items.push(Item::Char(c));
-                i += 1;
             }
         }
     }
-    items
+    alts.push(items);
+    alts
+}
+
+fn compile_one(p: &[char], i: &mut usize) -> Item {
+    let start = *i;
+    match p[start] {
+        '\\' if start + 1 < p.len() => {
+            *i += 2;
+            Item::Char(p[start + 1])
+        }
+        '*' => {
+            *i += 1;
+            Item::Star
+        }
+        '?' => {
+            *i += 1;
+            Item::Any
+        }
+        '[' => match parse_class(p, start) {
+            Some((item, next)) => {
+                *i = next;
+                item
+            }
+            None => {
+                *i += 1;
+                Item::Char('[')
+            }
+        },
+        c => {
+            *i += 1;
+            Item::Char(c)
+        }
+    }
 }
 
 // Parses a bracket expression starting at `p[start] == '['`.
@@ -133,10 +189,31 @@ fn item_matches(item: &Item, c: char) -> bool {
         Item::Any => true,
         Item::Class { negated, set } => class_matches(set, c) != *negated,
         Item::Star => true,
+        Item::Group(_) => false,
+    }
+}
+
+fn has_group(items: &[Item]) -> bool {
+    items.iter().any(|i| matches!(i, Item::Group(_)))
+}
+
+// Backtracking matcher for patterns containing groups.
+fn match_rec(items: &[Item], s: &[char]) -> bool {
+    let Some((first, rest)) = items.split_first() else {
+        return s.is_empty();
+    };
+    match first {
+        Item::Star => (0..=s.len()).any(|k| match_rec(rest, &s[k..])),
+        Item::Group(alts) => (0..=s.len())
+            .any(|k| alts.iter().any(|alt| match_items(alt, &s[..k])) && match_rec(rest, &s[k..])),
+        item => !s.is_empty() && item_matches(item, s[0]) && match_rec(rest, &s[1..]),
     }
 }
 
 fn match_items(items: &[Item], s: &[char]) -> bool {
+    if has_group(items) {
+        return match_rec(items, s);
+    }
     // Iterative matcher with single-star backtracking.
     let (mut pi, mut si) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
@@ -324,6 +401,18 @@ mod tests {
         assert!(!matches("\\*", "a"));
         assert!(matches("*.rs", "main.rs"));
         assert!(matches("é*", "école"));
+    }
+
+    #[test]
+    fn groups_and_alternation() {
+        assert!(matches("([1-4]*)", "4.0"));
+        assert!(!matches("([1-4]*)", "5.9"));
+        assert!(!matches("([1-4]*)", ""));
+        assert!(matches("*.(rs|toml)", "Cargo.toml"));
+        assert!(matches("(a|b)(c|d)", "bd"));
+        assert!(!matches("(a|b)(c|d)", "ab"));
+        assert!(matches("a(", "a("));
+        assert!(matches("\\(x\\)", "(x)"));
     }
 
     #[test]

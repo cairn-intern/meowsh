@@ -5,6 +5,8 @@ pub enum Tok {
     Word(String),
     IoNumber(i32),
     Op(&'static str),
+    // `(( expr ))`, holding the expression text.
+    Arith(String),
     Newline,
     Eof,
 }
@@ -446,7 +448,14 @@ impl Lexer {
             }
         }
 
-        if is_operator_start(c) {
+        if c == '(' && self.chars.get(self.pos + 1) == Some(&'(') {
+            if let Some(t) = self.try_arith()? {
+                return Ok(t);
+            }
+        }
+
+        let procsub = matches!(c, '<' | '>') && self.chars.get(self.pos + 1) == Some(&'(');
+        if is_operator_start(c) && !procsub {
             for op in OPERATORS {
                 let len = op.chars().count();
                 if self.pos + len <= self.chars.len()
@@ -464,12 +473,38 @@ impl Lexer {
         self.read_word().map(Tok::Word)
     }
 
+    // `((` starts an arithmetic command when its parentheses close with
+    // `))`; otherwise it is two subshell openers, as in `((cmd); cmd)`.
+    fn try_arith(&mut self) -> Result<Option<Tok>, LexError> {
+        let Some(inner_end) = scan_paren(&self.chars, self.pos + 1) else {
+            return if self.final_input {
+                Ok(None)
+            } else {
+                Err(LexError::Incomplete)
+            };
+        };
+        if self.chars.get(inner_end) != Some(&')') {
+            return Ok(None);
+        }
+        let expr: String = self.chars[self.pos + 2..inner_end - 1].iter().collect();
+        self.pos = inner_end + 1;
+        Ok(Some(Tok::Arith(expr)))
+    }
+
     fn read_word(&mut self) -> Result<String, LexError> {
         let mut out = String::new();
         while self.pos < self.chars.len() {
             let c = self.chars[self.pos];
             match c {
                 ' ' | '\t' | '\n' => break,
+                // Process substitution `<(...)` / `>(...)` at word start.
+                '<' | '>' if out.is_empty() && self.chars.get(self.pos + 1) == Some(&'(') => {
+                    let end = scan_paren(&self.chars, self.pos + 1).ok_or_else(|| {
+                        self.incomplete("unexpected end of file while looking for matching `)'")
+                    })?;
+                    out.extend(&self.chars[self.pos..end]);
+                    self.pos = end;
+                }
                 c if is_operator_start(c) => break,
                 '\\' => {
                     if self.pos + 1 >= self.chars.len() {

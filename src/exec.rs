@@ -175,6 +175,10 @@ pub fn exit_shell(status: i32) -> ! {
         exit_child(status);
     }
     with_shell(|s| s.flow = Flow::None);
+    if interactive() {
+        crate::builtins::run_hooks("zshexit", &[]);
+        with_shell(|s| s.flow = Flow::None);
+    }
     crate::trap::run_exit_trap();
     let status = match flow() {
         Flow::Exit(n) => n,
@@ -550,6 +554,13 @@ fn expand_command_words(raw: &[String]) -> ExpResult<Vec<String>> {
 // ---- node execution -------------------------------------------------------
 
 pub fn exec_node(node: &Node) -> i32 {
+    let mark = procsub_mark();
+    let st = exec_node_inner(node);
+    procsub_close_from(mark);
+    st
+}
+
+fn exec_node_inner(node: &Node) -> i32 {
     if flow_pending() {
         return last_status();
     }
@@ -559,6 +570,7 @@ pub fn exec_node(node: &Node) -> i32 {
     let status = match node {
         Node::Simple(cmd) => {
             let st = exec_simple(cmd, false);
+            set_pipestatus(&[st]);
             check_errexit(st);
             st
         }
@@ -577,6 +589,17 @@ pub fn exec_node(node: &Node) -> i32 {
         } => exec_if(branches, else_body.as_deref()),
         Node::Loop { cond, body, until } => exec_loop(cond, body, *until),
         Node::For { var, words, body } => exec_for(var, words.as_deref(), body),
+        Node::Arith(expr) => {
+            let st = arith_status(expr);
+            check_errexit(st);
+            st
+        }
+        Node::ForArith {
+            init,
+            cond,
+            step,
+            body,
+        } => exec_for_arith(init, cond, step, body),
         Node::Case { word, items } => exec_case(word, items),
         Node::FuncDef { name, body } => {
             with_shell(|s| {
@@ -891,6 +914,13 @@ fn exec_pipeline(cmds: &[Node], bang: bool) -> i32 {
     status
 }
 
+/// zsh's `$pipestatus`: the exit status of each command of the last
+/// pipeline.
+fn set_pipestatus(codes: &[i32]) {
+    let items = codes.iter().map(|c| c.to_string()).collect();
+    with_shell(|s| s.arrays.insert("pipestatus".to_string(), items));
+}
+
 fn run_pipeline(cmds: &[Node]) -> i32 {
     let text = cmds.iter().map(describe).collect::<Vec<_>>().join(" | ");
     let mut pids = Vec::new();
@@ -942,6 +972,7 @@ fn run_pipeline(cmds: &[Node]) -> i32 {
         return 1;
     }
     let codes = wait_foreground(&pids, pgid, &text);
+    set_pipestatus(&codes);
     if opt_set(OPT_PIPEFAIL) {
         codes.iter().rev().find(|&&c| c != 0).copied().unwrap_or(0)
     } else {
@@ -1123,6 +1154,46 @@ fn exec_for(var: &str, words: Option<&[String]>, body: &Node) -> i32 {
     status
 }
 
+// 0 if the expression is non-zero, 1 if zero, 2 on error.
+fn arith_status(expr: &str) -> i32 {
+    match crate::expand::eval_arith(expr) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => 2,
+    }
+}
+
+fn exec_for_arith(init: &str, cond: &str, step: &str, body: &Node) -> i32 {
+    if !init.is_empty() && crate::expand::eval_arith(init).is_err() {
+        return 1;
+    }
+    let mut status = 0;
+    with_shell(|s| s.loop_depth += 1);
+    loop {
+        if !cond.is_empty() {
+            match crate::expand::eval_arith(cond) {
+                Ok(false) => break,
+                Ok(true) => {}
+                Err(_) => {
+                    status = 1;
+                    break;
+                }
+            }
+        }
+        status = exec_node(body);
+        if loop_control() == Some(true) {
+            break;
+        }
+        crate::trap::run_pending();
+        if !step.is_empty() && crate::expand::eval_arith(step).is_err() {
+            status = 1;
+            break;
+        }
+    }
+    with_shell(|s| s.loop_depth -= 1);
+    status
+}
+
 fn exec_case(word: &str, items: &[CaseItem]) -> i32 {
     let w = match expand_string(word) {
         Ok(w) => w,
@@ -1256,6 +1327,68 @@ pub fn command_subst(src: &str) -> (String, i32) {
     (String::from_utf8_lossy(&bytes).into_owned(), status)
 }
 
+// Descriptors handed out by process substitution, closed once the
+// command that expanded them finishes.
+static PROCSUB_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+fn procsub_mark() -> usize {
+    PROCSUB_FDS.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+fn procsub_close_from(mark: usize) {
+    let fds: Vec<i32> = {
+        let mut v = PROCSUB_FDS.lock().unwrap_or_else(|e| e.into_inner());
+        if v.len() <= mark {
+            return;
+        }
+        v.drain(mark..).collect()
+    };
+    for fd in fds {
+        close(fd);
+    }
+}
+
+/// `<(src)` (`read` true) or `>(src)`: runs `src` in the background
+/// connected to a pipe and returns a `/dev/fd` path for the other end.
+pub fn process_subst(src: &str, read: bool) -> Option<String> {
+    let (r, w) = match pipe_cloexec() {
+        Ok(p) => p,
+        Err(e) => {
+            err_line(&format!("meowsh: pipe: {}", e));
+            return None;
+        }
+    };
+    let (mine, theirs) = if read { (r, w) } else { (w, r) };
+    let pid = fork_process(ForkKind::Inline);
+    if pid == 0 {
+        unsafe {
+            libc::close(mine);
+            libc::dup2(theirs, if read { 1 } else { 0 });
+            libc::close(theirs);
+        }
+        let st = run_string(src);
+        exit_child(st);
+    }
+    close(theirs);
+    if pid < 0 {
+        close(mine);
+        return None;
+    }
+    // The path must stay valid across exec, so the descriptor is
+    // inheritable; it is closed in the shell when the command ends.
+    let fd = dup_high(mine);
+    close(mine);
+    if fd < 0 {
+        return None;
+    }
+    unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+    PROCSUB_FDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(fd);
+    Some(format!("/dev/fd/{}", fd))
+}
+
 /// One line of input for `run_input`.
 pub enum InputLine {
     Line(String),
@@ -1306,6 +1439,7 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                     buf = rest;
                     if is_interactive {
                         on_command(&text);
+                        crate::builtins::run_hooks("preexec", &[text.clone(), text.clone(), text]);
                     }
                     exec_node(&node);
                     crate::trap::run_pending();

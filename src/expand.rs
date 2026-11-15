@@ -165,6 +165,9 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
         };
         return Ok(Val::List(items, star));
     }
+    if let Some(v) = subscript_search(name, sub, is_assoc)? {
+        return Ok(v);
+    }
     if is_assoc {
         let key = expand_string(sub)?;
         return Ok(match assoc_get(name, &key) {
@@ -191,6 +194,71 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
         Some(v) if idx == 0 || idx == 1 => Ok(Val::Str(v)),
         _ => Ok(Val::Unset),
     }
+}
+
+/// zsh subscript flags: `(i)`/`(I)` give the first/last index (keys for
+/// associative arrays) whose element matches the pattern, `(r)`/`(R)` the
+/// first/last matching value. `(e)` matches the text literally. Returns
+/// None when `sub` has no such flags.
+fn subscript_search(name: &str, sub: &str, is_assoc: bool) -> ExpResult<Option<Val>> {
+    let Some(rest) = sub.strip_prefix('(') else {
+        return Ok(None);
+    };
+    let Some(close) = rest.find(')') else {
+        return Ok(None);
+    };
+    let flags = &rest[..close];
+    if flags.is_empty() || !flags.chars().all(|c| "iIrRe".contains(c)) {
+        return Ok(None);
+    }
+    let word = &rest[close + 1..];
+    let exact = flags.contains('e');
+    let pat = if exact {
+        expand_string(word)?
+    } else {
+        expand_pattern(word)?
+    };
+    let hit = |v: &str| {
+        if exact {
+            v == pat
+        } else {
+            crate::pattern::matches(&pat, v)
+        }
+    };
+    let last = flags.contains('I') || flags.contains('R');
+    let want_value = flags.contains('r') || flags.contains('R');
+    if is_assoc {
+        let keys = assoc_keys(name).unwrap_or_default();
+        let mut found = keys.iter().filter_map(|k| {
+            let v = assoc_get(name, k).unwrap_or_default();
+            if want_value {
+                hit(&v).then_some(v)
+            } else {
+                hit(k).then(|| k.clone())
+            }
+        });
+        let r = if last {
+            found.next_back()
+        } else {
+            found.next()
+        };
+        return Ok(Some(r.map(Val::Str).unwrap_or(Val::Unset)));
+    }
+    let items = with_shell(|s| s.arrays.get(name).cloned())
+        .or_else(|| var_get_opt(name).map(|v| vec![v]))
+        .unwrap_or_default();
+    let mut idx = items
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| hit(v))
+        .map(|(k, _)| k);
+    let found = if last { idx.next_back() } else { idx.next() };
+    Ok(Some(match (found, want_value) {
+        (Some(k), true) => Val::Str(items[k].clone()),
+        (None, true) => Val::Unset,
+        (Some(k), false) => Val::Str((k + 1).to_string()),
+        (None, false) => Val::Str(if last { 0 } else { items.len() + 1 }.to_string()),
+    }))
 }
 
 fn check_set(name: &str, val: &Val) -> ExpResult<()> {
@@ -311,6 +379,24 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                 i = next;
             }
             '$' => i = expand_dollar(chars, i, mode, ctx)?,
+            '<' | '>'
+                if mode == Mode::Unquoted
+                    && i == 0
+                    && ctx.unquoted_lit == 0
+                    && chars.get(1) == Some(&'(') =>
+            {
+                let (ie, next) = bounds(scan_paren(chars, 1), n);
+                let src: String = chars[2..ie.max(2)].iter().collect();
+                match crate::exec::process_subst(&src, c == '<') {
+                    Some(path) => {
+                        for d in path.chars() {
+                            ctx.push(d, Q);
+                        }
+                    }
+                    None => return Err(ExpError { status: 1 }),
+                }
+                i = next;
+            }
             '~' if mode == Mode::Unquoted && (i == 0 || (ctx.assign && chars[i - 1] == ':')) => {
                 match tilde(chars, i, ctx.assign) {
                     Some((dir, next)) => {
@@ -406,10 +492,18 @@ fn eval_arith_str(expr: &str) -> ExpResult<i64> {
     }
 }
 
-fn arith(expr: &[char]) -> ExpResult<i64> {
+fn arith_num(expr: &[char]) -> ExpResult<crate::arith::Num> {
     let mut ctx = Ctx::new(false, false);
     walk(expr, Mode::Dq, &mut ctx)?;
-    eval_arith_str(&ctx.joined())
+    let text = ctx.joined();
+    crate::arith::eval_num(&text).or_else(|e| fail(&format!("{}: {}", text.trim(), e)))
+}
+
+/// Expands and evaluates the text of an arithmetic command; the result
+/// is true when non-zero.
+pub fn eval_arith(expr: &str) -> ExpResult<bool> {
+    let chars: Vec<char> = expr.chars().collect();
+    arith_num(&chars).map(crate::arith::Num::truthy)
 }
 
 fn is_special_param(c: char) -> bool {
@@ -442,7 +536,7 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
                 && chars[end - 2] == ')'
                 && scan_paren(chars, i + 2) == Some(end - 1);
             if is_arith {
-                let v = arith(&chars[i + 3..end - 2])?;
+                let v = arith_num(&chars[i + 3..end - 2])?;
                 emit_str(ctx, &v.to_string(), quoted);
             } else {
                 let src: String = chars[i + 2..end - 1].iter().collect();

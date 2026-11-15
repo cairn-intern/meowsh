@@ -109,9 +109,28 @@ fn unary(op: &str, arg: &str) -> TResult {
                 .map_err(|_| format!("{}: integer expression expected", arg))?;
             unsafe { libc::isatty(fd) == 1 }
         }
-        "-v" => crate::shell::var_exists(arg),
+        "-v" => var_is_set(arg),
         _ => return Err(format!("{}: unary operator expected", op)),
     })
+}
+
+// `-v name` or `-v name[subscript]`.
+fn var_is_set(arg: &str) -> bool {
+    let Some((name, sub)) = arg.strip_suffix(']').and_then(|a| a.split_once('[')) else {
+        return crate::shell::var_exists(arg);
+    };
+    if let Some(v) = crate::shell::assoc_get(name, sub) {
+        return !v.is_empty()
+            || crate::shell::assoc_keys(name).is_some_and(|k| k.iter().any(|k| k == sub));
+    }
+    let Some(items) = crate::shell::with_shell(|s| s.arrays.get(name).cloned()) else {
+        return false;
+    };
+    match crate::arith::eval(sub) {
+        Ok(i) if i > 0 => (i as usize) <= items.len(),
+        Ok(i) if i < 0 => i.unsigned_abs() as usize <= items.len(),
+        _ => false,
+    }
 }
 
 fn int(s: &str) -> Result<i64, String> {
@@ -379,8 +398,33 @@ impl DbParser<'_> {
             if is_binary(op) && self.pos + 2 < self.toks.len() {
                 let op = op.to_string();
                 let lhs = self.toks[self.pos].clone();
-                let rhs = self.toks[self.pos + 2].clone();
+                let mut rhs = self.toks[self.pos + 2].clone();
                 self.pos += 3;
+                // zsh: a pattern with groups, `== *.(a|b)`, arrives split
+                // at the parentheses; rejoin the pieces.
+                if matches!(op.as_str(), "=" | "==" | "!=") {
+                    let mut depth = (rhs == "(") as i32;
+                    while let Some(t) = self.toks.get(self.pos) {
+                        if depth == 0 && t != "(" {
+                            break;
+                        }
+                        depth += (t == "(") as i32 - (t == ")") as i32;
+                        rhs.push_str(t);
+                        self.pos += 1;
+                        if depth == 0 {
+                            // Text glued after the group, as in `(a|b)*`.
+                            if let Some(t) = self.toks.get(self.pos) {
+                                if !matches!(t.as_str(), "&&" | "||" | "(" | ")" | "]]") {
+                                    rhs.push_str(t);
+                                    self.pos += 1;
+                                }
+                            }
+                        }
+                    }
+                    if depth != 0 {
+                        return Err("expected `)'".to_string());
+                    }
+                }
                 if !run {
                     return Ok(false);
                 }

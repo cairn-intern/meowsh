@@ -1,12 +1,60 @@
-//! Arithmetic expansion: `$(( ))`. Signed 64-bit, wrapping on overflow,
-//! C operator precedence, assignment operators, and short-circuiting
+//! Arithmetic expansion: `$(( ))`. Signed 64-bit integers wrapping on
+//! overflow, zsh-style floats and math functions, C operator precedence, assignment operators, and short-circuiting
 //! `&&`, `||`, and `?:` that skip side effects in unevaluated operands.
 
 use std::cell::Cell;
 
+/// An arithmetic value. Integers are signed 64-bit and wrap on overflow;
+/// any float operand makes the result a float, as in zsh.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Num {
+    I(i64),
+    F(f64),
+}
+
+impl Num {
+    pub fn as_int(self) -> i64 {
+        match self {
+            Num::I(n) => n,
+            Num::F(f) => f as i64,
+        }
+    }
+
+    fn as_float(self) -> f64 {
+        match self {
+            Num::I(n) => n as f64,
+            Num::F(f) => f,
+        }
+    }
+
+    pub fn truthy(self) -> bool {
+        match self {
+            Num::I(n) => n != 0,
+            Num::F(f) => f != 0.0,
+        }
+    }
+}
+
+impl std::fmt::Display for Num {
+    // Floats always show a decimal point (`1.`), like zsh.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Num::I(n) => write!(f, "{}", n),
+            Num::F(x) => {
+                let s = format!("{}", x);
+                if x.is_finite() && !s.contains('.') && !s.contains('e') {
+                    write!(f, "{}.", s)
+                } else {
+                    write!(f, "{}", s)
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum T {
-    Num(i64),
+    Num(Num),
     Ident(String),
     Op(&'static str),
 }
@@ -44,6 +92,26 @@ pub fn parse_number(s: &str) -> Result<i64, String> {
     Ok(if neg { v.wrapping_neg() } else { v })
 }
 
+// A decimal float literal: digits with a `.` and/or an exponent.
+fn parse_float(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let body = t.strip_prefix(['-', '+']).unwrap_or(t);
+    let decimal = body
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '-' | '+'));
+    if !decimal || body.starts_with("0x") || !(body.contains('.') || body.contains(['e', 'E'])) {
+        return None;
+    }
+    t.parse::<f64>().ok()
+}
+
+fn parse_value(s: &str) -> Result<Num, String> {
+    if let Some(f) = parse_float(s) {
+        return Ok(Num::F(f));
+    }
+    parse_number(s).map(Num::I)
+}
+
 fn tokenize(s: &str) -> Result<Vec<T>, String> {
     let c: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
@@ -54,13 +122,21 @@ fn tokenize(s: &str) -> Result<Vec<T>, String> {
             i += 1;
             continue;
         }
-        if ch.is_ascii_digit() {
+        if ch.is_ascii_digit() || (ch == '.' && c.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
             let start = i;
-            while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '#' || c[i] == '_') {
-                i += 1;
+            while i < c.len() {
+                let d = c[i];
+                let exp_sign = matches!(d, '+' | '-')
+                    && matches!(c[i - 1], 'e' | 'E')
+                    && !c[start..i].iter().any(|x| matches!(x, 'x' | 'X' | '#'));
+                if d.is_ascii_alphanumeric() || d == '#' || d == '_' || d == '.' || exp_sign {
+                    i += 1;
+                } else {
+                    break;
+                }
             }
             let text: String = c[start..i].iter().collect();
-            out.push(T::Num(parse_number(&text)?));
+            out.push(T::Num(parse_value(&text)?));
             continue;
         }
         if ch.is_ascii_alphabetic() || ch == '_' {
@@ -96,19 +172,19 @@ struct P {
     pos: usize,
 }
 
-type R = Result<i64, String>;
+type R = Result<Num, String>;
 
 fn var_value(name: &str) -> R {
     let Some(val) = crate::shell::var_get_opt(name) else {
         if crate::shell::opt_set(crate::types::OPT_NOUNSET) {
             return Err(format!("{}: parameter not set", name));
         }
-        return Ok(0);
+        return Ok(Num::I(0));
     };
     if val.trim().is_empty() {
-        return Ok(0);
+        return Ok(Num::I(0));
     }
-    if let Ok(n) = parse_number(&val) {
+    if let Ok(n) = parse_value(&val) {
         return Ok(n);
     }
     // A variable holding an expression is evaluated recursively.
@@ -117,12 +193,12 @@ fn var_value(name: &str) -> R {
         return Err(format!("{}: expression recursion level exceeded", name));
     }
     DEPTH.with(|d| d.set(depth + 1));
-    let r = eval(&val);
+    let r = eval_num(&val);
     DEPTH.with(|d| d.set(depth));
     r
 }
 
-fn binop(op: &str, l: i64, r: i64) -> R {
+fn int_binop(op: &str, l: i64, r: i64) -> Result<i64, String> {
     Ok(match op {
         "+" => l.wrapping_add(r),
         "-" => l.wrapping_sub(r),
@@ -159,6 +235,74 @@ fn binop(op: &str, l: i64, r: i64) -> R {
         }
         _ => return Err(format!("unknown operator {}", op)),
     })
+}
+
+fn binop(op: &str, l: Num, r: Num) -> R {
+    let either_float = matches!(l, Num::F(_)) || matches!(r, Num::F(_));
+    // Bitwise operators always work on integers.
+    if !either_float || matches!(op, "<<" | ">>" | "&" | "^" | "|") {
+        return int_binop(op, l.as_int(), r.as_int()).map(Num::I);
+    }
+    let (a, b) = (l.as_float(), r.as_float());
+    Ok(Num::F(match op {
+        "+" => a + b,
+        "-" => a - b,
+        "*" => a * b,
+        "/" => a / b,
+        "%" => a % b,
+        "**" => a.powf(b),
+        _ => return Err(format!("unknown operator {}", op)),
+    }))
+}
+
+fn compare(op: &str, l: Num, r: Num) -> bool {
+    let ord = match (l, r) {
+        (Num::I(a), Num::I(b)) => a.partial_cmp(&b),
+        _ => l.as_float().partial_cmp(&r.as_float()),
+    };
+    use std::cmp::Ordering::*;
+    match op {
+        "==" => ord == Some(Equal),
+        "!=" => ord != Some(Equal),
+        "<" => ord == Some(Less),
+        "<=" => matches!(ord, Some(Less | Equal)),
+        ">" => ord == Some(Greater),
+        _ => matches!(ord, Some(Greater | Equal)),
+    }
+}
+
+// zsh/mathfunc functions.
+fn call(name: &str, args: &[Num]) -> R {
+    let one = |f: fn(f64) -> f64| -> R {
+        match args {
+            [x] => Ok(Num::F(f(x.as_float()))),
+            _ => Err(format!("{}: wrong number of arguments", name)),
+        }
+    };
+    match name {
+        "int" => match args {
+            [x] => Ok(Num::I(x.as_int())),
+            _ => Err(format!("{}: wrong number of arguments", name)),
+        },
+        "float" => one(|x| x),
+        "abs" => match args {
+            [Num::I(n)] => Ok(Num::I(n.wrapping_abs())),
+            _ => one(f64::abs),
+        },
+        "rint" => one(f64::round_ties_even),
+        "ceil" => one(f64::ceil),
+        "floor" => one(f64::floor),
+        "trunc" => one(f64::trunc),
+        "sqrt" => one(f64::sqrt),
+        "exp" => one(f64::exp),
+        "log" => one(f64::ln),
+        "log2" => one(f64::log2),
+        "log10" => one(f64::log10),
+        "sin" => one(f64::sin),
+        "cos" => one(f64::cos),
+        "tan" => one(f64::tan),
+        _ => Err(format!("{}: unknown function", name)),
+    }
 }
 
 impl P {
@@ -200,7 +344,7 @@ impl P {
                 self.pos += 2;
                 let rhs = self.assign(skip)?;
                 if skip {
-                    return Ok(0);
+                    return Ok(Num::I(0));
                 }
                 let v = if op == "=" {
                     rhs
@@ -215,23 +359,24 @@ impl P {
     }
 
     fn ternary(&mut self, skip: bool) -> R {
-        let c = self.lor(skip)?;
+        let v = self.lor(skip)?;
         if self.eat_op(&["?"]).is_some() {
-            let a = self.comma(skip || c == 0)?;
+            let c = v.truthy();
+            let a = self.comma(skip || !c)?;
             if self.eat_op(&[":"]).is_none() {
                 return Err("`:' expected for conditional expression".to_string());
             }
-            let b = self.assign(skip || c != 0)?;
-            return Ok(if c != 0 { a } else { b });
+            let b = self.assign(skip || c)?;
+            return Ok(if c { a } else { b });
         }
-        Ok(c)
+        Ok(v)
     }
 
     fn lor(&mut self, skip: bool) -> R {
         let mut l = self.land(skip)?;
         while self.eat_op(&["||"]).is_some() {
-            let r = self.land(skip || l != 0)?;
-            l = (l != 0 || r != 0) as i64;
+            let r = self.land(skip || l.truthy())?;
+            l = Num::I((l.truthy() || r.truthy()) as i64);
         }
         Ok(l)
     }
@@ -239,8 +384,8 @@ impl P {
     fn land(&mut self, skip: bool) -> R {
         let mut l = self.binary(0, skip)?;
         while self.eat_op(&["&&"]).is_some() {
-            let r = self.binary(0, skip || l == 0)?;
-            l = (l != 0 && r != 0) as i64;
+            let r = self.binary(0, skip || !l.truthy())?;
+            l = Num::I((l.truthy() && r.truthy()) as i64);
         }
         Ok(l)
     }
@@ -264,13 +409,8 @@ impl P {
         while let Some(op) = self.eat_op(LEVELS[level]) {
             let r = self.binary(level + 1, skip)?;
             l = match op {
-                "==" => (l == r) as i64,
-                "!=" => (l != r) as i64,
-                "<" => (l < r) as i64,
-                "<=" => (l <= r) as i64,
-                ">" => (l > r) as i64,
-                ">=" => (l >= r) as i64,
-                _ if skip => 0,
+                "==" | "!=" | "<" | "<=" | ">" | ">=" => Num::I(compare(op, l, r) as i64),
+                _ if skip => Num::I(0),
                 _ => binop(op, l, r)?,
             };
         }
@@ -282,7 +422,7 @@ impl P {
         if self.eat_op(&["**"]).is_some() {
             let exp = self.power(skip)?;
             if skip {
-                return Ok(0);
+                return Ok(Num::I(0));
             }
             return binop("**", base, exp);
         }
@@ -298,23 +438,20 @@ impl P {
                 };
                 self.pos += 1;
                 if skip {
-                    return Ok(0);
+                    return Ok(Num::I(0));
                 }
                 let v = var_value(&name)?;
-                let nv = if op == "++" {
-                    v.wrapping_add(1)
-                } else {
-                    v.wrapping_sub(1)
-                };
+                let nv = binop(if op == "++" { "+" } else { "-" }, v, Num::I(1))?;
                 set_var(&name, nv)?;
                 return Ok(nv);
             }
             let v = self.unary(skip)?;
-            return Ok(match op {
-                "+" => v,
-                "-" => v.wrapping_neg(),
-                "!" => (v == 0) as i64,
-                _ => !v,
+            return Ok(match (op, v) {
+                ("+", v) => v,
+                ("-", Num::I(n)) => Num::I(n.wrapping_neg()),
+                ("-", Num::F(f)) => Num::F(-f),
+                ("!", v) => Num::I(!v.truthy() as i64),
+                (_, v) => Num::I(!v.as_int()),
             });
         }
         self.postfix(skip)
@@ -328,21 +465,35 @@ impl P {
             }
             Some(T::Ident(name)) => {
                 self.pos += 1;
+                if self.peek_op("(") {
+                    self.pos += 1;
+                    let mut args = Vec::new();
+                    if !self.peek_op(")") {
+                        args.push(self.assign(skip)?);
+                        while self.eat_op(&[","]).is_some() {
+                            args.push(self.assign(skip)?);
+                        }
+                    }
+                    if !self.peek_op(")") {
+                        return Err("missing `)'".to_string());
+                    }
+                    self.pos += 1;
+                    if skip {
+                        return Ok(Num::I(0));
+                    }
+                    return call(&name, &args);
+                }
                 if let Some(op) = self.eat_op(&["++", "--"]) {
                     if skip {
-                        return Ok(0);
+                        return Ok(Num::I(0));
                     }
                     let v = var_value(&name)?;
-                    let nv = if op == "++" {
-                        v.wrapping_add(1)
-                    } else {
-                        v.wrapping_sub(1)
-                    };
+                    let nv = binop(if op == "++" { "+" } else { "-" }, v, Num::I(1))?;
                     set_var(&name, nv)?;
                     return Ok(v);
                 }
                 if skip {
-                    return Ok(0);
+                    return Ok(Num::I(0));
                 }
                 var_value(&name)
             }
@@ -364,7 +515,7 @@ impl P {
     }
 }
 
-fn set_var(name: &str, v: i64) -> Result<(), String> {
+fn set_var(name: &str, v: Num) -> Result<(), String> {
     if crate::shell::var_set(name, &v.to_string(), false) {
         Ok(())
     } else {
@@ -374,10 +525,10 @@ fn set_var(name: &str, v: i64) -> Result<(), String> {
 
 /// Evaluates an arithmetic expression whose parameter expansions and
 /// command substitutions have already been performed.
-pub fn eval(expr: &str) -> R {
+pub fn eval_num(expr: &str) -> R {
     let toks = tokenize(expr)?;
     if toks.is_empty() {
-        return Ok(0);
+        return Ok(Num::I(0));
     }
     let mut p = P { toks, pos: 0 };
     let v = p.comma(false)?;
@@ -388,6 +539,11 @@ pub fn eval(expr: &str) -> R {
         ));
     }
     Ok(v)
+}
+
+/// Like `eval_num`, truncating a float result to an integer.
+pub fn eval(expr: &str) -> Result<i64, String> {
+    eval_num(expr).map(Num::as_int)
 }
 
 #[cfg(test)]
@@ -418,6 +574,20 @@ mod tests {
     fn division_by_zero_is_error() {
         assert!(eval("7/0").is_err());
         assert!(eval("7%0").is_err());
+    }
+
+    #[test]
+    fn floats_and_math_functions() {
+        assert_eq!(eval_num("1.5 * 2"), Ok(Num::F(3.0)));
+        assert_eq!(eval_num("10 / 4.").map(|n| n.to_string()), Ok("2.5".into()));
+        assert_eq!(eval_num("1.0").map(|n| n.to_string()), Ok("1.".into()));
+        assert_eq!(eval_num("int(rint(2.5 * 1000))"), Ok(Num::I(2500)));
+        assert_eq!(eval_num("int(1.9)"), Ok(Num::I(1)));
+        assert_eq!(eval_num("floor(-1.5)"), Ok(Num::F(-2.0)));
+        assert_eq!(eval_num("1e3"), Ok(Num::F(1000.0)));
+        assert_eq!(eval_num("0.5 < 1"), Ok(Num::I(1)));
+        assert_eq!(eval("7 / 2"), Ok(3));
+        assert!(eval_num("nope(1)").is_err());
     }
 
     #[test]

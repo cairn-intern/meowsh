@@ -37,6 +37,9 @@ pub struct Parser {
     // also checked for alias expansion.
     alias_next: bool,
     alias_lookup: AliasLookup,
+    // Open `{ ... }` groups; inside one, a bare `}` ends a simple command
+    // as in zsh (`{ echo hi }`).
+    brace_depth: usize,
 }
 
 impl Parser {
@@ -48,6 +51,7 @@ impl Parser {
             alias_guard: Vec::new(),
             alias_next: false,
             alias_lookup: Box::new(crate::shell::alias_get),
+            brace_depth: 0,
         }
     }
 
@@ -310,7 +314,10 @@ impl Parser {
                 "case" => self.parse_case()?,
                 "{" => {
                     self.next()?;
-                    let body = self.parse_list(false)?;
+                    self.brace_depth += 1;
+                    let body = self.parse_list(false);
+                    self.brace_depth -= 1;
+                    let body = body?;
                     self.expect_word("}")?;
                     Node::Brace(Box::new(body))
                 }
@@ -326,6 +333,11 @@ impl Parser {
                 let body = self.parse_list(false)?;
                 self.expect_op(")")?;
                 Node::Subshell(Box::new(body))
+            }
+            Tok::Arith(e) => {
+                let e = e.clone();
+                self.next()?;
+                Node::Arith(e)
             }
             Tok::Eof => return Err(self.eof_error("a command")),
             Tok::IoNumber(_)
@@ -432,6 +444,9 @@ impl Parser {
                 Tok::Word(w) => w.clone(),
                 _ => break,
             };
+            if word == "}" && self.brace_depth > 0 && !cmd.words.is_empty() {
+                break;
+            }
             if cmd.words.is_empty() {
                 if let Some((name, subscript, append, value)) = assignment_split(&word) {
                     self.next()?;
@@ -567,6 +582,35 @@ impl Parser {
 
     fn parse_for(&mut self) -> PResult<Node> {
         self.next()?; // for
+        if let Tok::Arith(e) = self.peek()? {
+            let parts: Vec<String> = e.split(';').map(|p| p.trim().to_string()).collect();
+            if parts.len() != 3 {
+                return Err(ParseError::Syntax(format!(
+                    "syntax error: `(({}))': expected three expressions",
+                    e
+                )));
+            }
+            self.next()?;
+            if self.peek_is_op(";")? {
+                self.next()?;
+            }
+            self.skip_newlines()?;
+            let body = if self.peek_is_word("{")? {
+                self.parse_command()?
+            } else {
+                self.expect_word("do")?;
+                let body = self.parse_list(false)?;
+                self.expect_word("done")?;
+                body
+            };
+            let mut it = parts.into_iter();
+            return Ok(Node::ForArith {
+                init: it.next().unwrap(),
+                cond: it.next().unwrap(),
+                step: it.next().unwrap(),
+                body: Box::new(body),
+            });
+        }
         let var = match self.next()? {
             Tok::Word(w) if is_valid_name(&w) => w,
             Tok::Eof => return Err(self.eof_error("a variable name")),
@@ -670,6 +714,11 @@ impl Parser {
                 Tok::Word(w) => args.push(w),
                 Tok::Op(op) => args.push(op.to_string()),
                 Tok::IoNumber(n) => args.push(n.to_string()),
+                Tok::Arith(e) => {
+                    args.push("(".into());
+                    args.push(format!("({})", e));
+                    args.push(")".into());
+                }
                 Tok::Newline => {}
                 Tok::Eof => return Err(self.eof_error("`]]'")),
             }
@@ -689,6 +738,7 @@ fn tok_text(t: &Tok) -> String {
         Tok::Word(w) => w.clone(),
         Tok::IoNumber(n) => n.to_string(),
         Tok::Op(o) => o.to_string(),
+        Tok::Arith(e) => format!("(({}))", e),
         Tok::Newline => "newline".to_string(),
         Tok::Eof => "end of file".to_string(),
     }
@@ -735,7 +785,7 @@ fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
             fill_heredocs(cond, bodies);
             fill_heredocs(body, bodies);
         }
-        Node::For { body, .. } => fill_heredocs(body, bodies),
+        Node::For { body, .. } | Node::ForArith { body, .. } => fill_heredocs(body, bodies),
         Node::Case { items, .. } => {
             for item in items {
                 if let Some(b) = item.body.as_mut() {
@@ -748,7 +798,7 @@ fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
             fill_heredocs(node, bodies);
             fill_redirs(redirs, bodies);
         }
-        Node::DBracket(_) | Node::Empty => {}
+        Node::DBracket(_) | Node::Arith(_) | Node::Empty => {}
     }
 }
 
@@ -838,6 +888,29 @@ mod tests {
             p.parse_complete_command(),
             Err(ParseError::Syntax(_))
         ));
+    }
+
+    #[test]
+    fn arithmetic_command_and_c_style_for() {
+        assert!(matches!(parse_one("(( x > 1 ))"), Node::Arith(e) if e == " x > 1 "));
+        assert!(matches!(
+            parse_one("for ((i=0; i<3; i++)); do echo $i; done"),
+            Node::ForArith { .. }
+        ));
+        assert!(matches!(parse_one("((echo a); echo b)"), Node::Subshell(_)));
+    }
+
+    #[test]
+    fn closing_brace_ends_command_inside_group() {
+        assert!(matches!(parse_one("{ echo hi }"), Node::Brace(_)));
+        assert!(matches!(
+            parse_one("f() { echo a b }"),
+            Node::FuncDef { .. }
+        ));
+        match parse_one("echo }") {
+            Node::Simple(c) => assert_eq!(c.words, vec!["echo", "}"]),
+            n => panic!("{:?}", n),
+        }
     }
 
     #[test]

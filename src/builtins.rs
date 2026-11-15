@@ -64,6 +64,8 @@ const REGULAR: &[&str] = &[
     "compaudit",
     "zmodload",
     "emulate",
+    "print",
+    "zle",
 ];
 
 const KEYWORDS: &[&str] = &[
@@ -131,9 +133,11 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "ulimit" => builtin_ulimit(words),
         "umask" => builtin_umask(words),
         "zstyle" => builtin_zstyle(&words[1..]),
-        // Accepted for zsh startup-file compatibility; no effect.
-        "add-zsh-hook" | "bindkey" | "compinit" | "compdef" | "compaudit" | "zmodload"
-        | "emulate" => 0,
+        "add-zsh-hook" => builtin_add_zsh_hook(words),
+        "print" => builtin_print(words),
+        // Accepted for zsh startup-file compatibility; no effect. There is
+        // no zle, so widgets defined with `zle -N` never run.
+        "bindkey" | "compinit" | "compdef" | "compaudit" | "zmodload" | "emulate" | "zle" => 0,
         _ => {
             err_line(&format!("meowsh: {}: not a builtin", name));
             1
@@ -1123,6 +1127,7 @@ fn builtin_cd(words: &[String]) -> i32 {
     if print {
         out(&format!("{}\n", new));
     }
+    run_hooks("chpwd", &[]);
     0
 }
 
@@ -1735,30 +1740,93 @@ fn builtin_ulimit(words: &[String]) -> i32 {
 // Best-effort autoload: for each function name, sources a file of that name
 // from $fpath; names that are not found become no-op functions so later
 // calls do not fail.
+// autoload [-UXzk] [+X] name...: marks functions to be loaded from the
+// first file of that name in $fpath when first called. As in zsh, the
+// file's contents are the function body. `+X` loads immediately.
+// Names that are meowsh builtins are left alone so the builtin runs.
 fn builtin_autoload(words: &[String]) -> i32 {
-    let fpath = with_shell(|s| s.arrays.get("fpath").cloned()).unwrap_or_default();
+    let mut load_now = false;
+    let mut status = 0;
     for arg in &words[1..] {
+        if arg == "+X" {
+            load_now = true;
+            continue;
+        }
         if arg.starts_with('-') || arg.starts_with('+') {
             continue;
         }
-        let file = fpath
-            .iter()
-            .map(|d| format!("{}/{}", d, arg))
-            .find(|p| std::path::Path::new(p).is_file());
-        match file {
-            Some(path) => {
-                source_file(&path, None);
+        if is_builtin(arg) {
+            continue;
+        }
+        if load_now {
+            if !autoload_now(arg) {
+                err_line(&format!(
+                    "meowsh: {}: function definition file not found",
+                    arg
+                ));
+                status = 1;
             }
-            None => {
-                with_shell(|s| {
-                    s.functions.entry(arg.clone()).or_insert(FuncDef {
-                        body: Arc::new(Node::Empty),
-                    });
-                });
-            }
+            continue;
+        }
+        let already = with_shell(|s| s.functions.contains_key(arg));
+        if already {
+            continue;
+        }
+        // The stub loads the real body, then runs it with the arguments.
+        let stub = format!("autoload +X {0} && {0} \"$@\"", shell_quote(arg));
+        let mut p = crate::parser::Parser::without_aliases(&stub, true);
+        if let Ok(Some(body)) = p.parse_complete_command() {
+            with_shell(|s| {
+                s.functions.insert(
+                    arg.clone(),
+                    FuncDef {
+                        body: Arc::new(body),
+                    },
+                )
+            });
         }
     }
-    0
+    status
+}
+
+fn autoload_now(name: &str) -> bool {
+    let fpath = with_shell(|s| s.arrays.get("fpath").cloned()).unwrap_or_default();
+    let Some(content) = fpath
+        .iter()
+        .map(|d| std::path::Path::new(d).join(name))
+        .find_map(|p| std::fs::read_to_string(p).ok())
+    else {
+        return false;
+    };
+    let mut parser = crate::parser::Parser::new(&content, true);
+    let body = match parser.parse_program() {
+        Ok(nodes) => Node::List(
+            nodes
+                .into_iter()
+                .map(|node| crate::types::ListItem {
+                    node,
+                    background: false,
+                })
+                .collect(),
+        ),
+        Err(e) => {
+            let msg = match e {
+                crate::parser::ParseError::Syntax(m) => m,
+                crate::parser::ParseError::Incomplete => "unexpected end of file".to_string(),
+            };
+            err_line(&format!("meowsh: {}: {}", name, msg));
+            return false;
+        }
+    };
+    with_shell(|s| {
+        s.functions.insert(
+            name.to_string(),
+            FuncDef {
+                body: Arc::new(body),
+            },
+        )
+    });
+    true
 }
 
 fn builtin_setopt(words: &[String], value: bool) -> i32 {
@@ -1939,9 +2007,159 @@ fn print_zstyles(filters: &[String]) {
 }
 
 /// Calls a shell function by name if one is defined (used for hooks).
-pub fn call_if_defined(name: &str) -> Option<i32> {
-    let body = with_shell(|s| s.functions.get(name).map(|f| f.body.clone()))?;
-    Some(call_function(&body, &[name.to_string()]))
+const HOOKS: &[&str] = &[
+    "chpwd",
+    "precmd",
+    "preexec",
+    "periodic",
+    "zshaddhistory",
+    "zshexit",
+];
+
+/// Runs zsh hook `hook`: the function of that name, then each function
+/// named in `${hook}_functions`. Each sees the `$?` and `$pipestatus`
+/// from before the hooks, and both are restored afterwards.
+pub fn run_hooks(hook: &str, args: &[String]) {
+    let mut names = vec![hook.to_string()];
+    let list = format!("{}_functions", hook);
+    names.extend(with_shell(|s| s.arrays.get(&list).cloned()).unwrap_or_default());
+    let saved = with_shell(|s| (s.last_status, s.arrays.get("pipestatus").cloned()));
+    let restore = || {
+        with_shell(|s| {
+            s.last_status = saved.0;
+            match &saved.1 {
+                Some(p) => s.arrays.insert("pipestatus".to_string(), p.clone()),
+                None => s.arrays.remove("pipestatus"),
+            };
+        })
+    };
+    for name in names {
+        let Some(body) = with_shell(|s| s.functions.get(&name).map(|f| f.body.clone())) else {
+            continue;
+        };
+        restore();
+        let mut words = vec![name];
+        words.extend(args.iter().cloned());
+        call_function(&body, &words);
+        if matches!(crate::exec::flow(), Flow::Exit(_)) {
+            return;
+        }
+        set_flow(Flow::None);
+    }
+    restore();
+}
+
+// add-zsh-hook [-d] hook function
+fn builtin_add_zsh_hook(words: &[String]) -> i32 {
+    let mut args: Vec<&str> = words[1..].iter().map(|s| s.as_str()).collect();
+    let mut delete = false;
+    while let Some(a) = args.first() {
+        match *a {
+            "-d" => delete = true,
+            "-D" | "-U" | "-z" | "-k" => {}
+            _ => break,
+        }
+        args.remove(0);
+    }
+    let [hook, func] = args[..] else {
+        return usage("add-zsh-hook", "usage: add-zsh-hook [-d] hook function");
+    };
+    if !HOOKS.contains(&hook) {
+        return usage("add-zsh-hook", &format!("{}: unknown hook", hook));
+    }
+    let list = format!("{}_functions", hook);
+    with_shell(|s| {
+        let fns = s.arrays.entry(list).or_default();
+        fns.retain(|f| f != func);
+        if !delete {
+            fns.push(func.to_string());
+        }
+    });
+    0
+}
+
+// zsh `print`: echo-style escapes unless -r; -n no newline, -l one
+// argument per line, -N NUL-separated, -P prompt escapes, -u fd.
+fn builtin_print(words: &[String]) -> i32 {
+    let mut i = 1;
+    let (mut raw, mut newline, mut lines, mut nul, mut prompt) = (false, true, false, false, false);
+    let mut fd = 1;
+    while let Some(a) = words.get(i) {
+        if a == "-" || a == "--" {
+            i += 1;
+            break;
+        }
+        let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            break;
+        };
+        if !flags.chars().all(|c| "rRnlNPeEu0123456789".contains(c)) {
+            break;
+        }
+        let mut chars = flags.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                'r' | 'R' => raw = true,
+                'E' => raw = true,
+                'e' => raw = false,
+                'n' => newline = false,
+                'l' => lines = true,
+                'N' => nul = true,
+                'P' => prompt = true,
+                'u' => {
+                    let rest: String = chars.by_ref().collect();
+                    let spec = if rest.is_empty() {
+                        i += 1;
+                        words.get(i).cloned().unwrap_or_default()
+                    } else {
+                        rest
+                    };
+                    match spec.parse() {
+                        Ok(n) => fd = n,
+                        Err(_) => return usage("print", &format!("{}: bad file number", spec)),
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    let sep = if nul {
+        "\0"
+    } else if lines {
+        "\n"
+    } else {
+        " "
+    };
+    let mut cut = false;
+    let mut parts = Vec::new();
+    for a in &words[i.min(words.len())..] {
+        let mut t = a.clone();
+        if !raw {
+            if let Some(k) = t.find("\\c") {
+                t.truncate(k);
+                cut = true;
+            }
+            t = crate::expand::decode_escapes(&t);
+        }
+        if prompt {
+            t = crate::shell::expand_prompt(&t);
+        }
+        parts.push(t);
+        if cut {
+            break;
+        }
+    }
+    let mut text = parts.join(sep);
+    if newline && !cut {
+        text.push(if nul { '\0' } else { '\n' });
+    }
+    match crate::sys::write_fd(fd, text.as_bytes()) {
+        Ok(()) => 0,
+        Err(e) => {
+            err_line(&format!("meowsh: print: write error: {}", e));
+            1
+        }
+    }
 }
 
 #[cfg(test)]

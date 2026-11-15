@@ -123,6 +123,7 @@ pub fn shell_init() {
         }
     }
 
+    START.get_or_init(std::time::Instant::now);
     seed_tied_array(&mut shell, "path", "PATH");
     seed_tied_array(&mut shell, "fpath", "FPATH");
 }
@@ -176,7 +177,78 @@ pub fn build_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
     map.into_iter().collect()
 }
 
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static RANDOM_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn terminal_size() -> Option<(u16, u16)> {
+    let tty = crate::jobs::TTY_FD.load(std::sync::atomic::Ordering::SeqCst);
+    for fd in [tty, 2, 0, 1] {
+        if fd < 0 {
+            continue;
+        }
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+            return Some((ws.ws_col, ws.ws_row));
+        }
+    }
+    None
+}
+
+/// Parameters computed on each read, as in zsh. A user assignment to
+/// RANDOM reseeds it; the others ignore assignments.
+fn dynamic_var(name: &str) -> Option<String> {
+    use std::sync::atomic::Ordering;
+    match name {
+        "RANDOM" => {
+            let mut x = RANDOM_STATE.load(Ordering::Relaxed);
+            if x == 0 {
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(1);
+                x = t ^ ((std::process::id() as u64) << 32) | 1;
+            }
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            RANDOM_STATE.store(x, Ordering::Relaxed);
+            Some(((x >> 33) % 32768).to_string())
+        }
+        "SECONDS" => Some(
+            START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs()
+                .to_string(),
+        ),
+        "EPOCHSECONDS" | "EPOCHREALTIME" => {
+            let d = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            Some(if name == "EPOCHSECONDS" {
+                d.as_secs().to_string()
+            } else {
+                format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
+            })
+        }
+        "COLUMNS" => terminal_size().map(|(c, _)| c.to_string()),
+        "LINES" => terminal_size().map(|(_, r)| r.to_string()),
+        _ => None,
+    }
+}
+
+/// Reseeds `$RANDOM` after `RANDOM=n`.
+pub fn seed_random(seed: u64) {
+    RANDOM_STATE.store(
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 pub fn var_get(name: &str) -> String {
+    if let Some(v) = dynamic_var(name) {
+        return v;
+    }
     let shell = SHELL.shell.lock().unwrap();
     match name {
         "$" => return format!("{}", shell.shell_pid),
@@ -252,6 +324,13 @@ pub fn var_get(name: &str) -> String {
 }
 
 pub fn var_exists(name: &str) -> bool {
+    if matches!(
+        name,
+        "RANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME"
+    ) || (matches!(name, "COLUMNS" | "LINES") && terminal_size().is_some())
+    {
+        return true;
+    }
     let shell = SHELL.shell.lock().unwrap();
     if matches!(name, "?" | "$" | "!" | "0" | "#" | "@" | "*" | "-") {
         return true;
@@ -277,6 +356,9 @@ pub fn var_get_if_exists(name: &str) -> Option<i64> {
 }
 
 pub fn var_set(name: &str, value: &str, export: bool) -> bool {
+    if name == "RANDOM" {
+        seed_random(value.trim().parse().unwrap_or(0));
+    }
     let mut shell = SHELL.shell.lock().unwrap();
     if shell
         .vars
@@ -628,9 +710,15 @@ pub fn build_prompt() -> String {
         let short_pwd = shorten_path(pwd);
         return format!("\x1b[32m{}\x1b[0m \x1b[34m{}\x1b[0m 𓃠  ", user, short_pwd);
     }
-    // zsh-style % escapes, then POSIX parameter expansion.
-    let escaped = expand_prompt(&prompt_str);
-    crate::expand::expand_prompt_string(&escaped).unwrap_or(escaped)
+    render_prompt(&prompt_str)
+}
+
+/// Parameter, command and arithmetic expansion, then zsh `%` escapes, the
+/// order zsh uses with PROMPT_SUBST. Text produced by a substitution may
+/// itself contain `%` escapes, as starship's output does.
+pub fn render_prompt(s: &str) -> String {
+    let expanded = crate::expand::expand_prompt_string(s).unwrap_or_else(|_| s.to_string());
+    expand_prompt(&expanded)
 }
 
 pub fn expand_prompt(s: &str) -> String {
@@ -952,6 +1040,15 @@ mod tests {
         shell_init();
         let s = expand_prompt("%{\x1b[31m%}red%{\x1b[0m%}");
         assert_eq!(s, "\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn test_prompt_expands_substitutions_before_percent_escapes() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        shell_init();
+        var_set("PS1", "", false);
+        var_set("PROMPT", "$(printf '%%{X%%}a')%%", false);
+        assert_eq!(build_prompt(), "Xa%");
     }
 
     #[test]
