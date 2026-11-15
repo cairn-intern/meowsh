@@ -186,10 +186,50 @@ pub fn exit_child(status: i32) -> ! {
 }
 
 /// Exits the shell: runs the EXIT trap and terminates the process.
+// Files made for `=(cmd)`, removed when the shell exits.
+static EQ_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// zsh's `=(cmd)`: the output of cmd in a temporary file, whose name is
+/// the result.
+pub fn output_file_subst(src: &str) -> Option<String> {
+    let (out, _) = command_subst(src);
+    let dir = std::env::var("TMPDIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "/tmp".to_string());
+    let mut buf = format!("{}/meowsh-eqXXXXXX", dir.trim_end_matches('/')).into_bytes();
+    buf.push(0);
+    let fd = unsafe { libc::mkstemp(buf.as_mut_ptr() as *mut libc::c_char) };
+    if fd < 0 {
+        shell_err(&format!(
+            "can't create temporary file: {}",
+            strerror(last_errno())
+        ));
+        return None;
+    }
+    let _ = crate::sys::write_fd(fd, out.as_bytes());
+    close(fd);
+    buf.pop();
+    let path = String::from_utf8_lossy(&buf).into_owned();
+    if let Ok(mut f) = EQ_FILES.lock() {
+        f.push(path.clone());
+    }
+    Some(path)
+}
+
+fn remove_eq_files() {
+    if let Ok(mut f) = EQ_FILES.lock() {
+        for p in f.drain(..) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 pub fn exit_shell(status: i32) -> ! {
     if with_shell(|s| s.in_subshell) {
         exit_child(status);
     }
+    remove_eq_files();
     with_shell(|s| s.flow = Flow::None);
     if interactive() {
         crate::builtins::run_hooks("zshexit", &[]);
@@ -222,6 +262,20 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
         find_command(name)
     };
     let Some(path) = path else {
+        // zsh runs command_not_found_handler with the command and its
+        // arguments, in the process that would have run the command.
+        let handler = with_shell(|s| {
+            s.functions
+                .get("command_not_found_handler")
+                .map(|f| (f.body.clone(), f.line))
+        });
+        if let Some((body, line)) = handler {
+            let mut args = vec!["command_not_found_handler".to_string()];
+            args.extend(words.iter().cloned());
+            let st = call_function(&body, &args, line);
+            let _ = std::io::stdout().flush();
+            unsafe { libc::_exit(st) }
+        }
         shell_err(&format!("command not found: {}", name));
         unsafe { libc::_exit(127) }
     };
@@ -886,6 +940,15 @@ fn exec_node_inner(node: &Node) -> i32 {
         } => exec_for_arith(init, cond, step, body),
         Node::Case { word, items } => exec_case(word, items),
         Node::FuncDef { name, body, line } => {
+            // zsh expands the name: `function f$$ { ... }`.
+            let name = &if name.contains(['$', '`', '\'', '"', '\\']) {
+                match expand_string(name) {
+                    Ok(n) => n,
+                    Err(e) => return expansion_failed(e),
+                }
+            } else {
+                name.clone()
+            };
             with_shell(|s| {
                 s.functions.insert(
                     name.clone(),
@@ -1356,11 +1419,17 @@ fn restore_function_frame(entry: Frame, status: i32) {
 
 pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
     let depth = with_shell(|s| s.func_depth);
-    if depth >= MAX_FUNC_DEPTH {
-        shell_err(&format!(
-            "{}: maximum function nesting level exceeded",
-            words[0]
-        ));
+    // $FUNCNEST limits the depth (zsh's default is 500).
+    let limit = var_get_opt("FUNCNEST")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(MAX_FUNC_DEPTH);
+    if depth >= limit {
+        shell_err("maximum nested function level reached; increase FUNCNEST?");
+        with_shell(|s| {
+            if s.flow == Flow::None && !s.interactive {
+                s.flow = Flow::Exit(1);
+            }
+        });
         return 1;
     }
     let saved_line = crate::shell::with_err_ctx(|e| {
@@ -1953,7 +2022,15 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
         }
         e.lineno
     });
-    let st = run_parsed(src);
+    // zsh parses an `eval` or `-c` string whole before running it (so
+    // aliases it defines apply only later); sourced files, and sh mode as
+    // in bash, go command by command.
+    let whole = ctx.is_none_or(|c| c == "(eval)") && !sh_emulation();
+    let st = if whole {
+        run_whole(src)
+    } else {
+        run_parsed(src)
+    };
     crate::shell::with_err_ctx(|e| {
         if ctx.is_some() {
             e.stack.pop();
@@ -1961,6 +2038,36 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
         e.lineno = saved_line;
     });
     st
+}
+
+fn run_whole(src: &str) -> i32 {
+    let mut parser = Parser::new(src, true);
+    let mut nodes = Vec::new();
+    loop {
+        match parser.parse_complete_command() {
+            Ok(Some(node)) => nodes.push(node),
+            Ok(None) => break,
+            Err(e) => {
+                let msg = match e {
+                    ParseError::Syntax(m) => m,
+                    ParseError::Incomplete => "syntax error: unexpected end of file".to_string(),
+                };
+                crate::shell::with_err_ctx(|e| e.lineno = parser.line());
+                shell_err(&msg);
+                with_shell(|s| s.last_status = 2);
+                return 2;
+            }
+        }
+    }
+    let mut status = 0;
+    for node in &nodes {
+        if flow_pending() {
+            break;
+        }
+        status = exec_node(node);
+        crate::trap::run_pending();
+    }
+    status
 }
 
 fn run_parsed(src: &str) -> i32 {

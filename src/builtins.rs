@@ -6,7 +6,8 @@ use crate::exec::{call_function, last_status, run_string, set_flow, strerror};
 use crate::jobs::{builtin_bg, builtin_fg, builtin_jobs, builtin_wait, kill_targets};
 use crate::lexer::is_valid_name;
 use crate::shell::{
-    array_set, assoc_declare, builtin_err, find_command, var_get, var_get_opt, var_set, with_shell,
+    array_set, assoc_declare, builtin_err, find_command, shell_err, var_get, var_get_opt, var_set,
+    with_shell,
 };
 use crate::sys::{err_line, out, read_byte};
 use crate::trap::{set_trap, signal_name, signal_number, SIGNALS};
@@ -777,7 +778,87 @@ fn functions_listing(
     status
 }
 
+// `functions -M [-s] name [min [max [shellfn]]]` defines a math
+// function, `functions +M name` removes one, `functions -M` lists them.
+fn math_functions(words: &[String]) -> i32 {
+    use crate::arith::{MathFunc, MATH_FUNCS};
+    let remove = words[1].starts_with('+');
+    let string = words[1].contains('s');
+    let args = &words[2..];
+    let Ok(mut table) = MATH_FUNCS.write() else {
+        return 1;
+    };
+    if remove {
+        table.retain(|m| !args.contains(&m.name));
+        return 0;
+    }
+    let Some(name) = args.first() else {
+        let mut text = String::new();
+        for m in table.iter() {
+            text.push_str(&format!(
+                "functions -M{} {} {} {}{}\n",
+                if m.string { "s" } else { "" },
+                m.name,
+                m.min,
+                m.max,
+                if m.shellfn != m.name {
+                    format!(" {}", m.shellfn)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        out(&text);
+        return 0;
+    };
+    let num = |k: usize, d: i64| args.get(k).and_then(|a| a.parse::<i64>().ok()).unwrap_or(d);
+    let min = num(1, 0);
+    let max = if args.len() > 2 {
+        num(2, -1)
+    } else if args.len() > 1 {
+        min
+    } else {
+        -1
+    };
+    table.retain(|m| m.name != *name);
+    table.push(MathFunc {
+        name: name.clone(),
+        min,
+        max,
+        shellfn: args.get(3).cloned().unwrap_or_else(|| name.clone()),
+        string,
+    });
+    0
+}
+
+// `functions -c old new`: copies a function, loading it first if it is
+// autoloaded.
+fn copy_function(words: &[String]) -> i32 {
+    let (Some(old), Some(new)) = (words.get(2), words.get(3)) else {
+        return usage("functions", "-c: requires two arguments");
+    };
+    if is_autoload_stub(old) && !autoload_now(old, None, true) {
+        shell_err(&format!("{}: function definition file not found", old));
+        return 1;
+    }
+    let Some(f) = with_shell(|s| s.functions.get(old).cloned()) else {
+        builtin_err("functions", &format!("no such function: {}", old));
+        return 1;
+    };
+    with_shell(|s| s.functions.insert(new.clone(), f));
+    0
+}
+
 fn builtin_functions(words: &[String]) -> i32 {
+    if words.get(1).is_some_and(|a| a == "-c") {
+        return copy_function(words);
+    }
+    if words
+        .get(1)
+        .is_some_and(|a| a.len() > 1 && (a.starts_with("-M") || a.starts_with("+M")))
+    {
+        return math_functions(words);
+    }
     let (mut patterns, mut names_only, mut spaces) = (false, false, None);
     let mut i = 1;
     while let Some(a) = words.get(i) {
@@ -2225,73 +2306,190 @@ fn builtin_ulimit(words: &[String]) -> i32 {
 // first file of that name in $fpath when first called. As in zsh, the
 // file's contents are the function body. `+X` loads immediately.
 // Names that are meowsh builtins are left alone so the builtin runs.
+// The stub an autoloaded function has until it is loaded: it loads
+// the definition (from `dir` when given, `-d` also from $fpath) and runs
+// it, as zsh's `autoload -X` does.
+fn autoload_stub(dir: Option<&str>, default_too: bool) -> String {
+    let mut stub = String::from("builtin autoload -X");
+    if default_too {
+        stub.push_str(" -d");
+    }
+    if let Some(d) = dir {
+        stub.push(' ');
+        stub.push_str(&shell_quote(d));
+    }
+    stub
+}
+
+fn is_autoload_stub(name: &str) -> bool {
+    with_shell(|s| {
+        s.functions.get(name).is_some_and(|f| {
+            crate::deparse::Deparser::new(None)
+                .body_text(&f.body)
+                .trim_start_matches(['{', ' ', '\n', '\t'])
+                .starts_with("builtin autoload -X")
+        })
+    })
+}
+
+fn define_stub(name: &str, dir: Option<&str>, default_too: bool) {
+    let stub = autoload_stub(dir, default_too);
+    let mut p = crate::parser::Parser::without_aliases(&stub, true);
+    if let Ok(Some(body)) = p.parse_complete_command() {
+        with_shell(|s| {
+            s.functions.insert(
+                name.to_string(),
+                FuncDef {
+                    body: Arc::new(body),
+                    origin: s.argv0.clone(),
+                    line: 0,
+                },
+            )
+        });
+    }
+}
+
+// The directory of $fpath holding `name`, made absolute.
+fn fpath_dir(name: &str) -> Option<String> {
+    let fpath = with_shell(|s| s.array("fpath").cloned()).unwrap_or_default();
+    fpath.iter().find_map(|d| {
+        let p = std::path::Path::new(d).join(name);
+        p.is_file().then(|| {
+            let dir = std::path::Path::new(d);
+            let abs = if dir.is_absolute() {
+                dir.to_path_buf()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(dir)
+            };
+            abs.to_string_lossy().into_owned()
+        })
+    })
+}
+
 fn builtin_autoload(words: &[String]) -> i32 {
-    let mut load_now = false;
-    let mut status = 0;
-    for arg in &words[1..] {
-        if arg == "+X" {
+    let (mut load_now, mut exec_now, mut default_too) = (false, false, false);
+    let (mut resolve, mut strict) = (false, false);
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        if a == "+X" {
             load_now = true;
-            continue;
+        } else if let Some(f) = a.strip_prefix('-').filter(|f| !f.is_empty()) {
+            for c in f.chars() {
+                match c {
+                    'X' => exec_now = true,
+                    'd' => default_too = true,
+                    'r' => resolve = true,
+                    'R' => {
+                        resolve = true;
+                        strict = true;
+                    }
+                    _ => {}
+                }
+            }
+        } else if !a.starts_with('+') {
+            break;
         }
-        if arg.starts_with('-') || arg.starts_with('+') {
-            continue;
-        }
-        if is_builtin(arg) {
+        i += 1;
+    }
+    let args = &words[i..];
+    if exec_now {
+        return autoload_exec(args.first().map(|s| s.as_str()), default_too);
+    }
+    let mut status = 0;
+    for arg in args {
+        // `autoload /dir/name`: name loads from dir.
+        let (name, dir) = match arg.rsplit_once('/') {
+            Some((d, n)) if arg.starts_with('/') => (n.to_string(), Some(d.to_string())),
+            _ => (arg.clone(), None),
+        };
+        if is_builtin(&name) {
             continue;
         }
         if load_now {
-            if !autoload_now(arg) {
-                err_line(&format!(
-                    "meowsh: {}: function definition file not found",
-                    arg
-                ));
+            if !autoload_now(&name, dir.as_deref(), default_too || dir.is_none()) {
+                shell_err(&format!("{}: function definition file not found", name));
                 status = 1;
             }
             continue;
         }
-        let already = with_shell(|s| s.functions.contains_key(arg));
-        if already {
+        let defined = with_shell(|s| s.functions.contains_key(&name));
+        if defined && !is_autoload_stub(&name) {
             continue;
         }
-        // The stub loads the real body, then runs it with the arguments.
-        let stub = format!("autoload +X {0} && {0} \"$@\"", shell_quote(arg));
-        let mut p = crate::parser::Parser::without_aliases(&stub, true);
-        if let Ok(Some(body)) = p.parse_complete_command() {
-            with_shell(|s| {
-                s.functions.insert(
-                    arg.clone(),
-                    FuncDef {
-                        body: Arc::new(body),
-                        origin: s.argv0.clone(),
-                        line: 0,
-                    },
-                )
-            });
+        if dir.is_some() {
+            define_stub(&name, dir.as_deref(), default_too);
+            continue;
         }
+        if defined {
+            // A bare autoload keeps a stub with a path.
+            continue;
+        }
+        if resolve {
+            match fpath_dir(&name) {
+                Some(d) => define_stub(&name, Some(&d), false),
+                None if strict => {
+                    shell_err(&format!("{}: function definition file not found", name));
+                    status = 1;
+                }
+                None => define_stub(&name, None, false),
+            }
+            continue;
+        }
+        define_stub(&name, None, false);
     }
     status
 }
 
-fn autoload_now(name: &str) -> bool {
-    let fpath = with_shell(|s| s.array("fpath").cloned()).unwrap_or_default();
-    let Some(content) = fpath
-        .iter()
-        .map(|d| std::path::Path::new(d).join(name))
-        .find_map(|p| std::fs::read_to_string(p).ok())
+// `autoload -X [dir]` in a function: loads the running function's
+// definition, replacing it, and runs it with the same arguments.
+fn autoload_exec(dir: Option<&str>, default_too: bool) -> i32 {
+    let (name, args) = with_shell(|s| (s.argv0.clone(), s.pos_params.clone()));
+    if !autoload_now(&name, dir, default_too || dir.is_none()) {
+        // Reported where the function was called.
+        let top = crate::shell::with_err_ctx(|e| e.stack.pop());
+        shell_err(&format!("{}: function definition file not found", name));
+        if let Some(t) = top {
+            crate::shell::with_err_ctx(|e| e.stack.push(t));
+        }
+        return 1;
+    }
+    let Some((body, line)) =
+        with_shell(|s| s.functions.get(&name).map(|f| (f.body.clone(), f.line)))
     else {
+        return 1;
+    };
+    // Functions it defines come from its file.
+    let origin = with_shell(|s| s.functions.get(&name).map(|f| f.origin.clone()));
+    let saved = with_shell(|s| std::mem::replace(&mut s.source_file, origin));
+    let mut words = vec![name];
+    words.extend(args);
+    let st = call_function(&body, &words, line);
+    with_shell(|s| s.source_file = saved);
+    st
+}
+
+// Loads `name`'s definition from `dir` (or $fpath when `fpath_too`).
+// A file holding just a definition of `name` gives that definition's
+// body; otherwise the whole file is the body.
+fn autoload_now(name: &str, dir: Option<&str>, fpath_too: bool) -> bool {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = dir {
+        candidates.push(std::path::Path::new(d).join(name));
+    }
+    if fpath_too {
+        let fpath = with_shell(|s| s.array("fpath").cloned()).unwrap_or_default();
+        candidates.extend(fpath.iter().map(|d| std::path::Path::new(d).join(name)));
+    }
+    let Some((path, content)) = candidates.into_iter().find_map(|p| {
+        std::fs::read_to_string(&p)
+            .ok()
+            .map(|c| (p.to_string_lossy().into_owned(), c))
+    }) else {
         return false;
     };
     let mut parser = crate::parser::Parser::new(&content, true);
-    let body = match parser.parse_program() {
-        Ok(nodes) => Node::List(
-            nodes
-                .into_iter()
-                .map(|node| crate::types::ListItem {
-                    node,
-                    background: false,
-                })
-                .collect(),
-        ),
+    let nodes = match parser.parse_program() {
+        Ok(nodes) => nodes,
         Err(e) => {
             let msg = match e {
                 crate::parser::ParseError::Syntax(m) => m,
@@ -2301,12 +2499,33 @@ fn autoload_now(name: &str) -> bool {
             return false;
         }
     };
+    let body = match nodes.as_slice() {
+        [Node::FuncDef { name: n, body, .. }] if n == name => (**body).clone(),
+        _ => Node::List(
+            nodes
+                .into_iter()
+                .map(|node| crate::types::ListItem {
+                    node,
+                    background: false,
+                })
+                .collect(),
+        ),
+    };
+    let origin = if path.starts_with('/') {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(path.trim_start_matches("./"))
+            .to_string_lossy()
+            .into_owned()
+    };
     with_shell(|s| {
         s.functions.insert(
             name.to_string(),
             FuncDef {
                 body: Arc::new(body),
-                origin: s.argv0.clone(),
+                origin,
                 line: 0,
             },
         )

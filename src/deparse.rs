@@ -66,20 +66,52 @@ impl Deparser {
             n => n,
         };
         match inner {
-            Node::List(items) => {
-                for item in items {
-                    self.newline();
-                    self.node(&item.node);
-                    if item.background {
-                        self.push(" &");
-                    }
-                }
-            }
+            Node::List(items) => self.items(items, false),
             Node::Empty => {}
             n => {
                 self.newline();
                 self.node(n);
             }
+        }
+    }
+
+    // List items, each on its own line (`first`: no newline before the
+    // first). Definitions of several names sharing one body, as
+    // `a b () { ... }` parses, print as zsh's `function a b { ... }`.
+    fn items(&mut self, items: &[crate::types::ListItem], first: bool) {
+        let mut k = 0;
+        while k < items.len() {
+            if k > 0 || !first {
+                self.newline();
+            }
+            if let Node::FuncDef { body, .. } = &items[k].node {
+                let mut names = Vec::new();
+                let mut j = k;
+                let shape = format!("{:?}", body);
+                while let Some(Node::FuncDef { name, body: b, .. }) = items.get(j).map(|i| &i.node)
+                {
+                    if format!("{:?}", b) != shape {
+                        break;
+                    }
+                    names.push(name.clone());
+                    j += 1;
+                }
+                if names.len() > 1 {
+                    self.push("function ");
+                    self.push(&names.join(" "));
+                    self.push(" {");
+                    self.block(body);
+                    self.newline();
+                    self.push("}");
+                    k = j;
+                    continue;
+                }
+            }
+            self.node(&items[k].node);
+            if items[k].background {
+                self.push(" &");
+            }
+            k += 1;
         }
     }
 
@@ -110,17 +142,7 @@ impl Deparser {
                     self.node(n);
                 }
             }
-            Node::List(items) => {
-                for (k, item) in items.iter().enumerate() {
-                    if k > 0 {
-                        self.newline();
-                    }
-                    self.node(&item.node);
-                    if item.background {
-                        self.push(" &");
-                    }
-                }
-            }
+            Node::List(items) => self.items(items, true),
             Node::Subshell(b) => {
                 self.push("(");
                 self.block(b);

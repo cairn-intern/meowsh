@@ -335,7 +335,63 @@ fn compare(op: &str, l: Num, r: Num) -> bool {
 }
 
 // zsh/mathfunc functions.
+/// A math function defined with `functions -M`: its name in
+/// expressions, argument count limits, the shell function implementing
+/// it, and whether it takes its argument as a string (`-s`).
+#[derive(Clone)]
+pub struct MathFunc {
+    pub name: String,
+    pub min: i64,
+    pub max: i64,
+    pub shellfn: String,
+    pub string: bool,
+}
+
+pub static MATH_FUNCS: std::sync::RwLock<Vec<MathFunc>> = std::sync::RwLock::new(Vec::new());
+
+// The value of the last arithmetic evaluation: a math function's result.
+static LAST_VALUE: std::sync::Mutex<Option<Num>> = std::sync::Mutex::new(None);
+
+fn math_func(name: &str) -> Option<MathFunc> {
+    MATH_FUNCS
+        .read()
+        .ok()?
+        .iter()
+        .find(|m| m.name == name)
+        .cloned()
+}
+
+// Calls the shell function behind a `functions -M` math function.
+fn call_user(m: &MathFunc, args: Vec<String>) -> R {
+    let n = args.len() as i64;
+    if n < m.min || (m.max >= 0 && n > m.max) {
+        return Err(format!(
+            "wrong number of arguments: {}({})",
+            m.name,
+            args.join(",")
+        ));
+    }
+    let body = crate::shell::with_shell(|s| {
+        s.functions
+            .get(&m.shellfn)
+            .map(|f| (f.body.clone(), f.line))
+    });
+    let Some((body, line)) = body else {
+        return Err(format!("{}: function not defined", m.shellfn));
+    };
+    if let Ok(mut l) = LAST_VALUE.lock() {
+        *l = None;
+    }
+    let mut words = vec![m.name.clone()];
+    words.extend(args);
+    crate::exec::call_function(&body, &words, line);
+    Ok(LAST_VALUE.lock().ok().and_then(|l| *l).unwrap_or(Num::I(0)))
+}
+
 fn call(name: &str, args: &[Num]) -> R {
+    if let Some(m) = math_func(name) {
+        return call_user(&m, args.iter().map(|a| a.to_string()).collect());
+    }
     let one = |f: fn(f64) -> f64| -> R {
         match args {
             [x] => Ok(Num::F(f(x.as_float()))),
@@ -540,6 +596,34 @@ impl P {
             }
             Some(T::Ident(name)) => {
                 self.pos += 1;
+                // `functions -Ms`: the text between the parentheses is
+                // the one argument.
+                if self.peek_op("(") && math_func(&name).is_some_and(|m| m.string) {
+                    let start = self.starts[self.pos] + 1;
+                    let mut depth = 0;
+                    let mut end = start;
+                    for (k, &c) in self.src.iter().enumerate().skip(start) {
+                        match c {
+                            '(' => depth += 1,
+                            ')' if depth == 0 => {
+                                end = k;
+                                break;
+                            }
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        end = k + 1;
+                    }
+                    let arg: String = self.src[start..end.min(self.src.len())].iter().collect();
+                    while self.pos < self.toks.len() && self.starts[self.pos] <= end {
+                        self.pos += 1;
+                    }
+                    if skip {
+                        return Ok(Num::I(0));
+                    }
+                    let m = math_func(&name).unwrap();
+                    return call_user(&m, vec![arg]);
+                }
                 if self.peek_op("(") {
                     self.pos += 1;
                     let mut args = Vec::new();
@@ -608,6 +692,9 @@ pub fn eval_num(expr: &str) -> R {
         starts,
     };
     let v = p.comma(false)?;
+    if let Ok(mut l) = LAST_VALUE.lock() {
+        *l = Some(v);
+    }
     if p.pos < p.toks.len() {
         return Err(match &p.toks[p.pos] {
             T::Op(":") => "bad math expression: ':' without '?'".to_string(),

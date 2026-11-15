@@ -87,6 +87,12 @@ and builtins include:
 - patterns and globs with `(a|b)` groups and `<n-m>` ranges, `**/`, and
   glob qualifiers such as `(N)`, `(.)`, `(/)`, `(@)`, `(m-1)`, `(D)`
 - `[[ x == (a|b)* ]]`, `[[ -v name[key] ]]`, `[[ -o option ]]`
+- `=(cmd)` (output in a temporary file), `=cmd` (the command's path),
+  glob qualifier modifiers (`*(:t)`), `a~b` exclusions on whole paths,
+  `(#s)`/`(#e)`
+- an `eval` or `-c` string is parsed whole before it runs, as in zsh, so
+  an alias it defines applies only to later input (sourced files and sh
+  mode still go command by command)
 - `>& file` sends standard output and error to the file; `>!`, `>>|`,
   `>&|`, `&>|`; `{fd}>file` opens a new descriptor and stores its number
 - `enable`/`disable` (`-r` reserved words, `-a` aliases, `-f` functions),
@@ -104,7 +110,10 @@ and builtins include:
 - `repeat`, `select`, `coproc` (`print -p`, `read -p`, `>&p`), `foreach`,
   short and brace forms (`if [[ x ]] cmd`, `for x in a b; cmd`,
   `while c { }`, `case w { }`), `;|`, `|&`, `noglob`, `-`, `exec -a`/`-l`/`-c`
-- `autoload` from `$fpath`, `print`, `emulate`, `is-at-least`,
+- `autoload` from `$fpath` or a given path (`autoload /dir/name`, `-d`,
+  `-r`, `-R`, `-X`), `functions -c` and `-M` math functions, anonymous
+  `function { ... } args`, `command_not_found_handler`, `$FUNCNEST`, `$argv`,
+  `print`, `emulate`, `is-at-least`,
   `zparseopts`, `fc -l`, `colors`, `unfunction`, `builtin`, `read -k`/`-q`,
   global aliases (`alias -g`) and the `$aliases`/`$galiases` arrays
 - function-scoped EXIT traps, `LOCAL_OPTIONS`/`LOCAL_TRAPS` (also set by

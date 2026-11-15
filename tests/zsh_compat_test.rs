@@ -218,8 +218,10 @@ fn nested_expansion_flags_and_modifiers() {
 #[test]
 fn global_aliases_and_the_aliases_array() {
     let (_, out, _) = sh(
-        "alias -g G='| grep b'\nprintf 'a\\nb\\n' G\nalias ll='ls -l'\n\
-         echo ${aliases[ll]} ${#galiases}\naliases[hi]='echo hello'\nhi",
+        // Aliases apply to text parsed after they are defined, so the
+        // uses go through eval (zsh parses a -c string whole).
+        "alias -g G='| grep b'; eval \"printf 'a\\nb\\n' G\"; alias ll='ls -l'; \
+         echo ${aliases[ll]} ${#galiases}; aliases[hi]='echo hello'; eval hi",
     );
     assert_eq!(out, "b\nls -l 1\nhello\n");
 }
@@ -661,4 +663,66 @@ fn zerr_and_debug_traps() {
          trap 'print dbg $LINENO' DEBUG; :; trap - DEBUG\nprint $LINENO",
     );
     assert_eq!(out, "zerr\nok\ndbg 2\ndbg 2\n3\n");
+}
+
+// ---- functions: anonymous, math, autoload, handlers ----------------------
+
+#[test]
+fn anonymous_functions_with_glob_args_and_redirections() {
+    let (_, out, err) = sh(
+        "cd $HOME && v=outside; function { local v=inside; print $v $* } a b; print $v; \
+         touch yes no; () { echo $1 } (y|z)*; function { sed s/a/b/ } <<<abc",
+    );
+    assert_eq!(out, "inside a b\noutside\nyes\nbbc\n", "stderr: {}", err);
+}
+
+#[test]
+fn not_found_handler_math_functions_and_argv() {
+    let (_, out, err) = sh(
+        "command_not_found_handler() { print handled $1 ${argv[2,-1]}; return 3 }; \
+         nosuchcmd-q x y; print $?; \
+         functions -M m1; m1() { (( $# * 10 )) }; print $(( m1(1,2) )); \
+         f() { (( $#1 )) }; functions -Ms slen 1 1 f; print $(( slen(a, b) ))",
+    );
+    assert_eq!(
+        out, "handled nosuchcmd-q x y\n3\n20\n4\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
+fn eval_parses_whole_string_and_function_names_expand() {
+    let (_, out, _) = sh(
+        "eval 'alias zz=\"print aliased\"; zz' 2>/dev/null; eval zz; \
+         function g$$ () { print named }; g$$; d() { a b() { print $0 } }; functions d; \
+         e(){}; e; print empty ok",
+    );
+    assert_eq!(
+        out,
+        "aliased\nnamed\nd () {\n\tfunction a b {\n\t\tprint $0\n\t}\n}\nempty ok\n"
+    );
+}
+
+#[test]
+fn autoload_paths_and_function_copies() {
+    let (_, out, err) = sh(
+        "cd $HOME && mkdir -p ad && print 'print loaded from dir' >ad/af; \
+         autoload $PWD/ad/af; af; print 'print via X' >ad/ax; ax() { autoload -X $PWD/ad }; ax; \
+         h() { print h }; functions -c h h2; unfunction h; h2",
+    );
+    assert_eq!(out, "loaded from dir\nvia X\nh\n", "stderr: {}", err);
+}
+
+#[test]
+fn output_files_equals_and_glob_exclusions() {
+    let (_, out, err) = sh("cd $HOME && cat =(print in a file); print =cat(:t); \
+         mkdir -p g/d1 g/d2 g/d3; touch g/f; setopt extendedglob; \
+         print g/*~*/d2; print g/*~*/d3(/*|(#e))(/); print g/*(/:t); \
+         (FUNCNEST=1; r() { r }; r) 2>/dev/null; print $?");
+    assert_eq!(
+        out, "in a file\ncat\ng/d1 g/d3 g/f\ng/d1 g/d2\nd1 d2 d3\n1\n",
+        "stderr: {}",
+        err
+    );
 }

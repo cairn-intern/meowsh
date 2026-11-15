@@ -153,6 +153,8 @@ fn lookup(name: &str) -> Val {
     match name {
         "@" => return Val::List(pos_params(), false),
         "*" => return Val::List(pos_params(), true),
+        // zsh's $argv is the positional parameters.
+        "argv" if !crate::shell::var_exists("argv") => return Val::List(pos_params(), true),
         "LINENO" if !crate::shell::var_exists("LINENO") => {
             return Val::Str(crate::shell::lineno().to_string())
         }
@@ -339,6 +341,50 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                 i = next;
             }
             '$' => i = expand_dollar(chars, i, mode, ctx)?,
+            // `=(cmd)`: a temporary file holding cmd's output.
+            '=' if mode == Mode::Unquoted
+                && i == 0
+                && ctx.unquoted_lit == 0
+                && chars.get(1) == Some(&'(')
+                && !sh_mode() =>
+            {
+                let (ie, next) = bounds(scan_paren(chars, 1), n);
+                let src: String = chars[2..ie.max(2)].iter().collect();
+                match crate::exec::output_file_subst(&src) {
+                    Some(path) => {
+                        for d in path.chars() {
+                            ctx.push(d, Q);
+                        }
+                    }
+                    None => return Err(ExpError { status: 1 }),
+                }
+                i = next;
+            }
+            // EQUALS: `=cmd` is the path of command cmd.
+            '=' if mode == Mode::Unquoted
+                && i == 0
+                && ctx.unquoted_lit == 0
+                && chars
+                    .get(1)
+                    .is_some_and(|c| c.is_alphanumeric() || "_-.".contains(*c))
+                && !ctx.assign
+                && crate::options::is_set("equals") =>
+            {
+                let end = (1..n)
+                    .find(|&k| matches!(chars[k], '(' | '[' | '/' | '$' | '\'' | '"' | '`'))
+                    .unwrap_or(n);
+                let name: String = chars[1..end].iter().collect();
+                let path = crate::shell::find_command(&name);
+                match path {
+                    Some(p) => {
+                        for d in p.chars() {
+                            ctx.push(d, Q);
+                        }
+                    }
+                    None => return fail(&format!("{} not found", name)),
+                }
+                i = end;
+            }
             '<' | '>'
                 if mode == Mode::Unquoted
                     && i == 0
@@ -534,9 +580,9 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
         // zsh short forms: $+name, $#name, $=name, $^name, $~name, each
         // optionally with a subscript.
         '+' | '#' | '=' | '^' | '~'
-            if chars
-                .get(i + 2)
-                .is_some_and(|&c| crate::lexer::is_name_start(c)) =>
+            if chars.get(i + 2).is_some_and(|&c| {
+                crate::lexer::is_name_start(c) || (next == '#' && c.is_ascii_digit())
+            }) =>
         {
             let end = name_with_subscript(chars, i + 2);
             expand_braced(&chars[i + 1..end], mode, ctx)?;
@@ -1437,6 +1483,16 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
         Some(v) => Val::Str(v),
         None => Val::Unset,
     })
+}
+
+/// Applies `:` modifiers (`mods` starts with `:`) to one word, as glob
+/// qualifiers such as `*(:h)` do.
+pub fn modify_word(word: &str, mods: &str) -> String {
+    let rest: Vec<char> = mods.chars().collect();
+    match apply_modifiers(Val::Str(word.to_string()), &rest) {
+        Ok(Some(v)) => val_items(&v).join(" "),
+        _ => word.to_string(),
+    }
 }
 
 fn modifier_letters(c: char) -> bool {

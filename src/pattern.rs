@@ -18,6 +18,9 @@ enum Item {
     Repeat(Box<Item>, usize, Option<usize>),
     // EXTENDED_GLOB `^pat`: anything the rest does not match.
     Not(Vec<Item>),
+    // `(#s)` / `(#e)`: zero-width anchors. Patterns are matched against
+    // whole strings, so they only mark where a branch may end.
+    Anchor,
 }
 
 // Compile-time state: EXTENDED_GLOB, (#i) case folding, (#b) capturing
@@ -35,6 +38,17 @@ enum ClassItem {
     Char(char),
     Range(char, char),
     Named(String),
+}
+
+/// With EXTENDED_GLOB, a glob `a~b`: (a, b), b being matched against
+/// whole paths.
+pub fn glob_exclusion(pattern: &str) -> Option<(String, String)> {
+    if !crate::options::quick("extendedglob") {
+        return None;
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let k = split_exclusion(&p)?;
+    Some((p[..k].iter().collect(), p[k + 1..].iter().collect()))
 }
 
 // Splits an EXTENDED_GLOB `a~b` at the top-level `~`.
@@ -130,6 +144,9 @@ fn compile_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Vec<Vec
             // (#i), (#b), (#m), (#cN,M) and other globbing flags.
             '(' if cx.ext && p.get(i0 + 1) == Some(&'#') => {
                 let mut j = i0 + 2;
+                if matches!(p.get(j), Some('s' | 'e')) && p.get(j + 1) == Some(&')') {
+                    items.push(Item::Anchor);
+                }
                 while j < p.len() && p[j] != ')' {
                     match p[j] {
                         'i' | 'l' => cx.icase = true,
@@ -300,7 +317,7 @@ fn item_matches(item: &Item, c: char) -> bool {
         Item::Any => true,
         Item::Class { negated, set } => class_matches(set, c) != *negated,
         Item::Star => true,
-        Item::Group(..) | Item::Range(..) | Item::Repeat(..) | Item::Not(_) => false,
+        Item::Group(..) | Item::Range(..) | Item::Repeat(..) | Item::Not(_) | Item::Anchor => false,
     }
 }
 
@@ -308,7 +325,7 @@ fn has_group(items: &[Item]) -> bool {
     items.iter().any(|i| {
         matches!(
             i,
-            Item::Group(..) | Item::Range(..) | Item::Repeat(..) | Item::Not(_)
+            Item::Group(..) | Item::Range(..) | Item::Repeat(..) | Item::Not(_) | Item::Anchor
         )
     })
 }
@@ -318,7 +335,7 @@ fn match_one(item: &Item, chunk: &[char]) -> bool {
     match item {
         Item::Star => true,
         Item::Group(alts, _) => alts.iter().any(|alt| match_items(alt, chunk)),
-        Item::Range(..) | Item::Repeat(..) | Item::Not(_) => {
+        Item::Range(..) | Item::Repeat(..) | Item::Not(_) | Item::Anchor => {
             match_rec(std::slice::from_ref(item), chunk)
         }
         it => chunk.len() == 1 && item_matches(it, chunk[0]),
@@ -364,6 +381,7 @@ fn match_rec(items: &[Item], s: &[char]) -> bool {
             })
         }
         Item::Repeat(item, min, max) => match_repeat(item, *min, *max, s, rest),
+        Item::Anchor => match_rec(rest, s),
         Item::Not(inner) => {
             (0..=s.len()).any(|k| !match_items(inner, &s[..k]) && match_rec(rest, &s[k..]))
         }
@@ -569,6 +587,7 @@ fn cap_rec(items: &[Item], s: &[char], off: usize, caps: &mut Caps) -> bool {
             false
         }
         Item::Repeat(item, min, max) => cap_repeat(item, *min, *max, s, off, rest, caps),
+        Item::Anchor => cap_rec(rest, s, off, caps),
         Item::Range(..) | Item::Not(_) => (0..=s.len()).rev().any(|k| {
             match_rec(std::slice::from_ref(first), &s[..k]) && cap_rec(rest, &s[k..], off + k, caps)
         }),

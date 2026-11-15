@@ -17,6 +17,8 @@ pub struct Quals {
     // File-type and permission tests; each must pass.
     tests: Vec<Test>,
     sort: Option<(char, bool)>,
+    // `:h`, `:t`, ... applied to each match.
+    modifiers: String,
 }
 
 #[derive(Debug)]
@@ -68,6 +70,11 @@ fn parse_quals(s: &str) -> Option<Quals> {
             'N' => {
                 q.null = true;
                 continue;
+            }
+            // Modifiers end the qualifiers.
+            ':' => {
+                q.modifiers = chars[i - 1..].iter().collect();
+                break;
             }
             'D' => {
                 q.dots = true;
@@ -229,8 +236,36 @@ fn walk_dirs(dir: &str, dots: bool, out: &mut Vec<String>) {
     }
 }
 
+fn sort_matches(out: &mut Vec<String>, q: &Quals) {
+    match q.sort {
+        Some((key, rev)) => {
+            match key {
+                'm' => out.sort_by_key(|p| {
+                    std::cmp::Reverse(fs::metadata(p).map(|m| m.mtime()).unwrap_or(0))
+                }),
+                'L' => out.sort_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)),
+                _ => out.sort(),
+            }
+            if rev {
+                out.reverse();
+            }
+        }
+        None => {
+            out.sort();
+            out.dedup();
+        }
+    }
+}
+
 /// Expands `pattern`. Returns the sorted matches; empty if none.
 pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
+    // `a~b`: a's matches, less the paths b matches.
+    if let Some((main, excl)) = crate::pattern::glob_exclusion(pattern) {
+        let ex = Pattern::new(&excl);
+        let mut out = glob(&main, quals);
+        out.retain(|p| !ex.matches(p));
+        return out;
+    }
     let dots = quals.is_some_and(|q| q.dots);
     let comps = components(pattern);
     let mut current = vec![String::new()];
@@ -285,6 +320,14 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
         .filter(|p| !p.is_empty() && fs::symlink_metadata(p).is_ok())
         .collect();
     if let Some(q) = quals {
+        if !q.modifiers.is_empty() {
+            out.retain(|p| q.tests.iter().all(|t| passes(Path::new(p), t)));
+            sort_matches(&mut out, q);
+            return out
+                .iter()
+                .map(|p| crate::expand::modify_word(p, &q.modifiers))
+                .collect();
+        }
         out.retain(|p| q.tests.iter().all(|t| passes(Path::new(p), t)));
         if let Some((key, rev)) = q.sort {
             match key {

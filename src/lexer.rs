@@ -214,7 +214,9 @@ pub fn scan_paren(chars: &[char], i: usize) -> Option<usize> {
             '$' if j + 1 < chars.len() && chars[j + 1] == '{' => {
                 j = scan_brace(chars, j + 1, false)?
             }
-            '#' if at_word_start => {
+            // As in the lexer: `#` right after a parenthesis is glob
+            // syntax such as `(#e)`, not a comment.
+            '#' if at_word_start && !(j > i + 1 && matches!(chars[j - 1], '(' | ')')) => {
                 while j < chars.len() && chars[j] != '\n' {
                     j += 1;
                 }
@@ -391,6 +393,35 @@ impl Lexer {
 
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// After a `(` token: reads the rest of a word that starts with a
+    /// glob group, such as `(y|z)*`, and returns it whole.
+    pub fn glob_word_after_paren(&mut self) -> Option<String> {
+        let start = self.pos.checked_sub(1)?;
+        if self.chars.get(start) != Some(&'(') {
+            return None;
+        }
+        let mut depth = 0;
+        let mut i = start;
+        while i < self.chars.len() {
+            let c = self.chars[i];
+            match c {
+                '\\' => i += 1,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' if depth == 0 => break,
+                '\n' => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        let word: String = self.chars[start..i.min(self.chars.len())].iter().collect();
+        self.pos = i.min(self.chars.len());
+        Some(word)
     }
 
     pub fn set_pos(&mut self, pos: usize) {

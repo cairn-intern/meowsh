@@ -479,24 +479,61 @@ impl Parser {
     }
 
     // `() compound-command [args]`, after the `(`.
+    // A function body; `{}` (one word) is an empty one.
+    fn parse_func_body(&mut self) -> PResult<Node> {
+        if self.peek_is_word("{}")? {
+            self.next()?;
+            return Ok(Node::Brace(Box::new(Node::Empty)));
+        }
+        self.parse_command()
+    }
+
     fn parse_anon_func(&mut self) -> PResult<Node> {
         let line = self.lex.line();
         self.next()?; // )
+        self.anon_func_rest(line)
+    }
+
+    // The body of `() ...` or `function { ... }`, then its arguments and
+    // redirections. An argument may start with a glob group: `(a|b)*`.
+    fn anon_func_rest(&mut self, line: usize) -> PResult<Node> {
         self.skip_newlines()?;
         let body = self.parse_command()?;
         let mut args = Vec::new();
-        while let Tok::Word(w) = self.peek()? {
-            if LIST_TERMINATORS.contains(&w.as_str()) {
-                break;
+        let mut redirs = Vec::new();
+        loop {
+            if let Some(r) = self.try_parse_redirect()? {
+                redirs.push(r);
+                continue;
             }
-            let w = w.clone();
-            self.next()?;
-            args.push(w);
+            match self.peek()? {
+                Tok::Word(w) if !LIST_TERMINATORS.contains(&w.as_str()) => {
+                    let w = w.clone();
+                    self.next()?;
+                    args.push(w);
+                }
+                Tok::Op("(") => {
+                    self.peeked = None;
+                    match self.lex.glob_word_after_paren() {
+                        Some(w) => args.push(w),
+                        None => return Err(ParseError::Syntax("parse error near `('".into())),
+                    }
+                }
+                _ => break,
+            }
         }
-        Ok(Node::AnonFunc {
+        let node = Node::AnonFunc {
             body: std::sync::Arc::new(body),
             args,
             line,
+        };
+        Ok(if redirs.is_empty() {
+            node
+        } else {
+            Node::Redirected {
+                node: Box::new(node),
+                redirs,
+            }
         })
     }
 
@@ -702,7 +739,7 @@ impl Parser {
                 self.next()?;
                 self.expect_op(")")?;
                 self.skip_newlines()?;
-                let body = self.parse_command()?;
+                let body = self.parse_func_body()?;
                 let mut names = std::mem::take(&mut cmd.words);
                 names.push(word);
                 let defs = names
@@ -733,7 +770,7 @@ impl Parser {
                     )));
                 }
                 self.skip_newlines()?;
-                let body = self.parse_command()?;
+                let body = self.parse_func_body()?;
                 return Ok(Node::FuncDef {
                     name: word,
                     body: Box::new(body),
@@ -758,6 +795,10 @@ impl Parser {
     fn parse_function_keyword(&mut self) -> PResult<Node> {
         let line = self.lex.line();
         self.next()?;
+        // `function { ... } args`: an anonymous function.
+        if self.peek_is_word("{")? {
+            return self.anon_func_rest(line);
+        }
         let mut names = vec![match self.next()? {
             Tok::Word(w) => w,
             Tok::Eof => return Err(self.eof_error("a function name")),
@@ -776,7 +817,7 @@ impl Parser {
             self.expect_op(")")?;
         }
         self.skip_newlines()?;
-        let body = self.parse_command()?;
+        let body = self.parse_func_body()?;
         let mut defs: Vec<ListItem> = names
             .into_iter()
             .map(|name| ListItem {
