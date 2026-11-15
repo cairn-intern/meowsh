@@ -29,90 +29,151 @@ use std::sync::LazyLock;
 
 pub static SHELL: LazyLock<ShellState> = LazyLock::new(ShellState::new);
 
+/// Runs `f` with the global shell state locked. Recovers from a poisoned
+/// lock so a panic in one builtin does not wedge the shell.
+pub fn with_shell<R>(f: impl FnOnce(&mut Shell) -> R) -> R {
+    let mut guard = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut guard)
+}
+
 pub fn shell_init() {
-    let mut shell = SHELL.shell.lock().unwrap();
+    let mut shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
     shell.shell_pid = std::process::id() as i32;
     shell.shell_pgid = unsafe { libc::getpgrp() };
     shell.last_status = 0;
     *shell.next_job_id.lock().unwrap() = 1;
 
+    // Every environment variable becomes an exported shell variable.
+    for (key, value) in env::vars_os() {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if crate::lexer::is_valid_name(key) {
+            shell.vars.insert(
+                key.to_string(),
+                Var {
+                    value: value.to_string(),
+                    flags: VAR_EXPORT,
+                },
+            );
+        }
+    }
+
+    let set_default = |shell: &mut Shell, name: &str, value: String, flags: u32| {
+        shell
+            .vars
+            .entry(name.to_string())
+            .or_insert(Var { value, flags });
+    };
+    set_default(
+        &mut shell,
+        "PATH",
+        "/usr/local/bin:/usr/bin:/bin".to_string(),
+        VAR_EXPORT,
+    );
+    set_default(&mut shell, "PS2", "> ".to_string(), 0);
+    set_default(&mut shell, "PS4", "+ ".to_string(), 0);
+    // POSIX: IFS is reset at startup rather than inherited.
     shell.vars.insert(
-        "HOME".to_string(),
+        "IFS".to_string(),
         Var {
-            value: get_env("HOME", ""),
+            value: " \t\n".to_string(),
             flags: 0,
         },
     );
+    let ppid = unsafe { libc::getppid() };
     shell.vars.insert(
-        "PATH".to_string(),
+        "PPID".to_string(),
         Var {
-            value: get_env("PATH", "/usr/local/bin:/usr/bin:/bin"),
-            flags: VAR_EXPORT,
-        },
-    );
-    shell.vars.insert(
-        "USER".to_string(),
-        Var {
-            value: get_env("USER", "meow"),
+            value: ppid.to_string(),
             flags: 0,
         },
     );
-    shell.vars.insert(
-        "PWD".to_string(),
-        Var {
-            value: get_env("PWD", "/"),
-            flags: 0,
-        },
-    );
-    shell.vars.insert(
-        "SHELL".to_string(),
-        Var {
-            value: "/bin/meowsh".to_string(),
-            flags: 0,
-        },
-    );
-    shell.vars.insert(
-        "TERM".to_string(),
-        Var {
-            value: get_env("TERM", "dumb"),
-            flags: 0,
-        },
-    );
-    shell.vars.insert(
-        "PS1".to_string(),
-        Var {
-            value: get_env("PS1", ""),
-            flags: 0,
-        },
-    );
-    shell.vars.insert(
-        "PS2".to_string(),
-        Var {
-            value: "meowsh... ".to_string(),
-            flags: 0,
-        },
-    );
+    let shlvl = shell
+        .vars
+        .get("SHLVL")
+        .and_then(|v| v.value.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0)
+        + 1;
     shell.vars.insert(
         "SHLVL".to_string(),
         Var {
-            value: "1".to_string(),
-            flags: 0,
+            value: shlvl.to_string(),
+            flags: VAR_EXPORT,
         },
     );
+    let pwd = initial_pwd(shell.vars.get("PWD").map(|v| v.value.as_str()));
+    if let Some(pwd) = pwd {
+        shell.vars.insert(
+            "PWD".to_string(),
+            Var {
+                value: pwd,
+                flags: VAR_EXPORT,
+            },
+        );
+    }
 
     if let Some(home) = shell.vars.get("HOME") {
-        shell.history_file = PathBuf::from(&home.value)
-            .join(".meowsh_history")
-            .to_string_lossy()
-            .to_string();
+        if !home.value.is_empty() {
+            shell.history_file = PathBuf::from(&home.value)
+                .join(".meowsh_history")
+                .to_string_lossy()
+                .to_string();
+        }
     }
 
     seed_tied_array(&mut shell, "path", "PATH");
     seed_tied_array(&mut shell, "fpath", "FPATH");
 }
 
-fn get_env(key: &str, def: &str) -> String {
-    env::var(key).unwrap_or_else(|_| def.to_string())
+// Keeps an inherited $PWD only if it is absolute and names the current
+// directory; otherwise uses the physical working directory.
+fn initial_pwd(inherited: Option<&str>) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let cwd = env::current_dir().ok()?;
+    if let Some(p) = inherited {
+        if p.starts_with('/') {
+            if let (Ok(a), Ok(b)) = (std::fs::metadata(p), std::fs::metadata(&cwd)) {
+                if a.dev() == b.dev() && a.ino() == b.ino() {
+                    return Some(p.to_string());
+                }
+            }
+        }
+    }
+    Some(cwd.to_string_lossy().into_owned())
+}
+
+pub fn opt_set(flag: u32) -> bool {
+    with_shell(|s| s.opts & flag != 0)
+}
+
+pub fn alias_get(name: &str) -> Option<String> {
+    with_shell(|s| s.aliases.get(name).cloned())
+}
+
+/// Value of a parameter, or None if it is unset.
+pub fn var_get_opt(name: &str) -> Option<String> {
+    if var_exists(name) {
+        Some(var_get(name))
+    } else {
+        None
+    }
+}
+
+/// Exported variables for a child process, with `overrides` applied.
+pub fn build_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
+    let mut map: BTreeMap<String, String> = with_shell(|s| {
+        s.vars
+            .iter()
+            .filter(|(_, v)| v.flags & VAR_EXPORT != 0)
+            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .collect()
+    });
+    for (k, v) in overrides {
+        map.insert(k.clone(), v.clone());
+    }
+    map.into_iter().collect()
 }
 
 pub fn var_get(name: &str) -> String {
@@ -231,7 +292,7 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
     shell.arrays.remove(name);
     shell.assoc_arrays.remove(name);
     let mut flags = shell.vars.get(name).map(|v| v.flags).unwrap_or(0);
-    if export {
+    if export || shell.opts & OPT_ALLEXPORT != 0 {
         flags |= VAR_EXPORT;
     }
     shell.vars.insert(
@@ -241,7 +302,6 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
             flags,
         },
     );
-    env::set_var(name, value);
 
     if let Some(array_name) = scalar_to_tied_array(name) {
         let items = split_colon_list(value);
@@ -262,10 +322,6 @@ pub fn array_set(name: &str, items: Vec<String>) -> bool {
     }
     let items = maybe_unique_items(&shell, name, items);
     sync_tied_scalar(&mut shell, name, &items);
-    if !is_tied_array(name) {
-        let joined = items.join(" ");
-        env::set_var(name, &joined);
-    }
     shell.arrays.insert(name.to_string(), items);
     true
 }
@@ -285,10 +341,6 @@ pub fn array_append(name: &str, items: Vec<String>) -> bool {
     combined.extend(items);
     let combined = maybe_unique_items(&shell, name, combined);
     sync_tied_scalar(&mut shell, name, &combined);
-    if !is_tied_array(name) {
-        let joined = combined.join(" ");
-        env::set_var(name, &joined);
-    }
     shell.arrays.insert(name.to_string(), combined);
     true
 }
@@ -337,9 +389,6 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
     }
     let items = maybe_unique_items(&shell, name, items);
     sync_tied_scalar(&mut shell, name, &items);
-    if !is_tied_array(name) {
-        env::set_var(name, items.join(" "));
-    }
     shell.arrays.insert(name.to_string(), items);
     true
 }
@@ -353,9 +402,6 @@ pub fn array_make_unique(name: &str) -> bool {
     if let Some(items) = shell.arrays.get(name).cloned() {
         let items = unique_items(items);
         sync_tied_scalar(&mut shell, name, &items);
-        if !is_tied_array(name) {
-            env::set_var(name, items.join(" "));
-        }
         shell.arrays.insert(name.to_string(), items);
     }
     true
@@ -379,10 +425,7 @@ pub fn assoc_declare(name: &str) -> bool {
         return false;
     }
     shell.arrays.remove(name);
-    shell
-        .assoc_arrays
-        .entry(name.to_string())
-        .or_insert_with(BTreeMap::new);
+    shell.assoc_arrays.entry(name.to_string()).or_default();
     true
 }
 
@@ -454,10 +497,6 @@ fn tied_array_to_scalar(name: &str) -> Option<&'static str> {
     }
 }
 
-fn is_tied_array(name: &str) -> bool {
-    tied_array_to_scalar(name).is_some()
-}
-
 fn split_colon_list(value: &str) -> Vec<String> {
     if value.is_empty() {
         Vec::new()
@@ -474,14 +513,9 @@ fn sync_tied_scalar(shell: &mut Shell, name: &str, items: &[String]) {
             .get(scalar_name)
             .map(|v| v.flags)
             .unwrap_or(VAR_EXPORT);
-        shell.vars.insert(
-            scalar_name.to_string(),
-            Var {
-                value: value.clone(),
-                flags,
-            },
-        );
-        env::set_var(scalar_name, value);
+        shell
+            .vars
+            .insert(scalar_name.to_string(), Var { value, flags });
     }
 }
 
@@ -534,12 +568,10 @@ pub fn pop_scope() {
         for (name, prev) in scope {
             match prev {
                 Some(var) => {
-                    env::set_var(&name, &var.value);
                     shell.vars.insert(name, var);
                 }
                 None => {
                     shell.vars.remove(&name);
-                    env::remove_var(&name);
                 }
             }
         }
@@ -568,8 +600,13 @@ pub fn declare_local(name: &str) -> bool {
 
 pub fn shorten_path(p: &str) -> String {
     let home = var_get("HOME");
-    if !home.is_empty() && p.starts_with(&home) {
-        return format!("~{}", p.strip_prefix(&home).unwrap_or(""));
+    let home = home.trim_end_matches('/');
+    if !home.is_empty() {
+        if let Some(rest) = p.strip_prefix(home) {
+            if rest.is_empty() || rest.starts_with('/') {
+                return format!("~{}", rest);
+            }
+        }
     }
     p.to_string()
 }
@@ -591,7 +628,9 @@ pub fn build_prompt() -> String {
         let short_pwd = shorten_path(pwd);
         return format!("\x1b[32m{}\x1b[0m \x1b[34m{}\x1b[0m 𓃠  ", user, short_pwd);
     }
-    expand_prompt(&prompt_str)
+    // zsh-style % escapes, then POSIX parameter expansion.
+    let escaped = expand_prompt(&prompt_str);
+    crate::expand::expand_prompt_string(&escaped).unwrap_or(escaped)
 }
 
 pub fn expand_prompt(s: &str) -> String {
@@ -836,58 +875,7 @@ pub fn command_exists(name: &str) -> bool {
         }
     }
 
-    let builtins = [
-        ":",
-        "exit",
-        "cd",
-        "pushd",
-        "popd",
-        "dirs",
-        "source",
-        ".",
-        "pwd",
-        "echo",
-        "true",
-        "false",
-        "test",
-        "[",
-        "jobs",
-        "fg",
-        "bg",
-        "export",
-        "set",
-        "setopt",
-        "unsetopt",
-        "unset",
-        "alias",
-        "unalias",
-        "read",
-        "shift",
-        "local",
-        "typeset",
-        "declare",
-        "type",
-        "kill",
-        "wait",
-        "break",
-        "continue",
-        "umask",
-        "return",
-        "eval",
-        "trap",
-        "ulimit",
-        "readonly",
-        "history",
-        "zstyle",
-        "add-zsh-hook",
-        "autoload",
-        "compinit",
-        "compdef",
-        "compaudit",
-        "bindkey",
-        "zmodload",
-    ];
-    if builtins.contains(&name) {
+    if crate::builtins::is_builtin(name) {
         return true;
     }
 

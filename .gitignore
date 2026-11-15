@@ -1,1 +1,5 @@
 target/
+lcov.info
+meowsh
+reproduce_*.sh
+test_*.txt

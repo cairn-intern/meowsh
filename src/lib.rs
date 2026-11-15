@@ -1,20 +1,26 @@
-pub mod types;
-pub mod lexer;
-pub mod parser;
-pub mod shell;
-pub mod expand;
+pub mod arith;
+pub mod builtins;
 pub mod exec;
+pub mod expand;
 pub mod jobs;
+pub mod lexer;
 pub mod lineedit;
+pub mod parser;
+pub mod pattern;
+pub mod shell;
+pub mod sys;
+pub mod testexpr;
+pub mod trap;
+pub mod types;
 
-pub use types::*;
+pub use exec::*;
+pub use expand::*;
+pub use jobs::*;
 pub use lexer::*;
+pub use lineedit::*;
 pub use parser::*;
 pub use shell::*;
-pub use expand::*;
-pub use exec::*;
-pub use jobs::*;
-pub use lineedit::*;
+pub use types::*;
 
 pub fn get_clean_and_mappings(s: &str) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(s.len());
@@ -24,23 +30,27 @@ pub fn get_clean_and_mappings(s: &str) -> (String, Vec<usize>) {
         if c == '\x1b' {
             if let Some(&(_, next_c)) = chars.peek() {
                 match next_c {
-                    '[' => { // CSI
+                    '[' => {
+                        // CSI
                         chars.next();
-                        while let Some((_, c)) = chars.next() {
+                        for (_, c) in chars.by_ref() {
                             if ('@'..='~').contains(&c) {
                                 break;
                             }
                         }
                     }
-                    ']' => { // OSC
+                    ']' => {
+                        // OSC
                         chars.next();
                         while let Some((_, c)) = chars.next() {
-                            if c == '\x07' { // BEL
+                            if c == '\x07' {
+                                // BEL
                                 break;
                             }
                             if c == '\x1b' {
                                 if let Some(&(_, next_next_c)) = chars.peek() {
-                                    if next_next_c == '\\' { // ST
+                                    if next_next_c == '\\' {
+                                        // ST
                                         chars.next();
                                         break;
                                     }
@@ -48,7 +58,8 @@ pub fn get_clean_and_mappings(s: &str) -> (String, Vec<usize>) {
                             }
                         }
                     }
-                    '(' | ')' | '#' | '*' | '+' | '-' | '.' | '/' => { // G0/G1 charset or other 2-char ESC
+                    '(' | ')' | '#' | '*' | '+' | '-' | '.' | '/' => {
+                        // G0/G1 charset or other 2-char ESC
                         chars.next(); // Consume the qualifier
                         chars.next(); // Consume the character
                     }
@@ -81,7 +92,10 @@ mod tests {
     fn test_strip_ansi() {
         assert_eq!(strip_ansi("\x1b[31mhello\x1b[0m"), "hello");
         assert_eq!(strip_ansi("plain text"), "plain text");
-        assert_eq!(strip_ansi("\x1b[1;32mgreen bold\x1b[0m and \x1b[90mgrey\x1b[0m"), "green bold and grey");
+        assert_eq!(
+            strip_ansi("\x1b[1;32mgreen bold\x1b[0m and \x1b[90mgrey\x1b[0m"),
+            "green bold and grey"
+        );
         // Test OSC
         assert_eq!(strip_ansi("\x1b]0;terminal title\x07hello"), "hello");
         assert_eq!(strip_ansi("\x1b]0;title\x1b\\world"), "world");

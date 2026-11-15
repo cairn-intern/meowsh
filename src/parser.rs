@@ -1,566 +1,850 @@
-use crate::lexer::Lexer;
-use crate::types::{ASTNode, CaseItem, Redir, Token, TokenType};
+use crate::lexer::{assignment_split, is_valid_name, LexError, Lexer, Tok};
+use crate::types::{
+    AndOrOp, Assign, AssignValue, CaseItem, HereDoc, ListItem, Node, Redir, RedirOp, SimpleCmd,
+};
+use std::collections::HashMap;
 
-pub struct Parser<'a> {
-    lexer: &'a mut Lexer,
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParseError {
+    // The input ended inside a construct; more input may complete it.
+    Incomplete,
+    Syntax(String),
 }
 
-impl<'a> Parser<'a> {
-    pub fn new(lexer: &'a mut Lexer) -> Self {
-        Parser { lexer }
-    }
-
-    pub fn parse(&mut self) -> Option<ASTNode> {
-        self.parse_command_list(true).0
-    }
-
-    fn parse_command_list(&mut self, top_level: bool) -> (Option<ASTNode>, bool) {
-        let mut nodes = Vec::new();
-
-        // Skip blank lines at the start of a top-level parse so they don't
-        // make `parse()` return None and falsely terminate the script.
-        if top_level {
-            while self.peek_token().token_type == TokenType::Newline {
-                self.lexer.next_token();
-            }
+impl From<LexError> for ParseError {
+    fn from(e: LexError) -> Self {
+        match e {
+            LexError::Incomplete => ParseError::Incomplete,
+            LexError::Syntax(s) => ParseError::Syntax(s),
         }
+    }
+}
 
+type PResult<T> = Result<T, ParseError>;
+
+const LIST_TERMINATORS: &[&str] = &["then", "else", "elif", "fi", "do", "done", "esac", "}"];
+
+type AliasLookup = Box<dyn Fn(&str) -> Option<String>>;
+
+pub struct Parser {
+    lex: Lexer,
+    peeked: Option<Tok>,
+    final_input: bool,
+    // Aliases currently being expanded and the input offset where each
+    // expansion ends; an alias is not re-expanded inside its own text.
+    alias_guard: Vec<(String, usize)>,
+    // Set after an alias whose value ends in a blank: the next word is
+    // also checked for alias expansion.
+    alias_next: bool,
+    alias_lookup: AliasLookup,
+}
+
+impl Parser {
+    pub fn new(input: &str, final_input: bool) -> Self {
+        Parser {
+            lex: Lexer::new(input, final_input),
+            peeked: None,
+            final_input,
+            alias_guard: Vec::new(),
+            alias_next: false,
+            alias_lookup: Box::new(crate::shell::alias_get),
+        }
+    }
+
+    /// Parser that never expands aliases (used by tests and the highlighter).
+    pub fn without_aliases(input: &str, final_input: bool) -> Self {
+        let mut p = Parser::new(input, final_input);
+        p.alias_lookup = Box::new(|_| None);
+        p
+    }
+
+    /// Input not yet consumed. Only meaningful between complete commands.
+    pub fn rest(&self) -> String {
+        self.lex.rest()
+    }
+
+    fn peek(&mut self) -> PResult<&Tok> {
+        if self.peeked.is_none() {
+            self.peeked = Some(self.lex.next_token()?);
+        }
+        Ok(self.peeked.as_ref().unwrap())
+    }
+
+    fn next(&mut self) -> PResult<Tok> {
+        if let Some(t) = self.peeked.take() {
+            return Ok(t);
+        }
+        Ok(self.lex.next_token()?)
+    }
+
+    fn eof_error(&self, what: &str) -> ParseError {
+        if self.final_input {
+            ParseError::Syntax(format!("unexpected end of file (expecting {})", what))
+        } else {
+            ParseError::Incomplete
+        }
+    }
+
+    fn unexpected(&self, tok: &Tok) -> ParseError {
+        ParseError::Syntax(format!(
+            "syntax error near unexpected token `{}'",
+            tok_text(tok)
+        ))
+    }
+
+    fn peek_is_word(&mut self, w: &str) -> PResult<bool> {
+        Ok(matches!(self.peek()?, Tok::Word(x) if x == w))
+    }
+
+    fn peek_is_op(&mut self, op: &str) -> PResult<bool> {
+        Ok(matches!(self.peek()?, Tok::Op(x) if *x == op))
+    }
+
+    fn skip_newlines(&mut self) -> PResult<()> {
+        while matches!(self.peek()?, Tok::Newline) {
+            self.next()?;
+        }
+        Ok(())
+    }
+
+    fn expect_word(&mut self, w: &str) -> PResult<()> {
+        self.skip_newlines()?;
+        match self.next()? {
+            Tok::Word(x) if x == w => Ok(()),
+            Tok::Eof => Err(self.eof_error(&format!("`{}'", w))),
+            t => Err(self.unexpected(&t)),
+        }
+    }
+
+    fn expect_op(&mut self, op: &str) -> PResult<()> {
+        match self.next()? {
+            Tok::Op(x) if x == op => Ok(()),
+            Tok::Eof => Err(self.eof_error(&format!("`{}'", op))),
+            t => Err(self.unexpected(&t)),
+        }
+    }
+
+    /// Parses one complete command: everything up to an unquoted newline
+    /// or the end of input. Returns None when only blank lines and
+    /// comments remain. Here-document bodies are attached before returning.
+    pub fn parse_complete_command(&mut self) -> PResult<Option<Node>> {
+        self.skip_newlines()?;
+        if matches!(self.peek()?, Tok::Eof) {
+            return Ok(None);
+        }
+        let mut node = self.parse_list(true)?;
+        match self.next()? {
+            Tok::Newline | Tok::Eof => {}
+            t => return Err(self.unexpected(&t)),
+        }
+        if self.lex.has_pending_heredocs() {
+            return Err(self.eof_error("here-document body"));
+        }
+        let mut bodies = std::mem::take(&mut self.lex.heredoc_bodies);
+        fill_heredocs(&mut node, &mut bodies);
+        Ok(Some(node))
+    }
+
+    /// Parses all remaining commands into one list (used by tests).
+    pub fn parse_program(&mut self) -> PResult<Vec<Node>> {
+        let mut out = Vec::new();
+        while let Some(n) = self.parse_complete_command()? {
+            out.push(n);
+        }
+        Ok(out)
+    }
+
+    // list: and_or ((';' | '&') and_or)*
+    // At top level the list ends at a newline; inside compound commands
+    // newlines separate commands and the list ends at a terminator word.
+    fn parse_list(&mut self, top_level: bool) -> PResult<Node> {
+        let mut items: Vec<ListItem> = Vec::new();
         loop {
-            let tok = self.peek_token();
-            if tok.token_type == TokenType::Eof
-                || tok.token_type == TokenType::Rparen
-                || tok.token_type == TokenType::Rbrace
-            {
+            if !top_level {
+                self.skip_newlines()?;
+            }
+            if self.at_list_end()? {
                 break;
             }
-            if Self::is_reserved_end(&tok.value) {
-                break;
-            }
-
-            if let Some(node) = self.parse_command() {
-                nodes.push(node);
-            }
-
-            let tok = self.peek_token();
-            match tok.token_type {
-                TokenType::Semi => {
-                    self.lexer.next_token();
+            let node = self.parse_and_or()?;
+            let mut background = false;
+            match self.peek()? {
+                Tok::Op(";") => {
+                    self.next()?;
                 }
-                TokenType::Newline => {
-                    self.lexer.next_token();
+                Tok::Op("&") => {
+                    self.next()?;
+                    background = true;
+                }
+                Tok::Newline => {
                     if top_level {
+                        items.push(ListItem { node, background });
                         break;
                     }
                 }
-                TokenType::Ampersand => {
-                    self.lexer.next_token();
-                    if let Some(ref mut node) = nodes.last_mut() {
-                        node.conn = "&".to_string();
+                _ => {
+                    items.push(ListItem { node, background });
+                    break;
+                }
+            }
+            items.push(ListItem { node, background });
+            if top_level && matches!(self.peek()?, Tok::Newline | Tok::Eof) {
+                break;
+            }
+        }
+        if items.is_empty() {
+            return match self.peek()? {
+                Tok::Eof => Err(self.eof_error("a command")),
+                t => {
+                    let t = t.clone();
+                    if top_level {
+                        Err(self.unexpected(&t))
+                    } else {
+                        Ok(Node::Empty)
                     }
                 }
+            };
+        }
+        if items.len() == 1 && !items[0].background {
+            return Ok(items.pop().unwrap().node);
+        }
+        Ok(Node::List(items))
+    }
+
+    fn at_list_end(&mut self) -> PResult<bool> {
+        Ok(match self.peek()? {
+            Tok::Eof => true,
+            Tok::Op(")") | Tok::Op(";;") | Tok::Op(";&") => true,
+            Tok::Word(w) => LIST_TERMINATORS.contains(&w.as_str()),
+            _ => false,
+        })
+    }
+
+    // and_or: pipeline (('&&' | '||') linebreak pipeline)*
+    fn parse_and_or(&mut self) -> PResult<Node> {
+        let first = self.parse_pipeline()?;
+        let mut rest = Vec::new();
+        loop {
+            let op = match self.peek()? {
+                Tok::Op("&&") => AndOrOp::And,
+                Tok::Op("||") => AndOrOp::Or,
                 _ => break,
-            }
+            };
+            self.next()?;
+            self.skip_newlines()?;
+            rest.push((op, self.parse_pipeline()?));
         }
-
-        if nodes.is_empty() {
-            return (None, false);
+        if rest.is_empty() {
+            return Ok(first);
         }
-        if nodes.len() == 1 {
-            return (Some(nodes.remove(0)), true);
-        }
-
-        let pipes = nodes;
-        let mut node = ASTNode::new("list");
-        node.pipes = pipes;
-        (Some(node), true)
+        Ok(Node::AndOr {
+            first: Box::new(first),
+            rest,
+        })
     }
 
-    fn is_reserved_end(value: &str) -> bool {
-        // The lexer doesn't emit a dedicated Rbrace token for `}` — it
-        // comes back as a Word — so we treat the literal value as a
-        // command-list terminator alongside the other reserved words.
-        matches!(
-            value,
-            "done" | "fi" | "esac" | "else" | "elif" | "then" | "do" | "}"
-        )
+    // pipeline: ['!'] command ('|' linebreak command)*
+    fn parse_pipeline(&mut self) -> PResult<Node> {
+        let mut bang = false;
+        while self.peek_is_word("!")? {
+            self.next()?;
+            bang = !bang;
+        }
+        let mut cmds = vec![self.parse_command()?];
+        while self.peek_is_op("|")? {
+            self.next()?;
+            self.skip_newlines()?;
+            cmds.push(self.parse_command()?);
+        }
+        if cmds.len() == 1 && !bang {
+            return Ok(cmds.pop().unwrap());
+        }
+        Ok(Node::Pipeline { cmds, bang })
     }
 
-    fn peek_token(&mut self) -> Token {
-        self.lexer.peek_token()
+    fn alias_blocked(&self, name: &str) -> bool {
+        let pos = self.lex.pos();
+        self.alias_guard
+            .iter()
+            .any(|(n, end)| n == name && pos < *end)
     }
 
-    fn parse_command(&mut self) -> Option<ASTNode> {
-        let tok = self.peek_token();
-
-        if tok.token_type == TokenType::Eof
-            || tok.token_type == TokenType::Newline
-            || tok.token_type == TokenType::Semi
-        {
-            return None;
+    /// If the next token is an unquoted word naming an alias, replaces it
+    /// with the alias text. Returns true if a substitution happened.
+    fn try_alias(&mut self) -> PResult<bool> {
+        let name = match self.peek()? {
+            Tok::Word(w) => w.clone(),
+            _ => return Ok(false),
+        };
+        if self.alias_blocked(&name) {
+            return Ok(false);
         }
-
-        // POSIX function definition: name ( )  followed by compound command.
-        if tok.token_type == TokenType::Word && self.is_posix_func_def() {
-            return self.parse_posix_function();
-        }
-
-        if tok.value == "[[" {
-            return Some(self.parse_dbracket());
-        }
-
-        match tok.value.as_str() {
-            "if" => Some(self.parse_if()),
-            "while" | "until" => Some(self.parse_while()),
-            "for" => Some(self.parse_for()),
-            "case" => Some(self.parse_case()),
-            "{" => {
-                self.lexer.next_token();
-                let (body, _) = self.parse_command_list(false);
-                self.expect_token_type(TokenType::Rbrace);
-                let mut node = ASTNode::new("brace_group");
-                node.body = body.map(Box::new);
-                Some(node)
+        let Some(value) = (self.alias_lookup)(&name) else {
+            return Ok(false);
+        };
+        // The peeked token has been lexed; the lexer sits right after it.
+        self.peeked = None;
+        let pos = self.lex.pos();
+        let text = format!("{} ", value);
+        let len = text.chars().count();
+        for (_, end) in self.alias_guard.iter_mut() {
+            if *end >= pos {
+                *end += len;
             }
-            "(" => {
-                self.lexer.next_token();
-                let (body, _) = self.parse_command_list(false);
-                self.expect_token_type(TokenType::Rparen);
-                let mut node = ASTNode::new("subshell");
-                node.body = body.map(Box::new);
-                Some(node)
-            }
-            "!" => {
-                self.lexer.next_token();
-                let mut node = self.parse_command()?;
-                node.bang = true;
-                Some(node)
-            }
-            "function" => self.parse_function(),
-            _ => self.parse_simple_command(),
         }
+        self.lex.insert_text(&text);
+        self.alias_guard.push((name, pos + len));
+        self.alias_next = value.ends_with(' ') || value.ends_with('\t');
+        Ok(true)
     }
 
-    fn is_posix_func_def(&mut self) -> bool {
-        let mut clone = self.lexer.clone();
-        let name = clone.next_token();
-        if name.token_type != TokenType::Word {
-            return false;
-        }
-        // Reserved words and the "function" keyword don't form POSIX defs.
-        if matches!(
-            name.value.as_str(),
-            "if" | "while"
-                | "until"
-                | "for"
-                | "case"
-                | "function"
-                | "then"
-                | "else"
-                | "elif"
-                | "fi"
-                | "do"
-                | "done"
-                | "esac"
-                | "in"
-                | "{"
-                | "}"
-                | "!"
-        ) {
-            return false;
-        }
-        let lparen = clone.next_token();
-        if lparen.token_type != TokenType::Lparen {
-            return false;
-        }
-        let rparen = clone.next_token();
-        rparen.token_type == TokenType::Rparen
-    }
-
-    fn parse_posix_function(&mut self) -> Option<ASTNode> {
-        let name = self.lexer.next_token().value;
-        self.lexer.next_token(); // (
-        self.lexer.next_token(); // )
-        self.skip_newlines();
-        let body = self.parse_command();
-        let mut node = ASTNode::new("function");
-        node.func_name = name;
-        node.func_body = body.map(Box::new);
-        Some(node)
-    }
-
-    // [[ expr ]] conditional. The lexer hands us each inner token as-is
-    // (including `&&`, `||`, `(`, `)`, and operator/operand words). We
-    // collect raw values until `]]` and let the executor evaluate.
-    fn parse_dbracket(&mut self) -> ASTNode {
-        self.lexer.next_token(); // [[
-        let mut args: Vec<String> = Vec::new();
-        loop {
-            let tok = self.lexer.next_token();
-            if tok.token_type == TokenType::Eof {
-                eprintln!("meowsh: syntax error: unexpected end of file in [[ ... ]]");
-                break;
-            }
-            if tok.value == "]]" {
-                break;
-            }
-            if tok.token_type == TokenType::Newline {
-                continue;
-            }
-            args.push(tok.value);
-        }
-        let mut node = ASTNode::new("dbracket");
-        node.args = args;
-        node
-    }
-
-    fn parse_simple_command(&mut self) -> Option<ASTNode> {
-        let mut node = ASTNode::new("simple");
-
-        loop {
-            let mut tok = self.peek_token();
-            if Self::is_terminator(&tok) {
-                break;
-            }
-
-            let mut fd = -1;
-            if tok.token_type == TokenType::IoNumber {
-                let fd_str = self.lexer.next_token().value;
-                fd = fd_str.parse().unwrap_or(-1);
-                tok = self.peek_token();
-            }
-
-            if Self::is_redirection(&tok) {
-                let op = self.lexer.next_token().value;
-                if fd == -1 {
-                    if matches!(op.as_str(), "<" | "<<" | "<<-" | "<&" | "<>") {
-                        fd = 0;
-                    } else {
-                        fd = 1;
-                    }
+    fn parse_command(&mut self) -> PResult<Node> {
+        while self.try_alias()? {}
+        let tok = self.peek()?.clone();
+        let node = match &tok {
+            Tok::Word(w) => match w.as_str() {
+                "if" => self.parse_if()?,
+                "while" => self.parse_loop(false)?,
+                "until" => self.parse_loop(true)?,
+                "for" => self.parse_for()?,
+                "case" => self.parse_case()?,
+                "{" => {
+                    self.next()?;
+                    let body = self.parse_list(false)?;
+                    self.expect_word("}")?;
+                    Node::Brace(Box::new(body))
                 }
-                let file_tok = self.lexer.next_token();
-                let mut redir = Redir {
-                    op: op.clone(),
-                    file: file_tok.value.clone(),
-                    fd,
-                    heredoc_body: String::new(),
-                };
-
-                if op == "<<" || op == "<<-" {
-                    redir.heredoc_body = self.lexer.read_heredoc(&file_tok.value, op == "<<-");
+                "[[" => self.parse_dbracket()?,
+                "function" => return self.parse_function_keyword(),
+                "then" | "else" | "elif" | "fi" | "do" | "done" | "esac" | "}" | "in" => {
+                    return Err(self.unexpected(&tok));
                 }
-
-                node.redirs.push(redir);
-                continue;
+                _ => return self.parse_simple_or_funcdef(),
+            },
+            Tok::Op("(") => {
+                self.next()?;
+                let body = self.parse_list(false)?;
+                self.expect_op(")")?;
+                Node::Subshell(Box::new(body))
             }
-
-            if tok.token_type == TokenType::Assignment {
-                if node.args.is_empty() {
-                    let raw = tok.value.clone();
-                    self.lexer.next_token();
-                    let (name, value, is_append) = split_assignment(&raw);
-
-                    if let Some((base, subscript)) = split_assignment_subscript(&name) {
-                        node.subscript_assigns
-                            .push((base, subscript, value, is_append));
-                        continue;
-                    }
-
-                    // Array literal / append: `name=(...)` or `name+=(...)`.
-                    if value.is_empty() && self.peek_token().token_type == TokenType::Lparen {
-                        self.lexer.next_token(); // (
-                        let mut items: Vec<String> = Vec::new();
-                        loop {
-                            let t = self.peek_token();
-                            if t.token_type == TokenType::Rparen || t.token_type == TokenType::Eof {
-                                break;
-                            }
-                            if t.token_type == TokenType::Newline || t.token_type == TokenType::Semi
-                            {
-                                self.lexer.next_token();
-                                continue;
-                            }
-                            items.push(self.lexer.next_token().value);
-                        }
-                        if self.peek_token().token_type == TokenType::Rparen {
-                            self.lexer.next_token();
-                        }
-                        if is_append {
-                            node.array_appends.insert(name, items);
-                        } else {
-                            node.array_assigns.insert(name, items);
-                        }
-                        continue;
-                    }
-
-                    if is_append {
-                        node.scalar_appends.insert(name, value);
-                    } else {
-                        node.assigns.insert(name, value);
-                    }
-                    continue;
-                } else {
-                    node.args.push(tok.value.clone());
-                    self.lexer.next_token();
-                    continue;
-                }
-            }
-
-            if tok.token_type == TokenType::Word {
-                node.args.push(tok.value.clone());
-                self.lexer.next_token();
-                continue;
-            }
-
-            break;
+            Tok::Eof => return Err(self.eof_error("a command")),
+            Tok::IoNumber(_)
+            | Tok::Op("<")
+            | Tok::Op(">")
+            | Tok::Op(">>")
+            | Tok::Op("<<")
+            | Tok::Op("<<-")
+            | Tok::Op("<&")
+            | Tok::Op(">&")
+            | Tok::Op("<>")
+            | Tok::Op(">|") => return self.parse_simple_or_funcdef(),
+            _ => return Err(self.unexpected(&tok)),
+        };
+        // Redirections after a compound command apply to all of it.
+        let mut redirs = Vec::new();
+        while let Some(r) = self.try_parse_redirect()? {
+            redirs.push(r);
         }
-
-        let tok = self.peek_token();
-        if tok.token_type == TokenType::Pipe {
-            self.lexer.next_token();
-            if let Some(right) = self.parse_command() {
-                let left = node;
-                let mut pipe_node = ASTNode::new("pipeline");
-                pipe_node.pipes = vec![left, right];
-                return Some(pipe_node);
-            }
+        if redirs.is_empty() {
+            Ok(node)
+        } else {
+            Ok(Node::Redirected {
+                node: Box::new(node),
+                redirs,
+            })
         }
-        if tok.token_type == TokenType::AndIf {
-            self.lexer.next_token();
-            if let Some(right) = self.parse_command() {
-                let mut and_or = ASTNode::new("and_or");
-                and_or.left = Some(Box::new(node));
-                and_or.right = Some(Box::new(right));
-                and_or.conn = "&&".to_string();
-                return Some(and_or);
-            }
-        }
-        if tok.token_type == TokenType::OrIf {
-            self.lexer.next_token();
-            if let Some(right) = self.parse_command() {
-                let mut and_or = ASTNode::new("and_or");
-                and_or.left = Some(Box::new(node));
-                and_or.right = Some(Box::new(right));
-                and_or.conn = "||".to_string();
-                return Some(and_or);
-            }
-        }
-
-        Some(node)
     }
 
-    fn is_terminator(tok: &Token) -> bool {
-        matches!(
-            tok.token_type,
-            TokenType::Eof
-                | TokenType::Semi
-                | TokenType::Newline
-                | TokenType::Ampersand
-                | TokenType::Pipe
-                | TokenType::AndIf
-                | TokenType::OrIf
-                | TokenType::Rparen
-                | TokenType::Rbrace
-        )
-    }
-
-    fn is_redirection(tok: &Token) -> bool {
-        matches!(
-            tok.token_type,
-            TokenType::Less
-                | TokenType::Great
-                | TokenType::Dless
-                | TokenType::Dgreat
-                | TokenType::LessAnd
-                | TokenType::GreatAnd
-                | TokenType::LessGreat
-                | TokenType::Clobber
-                | TokenType::DlessDash
-        )
-    }
-
-    fn parse_if(&mut self) -> ASTNode {
-        self.lexer.next_token(); // if
-        let (cond, _) = self.parse_command_list(false);
-
-        self.expect_value("then");
-        let (body, _) = self.parse_command_list(false);
-
-        let else_node = {
-            let tok = self.peek_token();
-            match tok.value.as_str() {
-                "else" => {
-                    self.lexer.next_token();
-                    self.parse_command_list(false).0.map(Box::new)
+    fn try_parse_redirect(&mut self) -> PResult<Option<Redir>> {
+        let mut fd = None;
+        if let Tok::IoNumber(n) = self.peek()? {
+            fd = Some(*n);
+            self.next()?;
+        }
+        let op = match self.peek()? {
+            Tok::Op(op) => *op,
+            t => {
+                if fd.is_some() {
+                    let t = t.clone();
+                    return Err(self.unexpected(&t));
                 }
-                "elif" => Some(Box::new(self.parse_if())),
-                _ => None,
+                return Ok(None);
             }
         };
-
-        self.expect_value("fi");
-
-        let mut node = ASTNode::new("if");
-        node.cond = cond.map(Box::new);
-        node.body = body.map(Box::new);
-        node.else_body = else_node;
-        node
-    }
-
-    fn parse_while(&mut self) -> ASTNode {
-        let keyword = self.lexer.next_token().value;
-        let (cond, _) = self.parse_command_list(false);
-        self.expect_value("do");
-        let (body, _) = self.parse_command_list(false);
-        self.expect_value("done");
-
-        let mut node = ASTNode::new(&keyword);
-        node.cond = cond.map(Box::new);
-        node.body = body.map(Box::new);
-        node
-    }
-
-    fn parse_for(&mut self) -> ASTNode {
-        self.lexer.next_token(); // for
-        let var_name = self.lexer.next_token().value;
-
-        self.expect_value("in");
-
-        let mut words = Vec::new();
-        loop {
-            let tok = self.peek_token();
-            if tok.value == "do"
-                || tok.token_type == TokenType::Semi
-                || tok.token_type == TokenType::Newline
-            {
-                break;
+        let (rop, default_fd) = match op {
+            "<" => (RedirOp::Read, 0),
+            ">" => (RedirOp::Write, 1),
+            ">|" => (RedirOp::Clobber, 1),
+            ">>" => (RedirOp::Append, 1),
+            "<>" => (RedirOp::ReadWrite, 0),
+            "<&" => (RedirOp::DupIn, 0),
+            ">&" => (RedirOp::DupOut, 1),
+            "<<" | "<<-" => (RedirOp::HereDoc, 0),
+            _ => {
+                if fd.is_some() {
+                    return Err(ParseError::Syntax(format!(
+                        "syntax error near unexpected token `{}'",
+                        op
+                    )));
+                }
+                return Ok(None);
             }
-            words.push(self.lexer.next_token().value);
-        }
-
-        if self.peek_token().token_type == TokenType::Semi {
-            self.lexer.next_token();
-        }
-
-        self.expect_value("do");
-        let (body, _) = self.parse_command_list(false);
-        self.expect_value("done");
-
-        let mut node = ASTNode::new("for");
-        node.loop_var = var_name;
-        node.loop_words = words;
-        node.body = body.map(Box::new);
-        node
+        };
+        self.next()?;
+        let target = match self.next()? {
+            Tok::Word(w) => w,
+            Tok::Eof => return Err(self.eof_error("a redirection target")),
+            t => return Err(self.unexpected(&t)),
+        };
+        let heredoc = if rop == RedirOp::HereDoc {
+            let (id, expand) = self.lex.add_heredoc(&target, op == "<<-");
+            Some(HereDoc {
+                id,
+                body: String::new(),
+                expand,
+            })
+        } else {
+            None
+        };
+        Ok(Some(Redir {
+            fd: fd.unwrap_or(default_fd),
+            op: rop,
+            target,
+            heredoc,
+        }))
     }
 
-    fn parse_case(&mut self) -> ASTNode {
-        self.lexer.next_token(); // case
-        let word = self.lexer.next_token().value;
-
-        self.skip_newlines();
-        self.expect_value("in");
-        self.skip_newlines();
-
-        let mut node = ASTNode::new("case");
-        node.value = word;
-        node.cases = Vec::new();
-
+    fn parse_simple_or_funcdef(&mut self) -> PResult<Node> {
+        let mut cmd = SimpleCmd::default();
         loop {
-            let tok = self.peek_token();
-            if tok.value == "esac" || tok.token_type == TokenType::Eof {
-                break;
-            }
-
-            if tok.token_type == TokenType::Newline {
-                self.lexer.next_token();
+            if let Some(r) = self.try_parse_redirect()? {
+                cmd.redirs.push(r);
                 continue;
             }
-
-            if tok.value == "(" {
-                self.lexer.next_token();
+            if cmd.words.is_empty() || self.alias_next {
+                let check = self.alias_next || cmd.words.is_empty();
+                self.alias_next = false;
+                if check && self.try_alias()? {
+                    continue;
+                }
             }
-
-            let pattern = self.lexer.next_token().value;
-            self.expect_value(")");
-
-            let (body, _) = self.parse_command_list(false);
-            node.cases.push(CaseItem {
-                pattern,
-                body: body.map(Box::new),
-            });
-
-            let tok = self.peek_token();
-            if tok.value == ";;" {
-                self.lexer.next_token();
+            let word = match self.peek()? {
+                Tok::Word(w) => w.clone(),
+                _ => break,
+            };
+            if cmd.words.is_empty() {
+                if let Some((name, subscript, append, value)) = assignment_split(&word) {
+                    self.next()?;
+                    // `name=(...)` array literal.
+                    if value.is_empty() && subscript.is_none() && self.peek_is_op("(")? {
+                        self.next()?;
+                        let mut items = Vec::new();
+                        loop {
+                            match self.next()? {
+                                Tok::Op(")") => break,
+                                Tok::Newline => continue,
+                                Tok::Word(w) => items.push(w),
+                                Tok::Eof => return Err(self.eof_error("`)'")),
+                                t => return Err(self.unexpected(&t)),
+                            }
+                        }
+                        cmd.assigns.push(Assign {
+                            name,
+                            subscript: None,
+                            append,
+                            value: AssignValue::Array(items),
+                        });
+                    } else {
+                        cmd.assigns.push(Assign {
+                            name,
+                            subscript,
+                            append,
+                            value: AssignValue::Scalar(value),
+                        });
+                    }
+                    continue;
+                }
             }
-            self.skip_newlines();
+            self.next()?;
+            // name ( ) compound-command
+            if cmd.words.is_empty()
+                && cmd.assigns.is_empty()
+                && cmd.redirs.is_empty()
+                && self.peek_is_op("(")?
+            {
+                self.next()?;
+                self.expect_op(")")?;
+                if !is_func_name(&word) {
+                    return Err(ParseError::Syntax(format!(
+                        "`{}': not a valid function name",
+                        word
+                    )));
+                }
+                self.skip_newlines()?;
+                let body = self.parse_command()?;
+                return Ok(Node::FuncDef {
+                    name: word,
+                    body: Box::new(body),
+                });
+            }
+            cmd.words.push(word);
         }
-
-        self.expect_value("esac");
-        node
+        if cmd.words.is_empty() && cmd.assigns.is_empty() && cmd.redirs.is_empty() {
+            let t = self.peek()?.clone();
+            if t == Tok::Eof {
+                return Err(self.eof_error("a command"));
+            }
+            return Err(self.unexpected(&t));
+        }
+        Ok(Node::Simple(cmd))
     }
 
-    fn parse_function(&mut self) -> Option<ASTNode> {
-        self.lexer.next_token(); // function
-        let name = self.lexer.next_token().value;
-
-        let body = self.parse_command();
-
-        let mut node = ASTNode::new("function");
-        node.func_name = name;
-        node.func_body = body.map(Box::new);
-        Some(node)
+    // function name [()] compound-command
+    fn parse_function_keyword(&mut self) -> PResult<Node> {
+        self.next()?;
+        let name = match self.next()? {
+            Tok::Word(w) => w,
+            Tok::Eof => return Err(self.eof_error("a function name")),
+            t => return Err(self.unexpected(&t)),
+        };
+        if self.peek_is_op("(")? {
+            self.next()?;
+            self.expect_op(")")?;
+        }
+        self.skip_newlines()?;
+        let body = self.parse_command()?;
+        Ok(Node::FuncDef {
+            name,
+            body: Box::new(body),
+        })
     }
 
-    fn skip_newlines(&mut self) {
+    fn parse_if(&mut self) -> PResult<Node> {
+        self.next()?; // if
+        let mut branches = Vec::new();
+        let cond = self.parse_list(false)?;
+        self.expect_word("then")?;
+        let body = self.parse_list(false)?;
+        branches.push((cond, body));
+        let mut else_body = None;
         loop {
-            let tok = self.peek_token();
-            if tok.token_type != TokenType::Newline {
+            self.skip_newlines()?;
+            match self.next()? {
+                Tok::Word(w) if w == "elif" => {
+                    let cond = self.parse_list(false)?;
+                    self.expect_word("then")?;
+                    let body = self.parse_list(false)?;
+                    branches.push((cond, body));
+                }
+                Tok::Word(w) if w == "else" => {
+                    else_body = Some(Box::new(self.parse_list(false)?));
+                    self.expect_word("fi")?;
+                    break;
+                }
+                Tok::Word(w) if w == "fi" => break,
+                Tok::Eof => return Err(self.eof_error("`fi'")),
+                t => return Err(self.unexpected(&t)),
+            }
+        }
+        Ok(Node::If {
+            branches,
+            else_body,
+        })
+    }
+
+    fn parse_loop(&mut self, until: bool) -> PResult<Node> {
+        self.next()?;
+        let cond = self.parse_list(false)?;
+        self.expect_word("do")?;
+        let body = self.parse_list(false)?;
+        self.expect_word("done")?;
+        Ok(Node::Loop {
+            cond: Box::new(cond),
+            body: Box::new(body),
+            until,
+        })
+    }
+
+    fn parse_for(&mut self) -> PResult<Node> {
+        self.next()?; // for
+        let var = match self.next()? {
+            Tok::Word(w) if is_valid_name(&w) => w,
+            Tok::Eof => return Err(self.eof_error("a variable name")),
+            t => return Err(self.unexpected(&t)),
+        };
+        self.skip_newlines()?;
+        let mut words = None;
+        if self.peek_is_word("in")? {
+            self.next()?;
+            let mut list = Vec::new();
+            loop {
+                match self.next()? {
+                    Tok::Word(w) => list.push(w),
+                    Tok::Op(";") | Tok::Newline => break,
+                    Tok::Eof => return Err(self.eof_error("`do'")),
+                    t => return Err(self.unexpected(&t)),
+                }
+            }
+            words = Some(list);
+        } else if self.peek_is_op(";")? {
+            self.next()?;
+        }
+        self.expect_word("do")?;
+        let body = self.parse_list(false)?;
+        self.expect_word("done")?;
+        Ok(Node::For {
+            var,
+            words,
+            body: Box::new(body),
+        })
+    }
+
+    fn parse_case(&mut self) -> PResult<Node> {
+        self.next()?; // case
+        let word = match self.next()? {
+            Tok::Word(w) => w,
+            Tok::Eof => return Err(self.eof_error("a word")),
+            t => return Err(self.unexpected(&t)),
+        };
+        self.expect_word("in")?;
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines()?;
+            if self.peek_is_word("esac")? {
+                self.next()?;
                 break;
             }
-            self.lexer.next_token();
+            if self.peek_is_op("(")? {
+                self.next()?;
+            }
+            let mut patterns = Vec::new();
+            loop {
+                match self.next()? {
+                    Tok::Word(w) => patterns.push(w),
+                    Tok::Eof => return Err(self.eof_error("a case pattern")),
+                    t => return Err(self.unexpected(&t)),
+                }
+                match self.next()? {
+                    Tok::Op("|") => continue,
+                    Tok::Op(")") => break,
+                    Tok::Eof => return Err(self.eof_error("`)'")),
+                    t => return Err(self.unexpected(&t)),
+                }
+            }
+            let body = self.parse_list(false)?;
+            let body = match body {
+                Node::Empty => None,
+                b => Some(b),
+            };
+            self.skip_newlines()?;
+            let mut fallthrough = false;
+            match self.peek()?.clone() {
+                Tok::Op(";;") => {
+                    self.next()?;
+                }
+                Tok::Op(";&") => {
+                    self.next()?;
+                    fallthrough = true;
+                }
+                Tok::Word(w) if w == "esac" => {}
+                Tok::Eof => return Err(self.eof_error("`esac'")),
+                t => return Err(self.unexpected(&t)),
+            }
+            items.push(CaseItem {
+                patterns,
+                body,
+                fallthrough,
+            });
+        }
+        Ok(Node::Case { word, items })
+    }
+
+    // [[ expr ]]: operands and operators are kept as raw words and
+    // evaluated by the executor.
+    fn parse_dbracket(&mut self) -> PResult<Node> {
+        self.next()?; // [[
+        let mut args = Vec::new();
+        loop {
+            match self.next()? {
+                Tok::Word(w) if w == "]]" => break,
+                Tok::Word(w) => args.push(w),
+                Tok::Op(op) => args.push(op.to_string()),
+                Tok::IoNumber(n) => args.push(n.to_string()),
+                Tok::Newline => {}
+                Tok::Eof => return Err(self.eof_error("`]]'")),
+            }
+        }
+        Ok(Node::DBracket(args))
+    }
+}
+
+fn is_func_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains(['\'', '"', '\\', '$', '`', '=', '/'])
+        && !LIST_TERMINATORS.contains(&s)
+}
+
+fn tok_text(t: &Tok) -> String {
+    match t {
+        Tok::Word(w) => w.clone(),
+        Tok::IoNumber(n) => n.to_string(),
+        Tok::Op(o) => o.to_string(),
+        Tok::Newline => "newline".to_string(),
+        Tok::Eof => "end of file".to_string(),
+    }
+}
+
+fn fill_redirs(redirs: &mut [Redir], bodies: &mut HashMap<usize, String>) {
+    for r in redirs {
+        if let Some(hd) = r.heredoc.as_mut() {
+            if let Some(body) = bodies.remove(&hd.id) {
+                hd.body = body;
+            }
+        }
+    }
+}
+
+fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
+    if bodies.is_empty() {
+        return;
+    }
+    match node {
+        Node::Simple(cmd) => fill_redirs(&mut cmd.redirs, bodies),
+        Node::Pipeline { cmds, .. } => cmds.iter_mut().for_each(|c| fill_heredocs(c, bodies)),
+        Node::AndOr { first, rest } => {
+            fill_heredocs(first, bodies);
+            rest.iter_mut().for_each(|(_, n)| fill_heredocs(n, bodies));
+        }
+        Node::List(items) => items
+            .iter_mut()
+            .for_each(|i| fill_heredocs(&mut i.node, bodies)),
+        Node::Subshell(b) | Node::Brace(b) => fill_heredocs(b, bodies),
+        Node::If {
+            branches,
+            else_body,
+        } => {
+            for (c, b) in branches {
+                fill_heredocs(c, bodies);
+                fill_heredocs(b, bodies);
+            }
+            if let Some(e) = else_body {
+                fill_heredocs(e, bodies);
+            }
+        }
+        Node::Loop { cond, body, .. } => {
+            fill_heredocs(cond, bodies);
+            fill_heredocs(body, bodies);
+        }
+        Node::For { body, .. } => fill_heredocs(body, bodies),
+        Node::Case { items, .. } => {
+            for item in items {
+                if let Some(b) = item.body.as_mut() {
+                    fill_heredocs(b, bodies);
+                }
+            }
+        }
+        Node::FuncDef { body, .. } => fill_heredocs(body, bodies),
+        Node::Redirected { node, redirs } => {
+            fill_heredocs(node, bodies);
+            fill_redirs(redirs, bodies);
+        }
+        Node::DBracket(_) | Node::Empty => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_one(s: &str) -> Node {
+        let mut p = Parser::without_aliases(s, true);
+        p.parse_complete_command().unwrap().unwrap()
+    }
+
+    #[test]
+    fn and_or_is_left_associative() {
+        match parse_one("false && echo a || echo b") {
+            Node::AndOr { rest, .. } => {
+                assert_eq!(rest.len(), 2);
+                assert_eq!(rest[0].0, AndOrOp::And);
+                assert_eq!(rest[1].0, AndOrOp::Or);
+            }
+            n => panic!("unexpected {:?}", n),
         }
     }
 
-    fn expect_token_type(&mut self, _token_type: TokenType) {
-        self.lexer.next_token();
-    }
-
-    fn expect_value(&mut self, val: &str) {
-        let tok = self.lexer.next_token();
-        if tok.value != val {
-            // Error handling
+    #[test]
+    fn heredoc_body_read_after_newline() {
+        match parse_one("cat <<EOF | tr a-z A-Z\nabc\nEOF\n") {
+            Node::Pipeline { cmds, .. } => match &cmds[0] {
+                Node::Simple(c) => {
+                    let hd = c.redirs[0].heredoc.as_ref().unwrap();
+                    assert_eq!(hd.body, "abc\n");
+                    assert!(hd.expand);
+                }
+                n => panic!("unexpected {:?}", n),
+            },
+            n => panic!("unexpected {:?}", n),
         }
     }
-}
 
-pub fn parse(line: &str) -> Option<ASTNode> {
-    let mut lexer = Lexer::new(line);
-    let mut parser = Parser::new(&mut lexer);
-    parser.parse()
-}
+    #[test]
+    fn quoted_heredoc_delimiter_disables_expansion() {
+        match parse_one("cat <<'EOF'\n$x\nEOF\n") {
+            Node::Simple(c) => {
+                let hd = c.redirs[0].heredoc.as_ref().unwrap();
+                assert_eq!(hd.body, "$x\n");
+                assert!(!hd.expand);
+            }
+            n => panic!("unexpected {:?}", n),
+        }
+    }
 
-// Splits an Assignment-token value `name=val` or `name+=val` into
-// (name, val, is_append).
-fn split_assignment(raw: &str) -> (String, String, bool) {
-    if let Some(idx) = raw.find("+=") {
-        return (raw[..idx].to_string(), raw[idx + 2..].to_string(), true);
+    #[test]
+    fn case_alternation() {
+        match parse_one("case a in a|b) echo alt;; esac") {
+            Node::Case { items, .. } => assert_eq!(items[0].patterns, vec!["a", "b"]),
+            n => panic!("unexpected {:?}", n),
+        }
     }
-    if let Some(idx) = raw.find('=') {
-        return (raw[..idx].to_string(), raw[idx + 1..].to_string(), false);
-    }
-    (raw.to_string(), String::new(), false)
-}
 
-fn split_assignment_subscript(name: &str) -> Option<(String, String)> {
-    let open = name.find('[')?;
-    if !name.ends_with(']') || open == 0 {
-        return None;
+    #[test]
+    fn incomplete_constructs() {
+        for s in [
+            "if true; then\n",
+            "for i in 1 2\n",
+            "echo a &&\n",
+            "cat <<EOF\nabc\n",
+            "{ echo\n",
+        ] {
+            let mut p = Parser::without_aliases(s, false);
+            assert!(
+                matches!(p.parse_complete_command(), Err(ParseError::Incomplete)),
+                "{:?}",
+                s
+            );
+        }
     }
-    let base = &name[..open];
-    let subscript = &name[open + 1..name.len() - 1];
-    if base.is_empty() || subscript.is_empty() {
-        return None;
+
+    #[test]
+    fn syntax_errors_when_final() {
+        let mut p = Parser::without_aliases("if true; then\n", true);
+        assert!(matches!(
+            p.parse_complete_command(),
+            Err(ParseError::Syntax(_))
+        ));
+        let mut p = Parser::without_aliases("fi\n", true);
+        assert!(matches!(
+            p.parse_complete_command(),
+            Err(ParseError::Syntax(_))
+        ));
     }
-    Some((base.to_string(), subscript.to_string()))
+
+    #[test]
+    fn redirections_on_compound_commands() {
+        match parse_one("{ echo hi; } > out") {
+            Node::Redirected { redirs, .. } => assert_eq!(redirs[0].target, "out"),
+            n => panic!("unexpected {:?}", n),
+        }
+    }
 }

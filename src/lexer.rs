@@ -1,467 +1,622 @@
-use crate::types::{Token, TokenType};
+use std::collections::HashMap;
 
-fn is_operator(c: char) -> bool {
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tok {
+    Word(String),
+    IoNumber(i32),
+    Op(&'static str),
+    Newline,
+    Eof,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LexError {
+    // The input ended inside a construct; more input may complete it.
+    Incomplete,
+    Syntax(String),
+}
+
+const OPERATORS: &[&str] = &[
+    "<<-", "&&", "||", ";;", ";&", "<<", ">>", "<&", ">&", "<>", ">|", "|", "&", ";", "<", ">",
+    "(", ")",
+];
+
+fn is_operator_start(c: char) -> bool {
     matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')')
 }
 
+fn is_name_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+pub fn is_valid_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if is_name_start(c) => chars.all(is_name_char),
+        _ => false,
+    }
+}
+
+/// True if `s` has the form `name=...`, `name+=...`, or `name[sub]=...`.
 pub fn is_assignment(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
+    assignment_split(s).is_some()
+}
+
+/// Splits an assignment word into (name, optional subscript, append, value).
+pub fn assignment_split(s: &str) -> Option<(String, Option<String>, bool, String)> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() || !is_name_start(chars[0]) {
+        return None;
     }
-    let bytes = s.as_bytes();
-    let mut bracket_depth = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'=' && bracket_depth == 0 {
-            return i > 0;
-        }
-        // `name+=` form (zsh/bash append assignment).
-        if b == b'+' && bytes.get(i + 1) == Some(&b'=') && bracket_depth == 0 {
-            return i > 0;
-        }
-        let c = b as char;
-        if c == '[' {
-            if i == 0 {
-                return false;
+    let mut i = 1;
+    while i < chars.len() && is_name_char(chars[i]) {
+        i += 1;
+    }
+    let name: String = chars[..i].iter().collect();
+    let mut subscript = None;
+    if i < chars.len() && chars[i] == '[' {
+        let mut depth = 0;
+        let start = i + 1;
+        let mut j = i;
+        while j < chars.len() {
+            match chars[j] {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
             }
-            bracket_depth += 1;
-            continue;
+            j += 1;
         }
-        if c == ']' {
-            if bracket_depth == 0 {
-                return false;
-            }
-            bracket_depth -= 1;
-            continue;
+        if j >= chars.len() || j == start {
+            return None;
         }
-        if bracket_depth > 0 {
-            continue;
+        subscript = Some(chars[start..j].iter().collect());
+        i = j + 1;
+    }
+    let append = i < chars.len() && chars[i] == '+';
+    if append {
+        i += 1;
+    }
+    if i >= chars.len() || chars[i] != '=' {
+        return None;
+    }
+    let value: String = chars[i + 1..].iter().collect();
+    Some((name, subscript, append, value))
+}
+
+// ---- Scanners shared with the expander --------------------------------
+//
+// Each takes the index of the opening character and returns the index just
+// past the closing one, or None if the input ends first.
+
+pub fn scan_squote(chars: &[char], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < chars.len() {
+        if chars[j] == '\'' {
+            return Some(j + 1);
         }
-        if !c.is_alphabetic() && !c.is_ascii_digit() && b != b'_' {
-            return false;
+        j += 1;
+    }
+    None
+}
+
+// `$'...'`: `i` indexes the quote after `$`.
+pub fn scan_dollar_squote(chars: &[char], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 2,
+            '\'' => return Some(j + 1),
+            _ => j += 1,
         }
     }
-    false
+    None
+}
+
+pub fn scan_dquote(chars: &[char], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 2,
+            '"' => return Some(j + 1),
+            '`' => j = scan_bquote(chars, j)?,
+            '$' if j + 1 < chars.len() && chars[j + 1] == '(' => j = scan_paren(chars, j + 1)?,
+            '$' if j + 1 < chars.len() && chars[j + 1] == '{' => {
+                j = scan_brace(chars, j + 1, true)?
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+pub fn scan_bquote(chars: &[char], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 2,
+            '`' => return Some(j + 1),
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+// `${...}`: `i` indexes the `{`.
+pub fn scan_brace(chars: &[char], i: usize, in_dq: bool) -> Option<usize> {
+    let mut j = i + 1;
+    let mut depth = 1;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 2,
+            '\'' if !in_dq => j = scan_squote(chars, j)?,
+            '"' => j = scan_dquote(chars, j)?,
+            '`' => j = scan_bquote(chars, j)?,
+            '$' if j + 1 < chars.len() && chars[j + 1] == '(' => j = scan_paren(chars, j + 1)?,
+            '$' if j + 1 < chars.len() && chars[j + 1] == '{' => {
+                j = scan_brace(chars, j + 1, in_dq)?
+            }
+            '{' => {
+                depth += 1;
+                j += 1;
+            }
+            '}' => {
+                depth -= 1;
+                j += 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+// `$(...)` and `$((...))`: `i` indexes the first `(`. Unbalanced `)` that
+// end case patterns are skipped while inside `case ... esac`.
+pub fn scan_paren(chars: &[char], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    let mut depth = 1;
+    let mut case_depth = 0usize;
+    while j < chars.len() {
+        let c = chars[j];
+        let at_word_start = j == i + 1
+            || matches!(
+                chars[j - 1],
+                ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')'
+            );
+        match c {
+            '\\' => j += 2,
+            '\'' => j = scan_squote(chars, j)?,
+            '"' => j = scan_dquote(chars, j)?,
+            '`' => j = scan_bquote(chars, j)?,
+            '$' if j + 1 < chars.len() && chars[j + 1] == '(' => j = scan_paren(chars, j + 1)?,
+            '$' if j + 1 < chars.len() && chars[j + 1] == '{' => {
+                j = scan_brace(chars, j + 1, false)?
+            }
+            '#' if at_word_start => {
+                while j < chars.len() && chars[j] != '\n' {
+                    j += 1;
+                }
+            }
+            '(' => {
+                depth += 1;
+                j += 1;
+            }
+            ')' => {
+                j += 1;
+                if case_depth > 0 && depth == 1 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            c if at_word_start && is_name_start(c) => {
+                let start = j;
+                while j < chars.len() && is_name_char(chars[j]) {
+                    j += 1;
+                }
+                let word: String = chars[start..j].iter().collect();
+                let ends_word = j >= chars.len()
+                    || matches!(chars[j], ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')');
+                if ends_word {
+                    if word == "case" {
+                        case_depth += 1;
+                    } else if word == "esac" {
+                        case_depth = case_depth.saturating_sub(1);
+                    }
+                }
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+/// Removes quoting from a here-document delimiter word. Returns the
+/// delimiter and whether any part of it was quoted.
+pub fn unquote_delimiter(raw: &str) -> (String, bool) {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::new();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                quoted = true;
+                if i + 1 < chars.len() {
+                    out.push(chars[i + 1]);
+                }
+                i += 2;
+            }
+            '\'' | '"' => {
+                quoted = true;
+                let q = chars[i];
+                i += 1;
+                while i < chars.len() && chars[i] != q {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    (out, quoted)
+}
+
+struct PendingHeredoc {
+    id: usize,
+    delim: String,
+    strip_tabs: bool,
 }
 
 pub struct Lexer {
-    input: String,
+    chars: Vec<char>,
     pos: usize,
-}
-
-impl Clone for Lexer {
-    fn clone(&self) -> Self {
-        Lexer {
-            input: self.input.clone(),
-            pos: self.pos,
-        }
-    }
+    // When false, reaching the end of the input inside a construct reports
+    // Incomplete so the caller can read another line.
+    final_input: bool,
+    pending: Vec<PendingHeredoc>,
+    pub heredoc_bodies: HashMap<usize, String>,
+    next_heredoc_id: usize,
 }
 
 impl Lexer {
-    pub fn new(input: &str) -> Self {
+    pub fn new(input: &str, final_input: bool) -> Self {
         Lexer {
-            input: input.to_string(),
+            chars: input.chars().collect(),
             pos: 0,
+            final_input,
+            pending: Vec::new(),
+            heredoc_bodies: HashMap::new(),
+            next_heredoc_id: 0,
         }
     }
 
-    pub fn peek_token(&mut self) -> Token {
-        let mut clone = self.clone();
-        clone.next_token()
+    pub fn pos(&self) -> usize {
+        self.pos
     }
 
-    pub fn next_token(&mut self) -> Token {
-        self.skip_blanks();
+    pub fn rest(&self) -> String {
+        self.chars[self.pos.min(self.chars.len())..]
+            .iter()
+            .collect()
+    }
 
-        if self.pos >= self.input.len() {
-            return Token {
-                token_type: TokenType::Eof,
-                value: String::new(),
-            };
+    /// Splices alias text into the input at the current position.
+    pub fn insert_text(&mut self, text: &str) {
+        let at = self.pos.min(self.chars.len());
+        self.chars.splice(at..at, text.chars());
+    }
+
+    fn incomplete(&self, msg: &str) -> LexError {
+        if self.final_input {
+            LexError::Syntax(msg.to_string())
+        } else {
+            LexError::Incomplete
         }
+    }
 
-        let c = self.input[self.pos..].chars().next().unwrap();
+    /// Registers a here-document whose body starts after the next newline.
+    pub fn add_heredoc(&mut self, raw_delim: &str, strip_tabs: bool) -> (usize, bool) {
+        let (delim, quoted) = unquote_delimiter(raw_delim);
+        let id = self.next_heredoc_id;
+        self.next_heredoc_id += 1;
+        self.pending.push(PendingHeredoc {
+            id,
+            delim,
+            strip_tabs,
+        });
+        (id, !quoted)
+    }
 
-        if c == '\\'
-            && self.pos + 1 < self.input.len()
-            && self.input[self.pos + 1..].starts_with('\n')
-        {
-            self.pos += 2;
-            return self.next_token();
+    pub fn has_pending_heredocs(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn read_heredocs(&mut self) -> Result<(), LexError> {
+        let pending = std::mem::take(&mut self.pending);
+        for hd in pending {
+            let mut body = String::new();
+            loop {
+                if self.pos >= self.chars.len() {
+                    if !self.final_input {
+                        return Err(LexError::Incomplete);
+                    }
+                    eprintln!(
+                        "meowsh: warning: here-document delimited by end-of-file (wanted `{}')",
+                        hd.delim
+                    );
+                    break;
+                }
+                let start = self.pos;
+                let mut end = start;
+                while end < self.chars.len() && self.chars[end] != '\n' {
+                    end += 1;
+                }
+                if end >= self.chars.len() && !self.final_input {
+                    return Err(LexError::Incomplete);
+                }
+                let mut line: String = self.chars[start..end].iter().collect();
+                if hd.strip_tabs {
+                    line = line.trim_start_matches('\t').to_string();
+                }
+                self.pos = (end + 1).min(self.chars.len());
+                if line == hd.delim {
+                    break;
+                }
+                body.push_str(&line);
+                body.push('\n');
+            }
+            self.heredoc_bodies.insert(hd.id, body);
         }
+        Ok(())
+    }
 
-        if c == '#' {
-            while self.pos < self.input.len() && !self.input[self.pos..].starts_with('\n') {
+    pub fn next_token(&mut self) -> Result<Tok, LexError> {
+        loop {
+            while self.pos < self.chars.len() && matches!(self.chars[self.pos], ' ' | '\t') {
                 self.pos += 1;
             }
-            return self.next_token();
+            if self.pos + 1 < self.chars.len()
+                && self.chars[self.pos] == '\\'
+                && self.chars[self.pos + 1] == '\n'
+            {
+                self.pos += 2;
+                if self.pos >= self.chars.len() && !self.final_input {
+                    return Err(LexError::Incomplete);
+                }
+                continue;
+            }
+            if self.pos < self.chars.len() && self.chars[self.pos] == '#' {
+                while self.pos < self.chars.len() && self.chars[self.pos] != '\n' {
+                    self.pos += 1;
+                }
+                continue;
+            }
+            break;
         }
 
+        if self.pos >= self.chars.len() {
+            if !self.pending.is_empty() {
+                // `cat <<EOF` with no newline after it.
+                if !self.final_input {
+                    return Err(LexError::Incomplete);
+                }
+                self.read_heredocs()?;
+            }
+            return Ok(Tok::Eof);
+        }
+
+        let c = self.chars[self.pos];
         if c == '\n' {
             self.pos += 1;
-            return Token {
-                token_type: TokenType::Newline,
-                value: "\n".to_string(),
-            };
+            if !self.pending.is_empty() {
+                self.read_heredocs()?;
+            }
+            return Ok(Tok::Newline);
         }
 
-        if c.is_ascii_digit() && self.pos + 1 < self.input.len() {
-            let next_char = self.input[self.pos + 1..].chars().next().unwrap_or(' ');
-            if next_char == '<' || next_char == '>' {
-                return self.read_io_number();
+        if c.is_ascii_digit() {
+            let mut j = self.pos;
+            while j < self.chars.len() && self.chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < self.chars.len() && matches!(self.chars[j], '<' | '>') {
+                let digits: String = self.chars[self.pos..j].iter().collect();
+                if let Ok(n) = digits.parse::<i32>() {
+                    self.pos = j;
+                    return Ok(Tok::IoNumber(n));
+                }
             }
         }
 
-        if is_operator(c) {
-            return self.read_operator();
+        if is_operator_start(c) {
+            for op in OPERATORS {
+                let len = op.chars().count();
+                if self.pos + len <= self.chars.len()
+                    && self.chars[self.pos..self.pos + len]
+                        .iter()
+                        .copied()
+                        .eq(op.chars())
+                {
+                    self.pos += len;
+                    return Ok(Tok::Op(op));
+                }
+            }
         }
 
-        self.read_word()
+        self.read_word().map(Tok::Word)
     }
 
-    fn skip_blanks(&mut self) {
-        while self.pos < self.input.len() {
-            let c = self.input[self.pos..].chars().next().unwrap();
-            if c == ' ' || c == '\t' {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn read_io_number(&mut self) -> Token {
-        let start = self.pos;
-        while self.pos < self.input.len() {
-            let c = self.input[self.pos..].chars().next().unwrap();
-            if c.is_ascii_digit() {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-
-        if self.pos < self.input.len() {
-            let c = self.input[self.pos..].chars().next().unwrap();
-            if c == '<' || c == '>' {
-                return Token {
-                    token_type: TokenType::IoNumber,
-                    value: self.input[start..self.pos].to_string(),
-                };
-            }
-        }
-
-        self.pos = start;
-        self.read_word()
-    }
-
-    fn read_operator(&mut self) -> Token {
-        let c = self.input[self.pos..].chars().next().unwrap();
-        self.pos += 1;
-
-        match c {
-            '|' => {
-                if self.pos < self.input.len() && self.input[self.pos..].starts_with('|') {
-                    self.pos += 1;
-                    return Token {
-                        token_type: TokenType::OrIf,
-                        value: "||".to_string(),
+    fn read_word(&mut self) -> Result<String, LexError> {
+        let mut out = String::new();
+        while self.pos < self.chars.len() {
+            let c = self.chars[self.pos];
+            match c {
+                ' ' | '\t' | '\n' => break,
+                c if is_operator_start(c) => break,
+                '\\' => {
+                    if self.pos + 1 >= self.chars.len() {
+                        out.push('\\');
+                        self.pos += 1;
+                    } else if self.chars[self.pos + 1] == '\n' {
+                        self.pos += 2;
+                        if self.pos >= self.chars.len() && !self.final_input {
+                            return Err(LexError::Incomplete);
+                        }
+                    } else {
+                        out.push('\\');
+                        out.push(self.chars[self.pos + 1]);
+                        self.pos += 2;
+                    }
+                }
+                '\'' => {
+                    let end = scan_squote(&self.chars, self.pos).ok_or_else(|| {
+                        self.incomplete("unexpected end of file while looking for matching `''")
+                    })?;
+                    out.extend(&self.chars[self.pos..end]);
+                    self.pos = end;
+                }
+                '"' => {
+                    let end = scan_dquote(&self.chars, self.pos).ok_or_else(|| {
+                        self.incomplete("unexpected end of file while looking for matching `\"'")
+                    })?;
+                    out.extend(&self.chars[self.pos..end]);
+                    self.pos = end;
+                }
+                '`' => {
+                    let end = scan_bquote(&self.chars, self.pos).ok_or_else(|| {
+                        self.incomplete("unexpected end of file while looking for matching ``'")
+                    })?;
+                    out.extend(&self.chars[self.pos..end]);
+                    self.pos = end;
+                }
+                '$' if self.pos + 1 < self.chars.len() => {
+                    let next = self.chars[self.pos + 1];
+                    let end = match next {
+                        '(' => Some(scan_paren(&self.chars, self.pos + 1).ok_or_else(|| {
+                            self.incomplete("unexpected end of file while looking for matching `)'")
+                        })?),
+                        '{' => {
+                            Some(scan_brace(&self.chars, self.pos + 1, false).ok_or_else(|| {
+                                self.incomplete(
+                                    "unexpected end of file while looking for matching `}'",
+                                )
+                            })?)
+                        }
+                        '\'' => Some(scan_dollar_squote(&self.chars, self.pos + 1).ok_or_else(
+                            || {
+                                self.incomplete(
+                                    "unexpected end of file while looking for matching `''",
+                                )
+                            },
+                        )?),
+                        _ => None,
                     };
-                }
-                Token {
-                    token_type: TokenType::Pipe,
-                    value: "|".to_string(),
-                }
-            }
-            '&' => {
-                if self.pos < self.input.len() && self.input[self.pos..].starts_with('&') {
-                    self.pos += 1;
-                    return Token {
-                        token_type: TokenType::AndIf,
-                        value: "&&".to_string(),
-                    };
-                }
-                Token {
-                    token_type: TokenType::Ampersand,
-                    value: "&".to_string(),
-                }
-            }
-            ';' => {
-                if self.pos < self.input.len() && self.input[self.pos..].starts_with(';') {
-                    self.pos += 1;
-                    return Token {
-                        token_type: TokenType::Dsemi,
-                        value: ";;".to_string(),
-                    };
-                }
-                Token {
-                    token_type: TokenType::Semi,
-                    value: ";".to_string(),
-                }
-            }
-            '<' => {
-                if self.pos < self.input.len() {
-                    let next = self.input[self.pos..].chars().next().unwrap();
-                    if next == '<' {
-                        self.pos += 1;
-                        if self.pos < self.input.len() && self.input[self.pos..].starts_with('-') {
-                            self.pos += 1;
-                            return Token {
-                                token_type: TokenType::DlessDash,
-                                value: "<<-".to_string(),
-                            };
+                    match end {
+                        Some(end) => {
+                            out.extend(&self.chars[self.pos..end]);
+                            self.pos = end;
                         }
-                        return Token {
-                            token_type: TokenType::Dless,
-                            value: "<<".to_string(),
-                        };
-                    }
-                    if next == '&' {
-                        self.pos += 1;
-                        return Token {
-                            token_type: TokenType::LessAnd,
-                            value: "<&".to_string(),
-                        };
-                    }
-                    if next == '>' {
-                        self.pos += 1;
-                        return Token {
-                            token_type: TokenType::LessGreat,
-                            value: "<>".to_string(),
-                        };
-                    }
-                }
-                Token {
-                    token_type: TokenType::Less,
-                    value: "<".to_string(),
-                }
-            }
-            '>' => {
-                if self.pos < self.input.len() {
-                    let next = self.input[self.pos..].chars().next().unwrap();
-                    if next == '>' {
-                        self.pos += 1;
-                        return Token {
-                            token_type: TokenType::Dgreat,
-                            value: ">>".to_string(),
-                        };
-                    }
-                    if next == '&' {
-                        self.pos += 1;
-                        return Token {
-                            token_type: TokenType::GreatAnd,
-                            value: ">&".to_string(),
-                        };
-                    }
-                    if next == '|' {
-                        self.pos += 1;
-                        return Token {
-                            token_type: TokenType::Clobber,
-                            value: ">|".to_string(),
-                        };
-                    }
-                }
-                Token {
-                    token_type: TokenType::Great,
-                    value: ">".to_string(),
-                }
-            }
-            '(' => Token {
-                token_type: TokenType::Lparen,
-                value: "(".to_string(),
-            },
-            ')' => Token {
-                token_type: TokenType::Rparen,
-                value: ")".to_string(),
-            },
-            _ => Token {
-                token_type: TokenType::Word,
-                value: c.to_string(),
-            },
-        }
-    }
-
-    fn read_word(&mut self) -> Token {
-        let start = self.pos;
-
-        while self.pos < self.input.len() {
-            let c = self.input[self.pos..].chars().next().unwrap();
-
-            if c == '\\' {
-                self.pos += 1;
-                if self.pos < self.input.len() {
-                    self.pos += 1;
-                }
-                continue;
-            }
-
-            if c == '\'' {
-                self.pos += 1;
-                while self.pos < self.input.len() && !self.input[self.pos..].starts_with('\'') {
-                    self.pos += 1;
-                }
-                if self.pos < self.input.len() {
-                    self.pos += 1;
-                }
-                continue;
-            }
-
-            if c == '"' {
-                self.pos += 1;
-                while self.pos < self.input.len() {
-                    let nc = self.input[self.pos..].chars().next().unwrap();
-                    if nc == '\\' {
-                        self.pos += 1;
-                        if self.pos < self.input.len() {
+                        None => {
+                            out.push('$');
                             self.pos += 1;
                         }
-                        continue;
                     }
-                    if nc == '"' {
-                        self.pos += 1;
-                        break;
-                    }
+                }
+                c => {
+                    out.push(c);
                     self.pos += 1;
                 }
-                continue;
-            }
-
-            if c == '`' {
-                self.pos += 1;
-                while self.pos < self.input.len() && !self.input[self.pos..].starts_with('`') {
-                    self.pos += 1;
-                }
-                if self.pos < self.input.len() {
-                    self.pos += 1;
-                }
-                continue;
-            }
-
-            if c == '$' {
-                self.pos += 1;
-                if self.pos < self.input.len() {
-                    let nc = self.input[self.pos..].chars().next().unwrap();
-                    if nc == '(' {
-                        self.pos += 1;
-                        if self.pos < self.input.len() && self.input[self.pos..].starts_with('(') {
-                            self.pos += 1;
-                            let mut depth = 1;
-                            while self.pos < self.input.len() && depth > 0 {
-                                let ch = self.input[self.pos..].chars().next().unwrap();
-                                self.pos += 1;
-                                if ch == '(' {
-                                    if self.pos < self.input.len()
-                                        && self.input[self.pos..].starts_with('(')
-                                    {
-                                        self.pos += 1;
-                                        depth += 1;
-                                    }
-                                } else if ch == ')'
-                                    && self.pos < self.input.len()
-                                    && self.input[self.pos..].starts_with(')')
-                                {
-                                    self.pos += 1;
-                                    depth -= 1;
-                                }
-                            }
-                            continue;
-                        }
-
-                        let mut depth = 1;
-                        while self.pos < self.input.len() && depth > 0 {
-                            let ch = self.input[self.pos..].chars().next().unwrap();
-                            self.pos += 1;
-                            if ch == '(' {
-                                depth += 1;
-                            } else if ch == ')' {
-                                depth -= 1;
-                            }
-                        }
-                        continue;
-                    }
-                    if nc == '{' {
-                        while self.pos < self.input.len()
-                            && !self.input[self.pos..].starts_with('}')
-                        {
-                            self.pos += 1;
-                        }
-                        if self.pos < self.input.len() {
-                            self.pos += 1;
-                        }
-                        continue;
-                    }
-                }
-                continue;
-            }
-
-            if c.is_whitespace() || is_operator(c) {
-                break;
-            }
-
-            self.pos += 1;
-        }
-
-        let value = self.input[start..self.pos].to_string();
-        let token_type = if is_assignment(&value) {
-            TokenType::Assignment
-        } else {
-            TokenType::Word
-        };
-
-        Token { token_type, value }
-    }
-
-    pub fn read_heredoc(&mut self, delimiter: &str, strip_tabs: bool) -> String {
-        let mut body = String::new();
-        let mut current_line = String::new();
-
-        // Skip the immediate newline if present
-        if self.pos < self.input.len() && self.input[self.pos..].starts_with('\n') {
-            self.pos += 1;
-        }
-
-        while self.pos < self.input.len() {
-            let c = self.input[self.pos..].chars().next().unwrap();
-            self.pos += 1;
-
-            if c == '\n' {
-                let mut check_line = current_line.as_str();
-                if strip_tabs {
-                    check_line = check_line.trim_start_matches('\t');
-                }
-                if check_line == delimiter {
-                    return body;
-                }
-                body.push_str(&current_line);
-                body.push('\n');
-                current_line.clear();
-            } else {
-                current_line.push(c);
             }
         }
-
-        let mut check_line = current_line.as_str();
-        if strip_tabs {
-            check_line = check_line.trim_start_matches('\t');
-        }
-        if check_line == delimiter {
-            return body;
-        }
-
-        body.push_str(&current_line);
-        body
+        Ok(out)
     }
 }
 
-pub fn tokenize(line: &str) -> Vec<Token> {
-    let mut lexer = Lexer::new(line);
-    let mut tokens = Vec::new();
-    loop {
-        let tok = lexer.next_token();
-        if tok.token_type == TokenType::Eof {
-            break;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(s: &str) -> Vec<Tok> {
+        let mut lx = Lexer::new(s, true);
+        let mut out = Vec::new();
+        loop {
+            let t = lx.next_token().unwrap();
+            if t == Tok::Eof {
+                break;
+            }
+            out.push(t);
         }
-        tokens.push(tok);
+        out
     }
-    tokens
+
+    #[test]
+    fn non_ascii_words_do_not_panic() {
+        assert_eq!(
+            tokens("echo é 'ü' \"ß\" # ç"),
+            vec![
+                Tok::Word("echo".into()),
+                Tok::Word("é".into()),
+                Tok::Word("'ü'".into()),
+                Tok::Word("\"ß\"".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_substitutions_stay_one_word() {
+        assert_eq!(
+            tokens("echo ${x:-$(echo \"}\")}y z"),
+            vec![
+                Tok::Word("echo".into()),
+                Tok::Word("${x:-$(echo \"}\")}y".into()),
+                Tok::Word("z".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn case_inside_command_substitution() {
+        assert_eq!(
+            tokens("echo $(case a in a) echo y;; esac)"),
+            vec![
+                Tok::Word("echo".into()),
+                Tok::Word("$(case a in a) echo y;; esac)".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_quote_is_incomplete_when_streaming() {
+        let mut lx = Lexer::new("echo 'abc\n", false);
+        assert_eq!(lx.next_token(), Ok(Tok::Word("echo".into())));
+        assert_eq!(lx.next_token(), Err(LexError::Incomplete));
+    }
+
+    #[test]
+    fn assignment_detection() {
+        assert!(is_assignment("a=1"));
+        assert!(is_assignment("a+=1"));
+        assert!(is_assignment("a[1]=x"));
+        assert!(!is_assignment("1a=b"));
+        assert!(!is_assignment("=b"));
+        assert!(!is_assignment("a"));
+    }
 }

@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -354,7 +354,9 @@ fn test_failed_popd_restores_stack() {
 
 #[test]
 fn test_history_builtin() {
+    let home = TempDir::new().expect("tempdir for HOME");
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .env("HOME", home.path())
         .arg("-i")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -369,8 +371,8 @@ fn test_history_builtin() {
     writeln!(stdin, "exit").unwrap();
     drop(stdin);
 
-    let mut stdout = String::new();
-    child.stdout.unwrap().read_to_string(&mut stdout).unwrap();
+    let output = child.wait_with_output().expect("Failed to wait for meowsh");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
     assert!(stdout.contains("first"));
     assert!(stdout.contains("second"));
@@ -379,7 +381,9 @@ fn test_history_builtin() {
 
 #[test]
 fn test_recursive_globbing() {
+    let home = TempDir::new().expect("tempdir for HOME");
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .env("HOME", home.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -391,8 +395,8 @@ fn test_recursive_globbing() {
     writeln!(stdin, "exit").unwrap();
     drop(stdin);
 
-    let mut stdout = String::new();
-    child.stdout.unwrap().read_to_string(&mut stdout).unwrap();
+    let output = child.wait_with_output().expect("Failed to wait for meowsh");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
     assert!(stdout.contains("src/main.rs"));
     assert!(stdout.contains("src/lib.rs"));
@@ -401,7 +405,9 @@ fn test_recursive_globbing() {
 
 #[test]
 fn test_brace_expansion() {
+    let home = TempDir::new().expect("tempdir for HOME");
     let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .env("HOME", home.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -414,8 +420,8 @@ fn test_brace_expansion() {
     writeln!(stdin, "exit").unwrap();
     drop(stdin);
 
-    let mut stdout = String::new();
-    child.stdout.unwrap().read_to_string(&mut stdout).unwrap();
+    let output = child.wait_with_output().expect("Failed to wait for meowsh");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
     assert!(stdout.contains("a b c"));
     assert!(stdout.contains("file_1.txt file_2.txt"));

@@ -1,39 +1,110 @@
-use crate::shell::SHELL;
-use crate::types::{Job, JobState, ProcState};
+use crate::shell::with_shell;
+use crate::sys::{err_line, out};
+use crate::types::{Job, JobState, ProcState, Process};
+use std::sync::atomic::{AtomicI32, Ordering};
 
-pub fn jobs_init() {}
+/// Descriptor for the controlling terminal while job control is on.
+pub static TTY_FD: AtomicI32 = AtomicI32::new(-1);
 
-fn status_to_exit(status: i32) -> i32 {
+pub fn status_to_exit(status: i32) -> i32 {
     if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status) as i32
+        128 + libc::WTERMSIG(status)
     } else if libc::WIFSTOPPED(status) {
-        128 + libc::WSTOPSIG(status) as i32
+        128 + libc::WSTOPSIG(status)
     } else {
         0
     }
 }
 
-fn job_exit_status(job_id: i32) -> i32 {
-    let shell = SHELL.shell.lock().unwrap();
-    let jobs = shell.jobs.lock().unwrap();
-    jobs.iter()
-        .find(|j| j.id == job_id)
-        .and_then(|j| j.procs.last())
-        .map(|proc| status_to_exit(proc.status))
-        .unwrap_or(0)
+fn job_control() -> bool {
+    with_shell(|s| s.job_control)
 }
 
-fn remove_done_job(job_id: i32) {
-    let shell = SHELL.shell.lock().unwrap();
-    let mut jobs = shell.jobs.lock().unwrap();
-    jobs.retain(|j| j.id != job_id || j.state != JobState::Done);
+fn give_terminal_to(pgid: i32) {
+    let fd = TTY_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe {
+            libc::tcsetpgrp(fd, pgid);
+        }
+    }
 }
 
-fn reap_finished_jobs() {
+fn reclaim_terminal() {
+    let pgid = with_shell(|s| s.shell_pgid);
+    give_terminal_to(pgid);
+}
+
+/// Adds a job and returns its number.
+pub fn add_job(pgid: i32, pids: &[i32], state: JobState, text: &str) -> i32 {
+    with_shell(|s| {
+        let mut next = s.next_job_id.lock().unwrap_or_else(|e| e.into_inner());
+        let mut jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if jobs.is_empty() {
+            *next = 1;
+        }
+        let id = *next;
+        *next += 1;
+        let proc_state = match state {
+            JobState::Stopped => ProcState::Stopped,
+            JobState::Running => ProcState::Running,
+            JobState::Done => ProcState::Done,
+        };
+        jobs.push(Job {
+            id,
+            pgid,
+            procs: pids
+                .iter()
+                .map(|&pid| Process {
+                    pid,
+                    status: 0,
+                    state: proc_state,
+                    cmd: text.to_string(),
+                })
+                .collect(),
+            state,
+            notified: false,
+            foreground: false,
+            cmd_text: text.to_string(),
+        });
+        id
+    })
+}
+
+pub fn job_update_status(pid: i32, status: i32) {
+    with_shell(|s| {
+        let mut jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for job in jobs.iter_mut() {
+            if let Some(proc) = job.procs.iter_mut().find(|p| p.pid == pid) {
+                if libc::WIFSTOPPED(status) {
+                    proc.state = ProcState::Stopped;
+                    proc.status = status;
+                } else if libc::WIFCONTINUED(status) {
+                    proc.state = ProcState::Running;
+                } else {
+                    proc.state = ProcState::Done;
+                    proc.status = status;
+                }
+                job.state = if job.procs.iter().all(|p| p.state == ProcState::Done) {
+                    JobState::Done
+                } else if job.procs.iter().any(|p| p.state == ProcState::Stopped) {
+                    JobState::Stopped
+                } else {
+                    JobState::Running
+                };
+                job.notified = false;
+                return;
+            }
+        }
+    })
+}
+
+/// Collects status changes of background children without blocking.
+/// With `notify`, finished jobs are reported and forgotten.
+pub fn reap_jobs(notify: bool) {
     loop {
-        let mut status: i32 = 0;
+        let mut status = 0;
         let pid = unsafe {
             libc::waitpid(
                 -1,
@@ -41,13 +112,151 @@ fn reap_finished_jobs() {
                 libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED,
             )
         };
-
         if pid <= 0 {
             break;
         }
-
         job_update_status(pid, status);
     }
+    if notify {
+        let done: Vec<(i32, String)> = with_shell(|s| {
+            let mut jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            let done = jobs
+                .iter()
+                .filter(|j| j.state == JobState::Done)
+                .map(|j| (j.id, j.cmd_text.clone()))
+                .collect();
+            jobs.retain(|j| j.state != JobState::Done);
+            done
+        });
+        for (id, text) in done {
+            err_line(&format!("[{}]+  Done\t\t{}", id, text));
+        }
+    }
+}
+
+fn waitpid_retry(pid: i32, flags: i32) -> Option<i32> {
+    loop {
+        let mut status = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, flags) };
+        if r == pid {
+            return Some(status);
+        }
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return None;
+    }
+}
+
+/// Waits for a foreground pipeline. Returns one exit code per process.
+/// A stopped pipeline becomes a background job.
+pub fn wait_foreground(pids: &[i32], pgid: i32, text: &str) -> Vec<i32> {
+    let jc = job_control();
+    let flags = if jc { libc::WUNTRACED } else { 0 };
+    let mut codes = vec![0; pids.len()];
+    let mut stopped_at = None;
+    for (k, &pid) in pids.iter().enumerate() {
+        match waitpid_retry(pid, flags) {
+            Some(st) => {
+                codes[k] = status_to_exit(st);
+                if libc::WIFSTOPPED(st) {
+                    stopped_at = Some(k);
+                    break;
+                }
+                if libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == libc::SIGINT {
+                    with_shell(|s| {
+                        if s.interactive {
+                            s.flow = crate::types::Flow::Interrupt;
+                        }
+                    });
+                }
+            }
+            None => codes[k] = 127,
+        }
+    }
+    if jc {
+        reclaim_terminal();
+    }
+    if let Some(k) = stopped_at {
+        let id = add_job(pgid, pids, JobState::Stopped, text);
+        with_shell(|s| {
+            let mut jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+                for (i, p) in job.procs.iter_mut().enumerate() {
+                    if i < k {
+                        p.state = ProcState::Done;
+                        p.status = codes[i] << 8;
+                    }
+                }
+                job.notified = true;
+            }
+        });
+        err_line(&format!("\n[{}]+  Stopped\t\t{}", id, text));
+        let stopped_code = codes[k];
+        for c in codes.iter_mut().skip(k + 1) {
+            *c = stopped_code;
+        }
+    }
+    codes
+}
+
+// Waits for every unfinished process of a job brought to the foreground.
+fn wait_job_foreground(id: i32) -> i32 {
+    let pids: Vec<i32> = with_shell(|s| {
+        let jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.iter()
+            .find(|j| j.id == id)
+            .map(|j| {
+                j.procs
+                    .iter()
+                    .filter(|p| p.state != ProcState::Done)
+                    .map(|p| p.pid)
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    let mut stopped = false;
+    for pid in pids {
+        if let Some(st) = waitpid_retry(pid, libc::WUNTRACED) {
+            job_update_status(pid, st);
+            if libc::WIFSTOPPED(st) {
+                stopped = true;
+                break;
+            }
+        }
+    }
+    reclaim_terminal();
+    let (status, text) = job_result(id);
+    if stopped {
+        err_line(&format!("\n[{}]+  Stopped\t\t{}", id, text));
+    } else {
+        remove_job(id);
+    }
+    status
+}
+
+fn job_result(id: i32) -> (i32, String) {
+    with_shell(|s| {
+        let jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.iter()
+            .find(|j| j.id == id)
+            .map(|j| {
+                let st = j
+                    .procs
+                    .last()
+                    .map(|p| status_to_exit(p.status))
+                    .unwrap_or(0);
+                (st, j.cmd_text.clone())
+            })
+            .unwrap_or((0, String::new()))
+    })
+}
+
+fn remove_job(id: i32) {
+    with_shell(|s| {
+        let mut jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.retain(|j| j.id != id);
+    })
 }
 
 fn parse_job_id(args: &[String]) -> Result<Option<i32>, String> {
@@ -77,190 +286,232 @@ fn find_job_index(jobs: &[Job], requested_id: Option<i32>) -> Option<usize> {
     }
 }
 
-fn print_no_current_job(command: &str, requested_id: Option<i32>) {
-    if let Some(id) = requested_id {
-        eprintln!("meowsh: {command}: no such job: %{id}");
-    } else {
-        eprintln!("meowsh: {command}: no current job");
+fn no_current_job(command: &str, requested_id: Option<i32>) -> i32 {
+    match requested_id {
+        Some(id) => err_line(&format!("meowsh: {}: no such job: %{}", command, id)),
+        None => err_line(&format!("meowsh: {}: no current job", command)),
     }
+    1
 }
 
-pub fn job_update_status(pid: i32, status: i32) {
-    let shell = SHELL.shell.lock().unwrap();
-    let mut jobs = shell.jobs.lock().unwrap();
+// Resolves a job spec to (id, pgid, text).
+fn select_job(command: &str, args: &[String]) -> Result<(i32, i32, String), i32> {
+    reap_jobs(false);
+    let requested = match parse_job_id(args) {
+        Ok(id) => id,
+        Err(e) => {
+            err_line(&format!("meowsh: {}: {}", command, e));
+            return Err(1);
+        }
+    };
+    let found = with_shell(|s| {
+        let jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        find_job_index(&jobs, requested)
+            .map(|i| (jobs[i].id, jobs[i].pgid, jobs[i].cmd_text.clone()))
+    });
+    found.ok_or_else(|| no_current_job(command, requested))
+}
 
-    for job in jobs.iter_mut() {
-        for proc in job.procs.iter_mut() {
-            if proc.pid == pid {
-                proc.status = status;
-                let stopped = libc::WIFSTOPPED(status);
-                let exited = libc::WIFEXITED(status);
-                let signaled = libc::WIFSIGNALED(status);
-
-                if stopped {
-                    proc.state = ProcState::Stopped;
-                } else if exited || signaled {
-                    proc.state = ProcState::Done;
-                } else {
-                    proc.state = ProcState::Running;
+fn set_job_running(id: i32) {
+    with_shell(|s| {
+        let mut jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+            job.state = JobState::Running;
+            for p in job.procs.iter_mut() {
+                if p.state == ProcState::Stopped {
+                    p.state = ProcState::Running;
                 }
-                let all_done = job.procs.iter().all(|p| p.state == ProcState::Done);
-                let any_stopped = job.procs.iter().any(|p| p.state == ProcState::Stopped);
-
-                if all_done {
-                    job.state = JobState::Done;
-                } else if any_stopped {
-                    job.state = JobState::Stopped;
-                } else {
-                    job.state = JobState::Running;
-                }
-                return;
             }
         }
-    }
+    })
 }
 
-pub fn job_wait_foreground(job: &Job) -> i32 {
-    loop {
-        let mut status: i32 = 0;
-        let pid = unsafe { libc::waitpid(-job.pgid, &mut status, libc::WUNTRACED) };
-
-        if pid < 0 {
-            break;
+pub fn builtin_jobs(args: &[String]) -> i32 {
+    reap_jobs(false);
+    let pids_only = args.iter().any(|a| a == "-p");
+    let long = args.iter().any(|a| a == "-l");
+    let jobs: Vec<Job> = with_shell(|s| {
+        let mut jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = jobs.clone();
+        jobs.retain(|j| j.state != JobState::Done);
+        snapshot
+    });
+    for job in jobs {
+        if pids_only {
+            out(&format!("{}\n", job.pgid));
+            continue;
         }
-
-        job_update_status(pid, status);
-
-        if libc::WIFSTOPPED(status) {
-            println!("\n[{}]+  Stopped\t{}", job.id, job.cmd_text);
-            let shell = SHELL.shell.lock().unwrap();
-            let mut jobs = shell.jobs.lock().unwrap();
-            if let Some(j) = jobs.iter_mut().find(|j| j.id == job.id) {
-                j.state = JobState::Stopped;
-                j.notified = true;
-            }
-            break;
-        }
-
-        let job_state = {
-            let shell = SHELL.shell.lock().unwrap();
-            let jobs = shell.jobs.lock().unwrap();
-            jobs.iter()
-                .find(|j| j.id == job.id)
-                .map(|j| j.state)
-                .unwrap_or(JobState::Done)
-        };
-        if job_state != JobState::Running {
-            break;
-        }
-    }
-
-    let status = job_exit_status(job.id);
-
-    unsafe {
-        let shell_pgid = SHELL.shell.lock().unwrap().shell_pgid;
-        let _ = libc::tcsetpgrp(0, shell_pgid);
-    }
-
-    remove_done_job(job.id);
-
-    status
-}
-
-pub fn builtin_jobs(_args: &[String]) -> i32 {
-    reap_finished_jobs();
-
-    let shell = SHELL.shell.lock().unwrap();
-    let mut jobs = shell.jobs.lock().unwrap();
-
-    for job in jobs.iter() {
-        let state_str = match job.state {
+        let state = match job.state {
             JobState::Running => "Running",
             JobState::Stopped => "Stopped",
             JobState::Done => "Done",
         };
-        println!("[{}]+  {}\t\t{}", job.id, state_str, job.cmd_text);
+        if long {
+            out(&format!(
+                "[{}]+ {} {}\t\t{}\n",
+                job.id, job.pgid, state, job.cmd_text
+            ));
+        } else {
+            out(&format!("[{}]+  {}\t\t{}\n", job.id, state, job.cmd_text));
+        }
     }
-    jobs.retain(|job| job.state != JobState::Done);
     0
 }
 
 pub fn builtin_fg(args: &[String]) -> i32 {
-    reap_finished_jobs();
-
-    let requested_id = match parse_job_id(args) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("meowsh: fg: {}", e);
-            return 1;
-        }
-    };
-
-    let shell = SHELL.shell.lock().unwrap();
-    let mut jobs = shell.jobs.lock().unwrap();
-
-    let Some(job_index) = find_job_index(&jobs, requested_id) else {
-        print_no_current_job("fg", requested_id);
+    if !job_control() {
+        err_line("meowsh: fg: no job control");
         return 1;
-    };
-
-    let job = &mut jobs[job_index];
-    println!("{}", job.cmd_text);
-    job.state = JobState::Running;
-    job.foreground = true;
-
-    let job = job.clone();
-
-    drop(jobs);
-    drop(shell);
-
-    unsafe {
-        let _ = libc::tcsetpgrp(0, job.pgid);
-        let _ = libc::kill(-job.pgid, libc::SIGCONT);
     }
-
-    job_wait_foreground(&job)
+    let (id, pgid, text) = match select_job("fg", args) {
+        Ok(j) => j,
+        Err(st) => return st,
+    };
+    out(&format!("{}\n", text));
+    set_job_running(id);
+    give_terminal_to(pgid);
+    unsafe {
+        libc::kill(-pgid, libc::SIGCONT);
+    }
+    wait_job_foreground(id)
 }
 
 pub fn builtin_bg(args: &[String]) -> i32 {
-    reap_finished_jobs();
-
-    let requested_id = match parse_job_id(args) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("meowsh: bg: {}", e);
-            return 1;
-        }
-    };
-
-    let shell = SHELL.shell.lock().unwrap();
-    let mut jobs = shell.jobs.lock().unwrap();
-
-    let Some(job_index) = find_job_index(&jobs, requested_id) else {
-        print_no_current_job("bg", requested_id);
+    if !job_control() {
+        err_line("meowsh: bg: no job control");
         return 1;
-    };
-
-    let job = &mut jobs[job_index];
-    job.state = JobState::Running;
-    job.foreground = false;
-
-    let pgid = job.pgid;
-
-    drop(jobs);
-    drop(shell);
-
-    unsafe {
-        let _ = libc::kill(-pgid, libc::SIGCONT);
     }
-
+    let (id, pgid, text) = match select_job("bg", args) {
+        Ok(j) => j,
+        Err(st) => return st,
+    };
+    set_job_running(id);
+    unsafe {
+        libc::kill(-pgid, libc::SIGCONT);
+    }
+    out(&format!("[{}]+ {} &\n", id, text));
     0
+}
+
+// Waits for one process, using a status already collected by `reap_jobs`
+// when there is one.
+fn wait_pid(pid: i32) -> i32 {
+    let known = with_shell(|s| {
+        let jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.iter()
+            .flat_map(|j| j.procs.iter())
+            .find(|p| p.pid == pid)
+            .map(|p| (p.state, p.status))
+    });
+    match known {
+        Some((ProcState::Done, st)) => status_to_exit(st),
+        Some(_) => match waitpid_retry(pid, 0) {
+            Some(st) => {
+                job_update_status(pid, st);
+                status_to_exit(st)
+            }
+            None => 127,
+        },
+        None => match waitpid_retry(pid, 0) {
+            Some(st) => status_to_exit(st),
+            None => 127,
+        },
+    }
+}
+
+fn forget_done_jobs() {
+    with_shell(|s| {
+        let mut jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.retain(|j| j.state != JobState::Done);
+    })
+}
+
+pub fn builtin_wait(args: &[String]) -> i32 {
+    if args.is_empty() {
+        let pids: Vec<i32> = with_shell(|s| {
+            let jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            jobs.iter()
+                .flat_map(|j| j.procs.iter())
+                .filter(|p| p.state != ProcState::Done)
+                .map(|p| p.pid)
+                .collect()
+        });
+        for pid in pids {
+            wait_pid(pid);
+        }
+        forget_done_jobs();
+        return 0;
+    }
+    let mut status = 0;
+    for arg in args {
+        if let Some(spec) = arg.strip_prefix('%') {
+            let pids: Option<Vec<i32>> = spec.parse::<i32>().ok().and_then(|id| {
+                with_shell(|s| {
+                    let jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                    jobs.iter()
+                        .find(|j| j.id == id)
+                        .map(|j| j.procs.iter().map(|p| p.pid).collect())
+                })
+            });
+            match pids {
+                Some(pids) => {
+                    for pid in pids {
+                        status = wait_pid(pid);
+                    }
+                }
+                None => {
+                    err_line(&format!("meowsh: wait: {}: no such job", arg));
+                    status = 127;
+                }
+            }
+        } else {
+            match arg.parse::<i32>() {
+                Ok(pid) if pid > 0 => status = wait_pid(pid),
+                _ => {
+                    err_line(&format!(
+                        "meowsh: wait: `{}': not a pid or valid job spec",
+                        arg
+                    ));
+                    status = 2;
+                }
+            }
+        }
+    }
+    forget_done_jobs();
+    status
+}
+
+/// Target process(es) for `kill`: a pid, or a job spec.
+pub fn kill_targets(spec: &str) -> Result<Vec<i32>, String> {
+    if let Some(job) = spec.strip_prefix('%') {
+        let id = if job.is_empty() || job == "+" || job == "%" {
+            None
+        } else {
+            Some(
+                job.parse::<i32>()
+                    .map_err(|_| format!("{}: no such job", spec))?,
+            )
+        };
+        let jc = job_control();
+        return with_shell(|s| {
+            let jobs = s.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            let idx = find_job_index(&jobs, id).ok_or_else(|| format!("{}: no such job", spec))?;
+            let job = &jobs[idx];
+            Ok(if jc {
+                vec![-job.pgid]
+            } else {
+                job.procs.iter().map(|p| p.pid).collect()
+            })
+        });
+    }
+    spec.parse::<i32>()
+        .map(|p| vec![p])
+        .map_err(|_| format!("{}: arguments must be process or job IDs", spec))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Process;
 
     fn test_job(id: i32, state: JobState) -> Job {
         Job {

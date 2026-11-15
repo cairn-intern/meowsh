@@ -1,3 +1,4 @@
+use crate::exec::InputLine;
 use crate::shell::build_prompt;
 use crate::strip_ansi;
 use rustyline::completion::Completer;
@@ -9,6 +10,7 @@ use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
 use rustyline::{ColorMode, Editor, Helper};
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 pub struct MeowshHelper;
 
@@ -65,12 +67,7 @@ impl MeowshHelper {
                 }
             }
 
-            let builtins = [
-                "exit", "cd", "pushd", "popd", "dirs", "source", "pwd", "echo", "true", "false",
-                "test", "[", "jobs", "fg", "bg", "export", "set", "unset", "alias", "unalias",
-                "read", "shift", "local", "typeset", "declare", "type", "kill", "wait", "break",
-                "continue", "umask", "return", "eval", "trap", "ulimit", "readonly", "history",
-            ];
+            let builtins = crate::builtins::builtin_names();
             for b in builtins {
                 if self.fuzzy_match(current, b) {
                     completions.push(rustyline::completion::Pair {
@@ -127,7 +124,7 @@ impl MeowshHelper {
 
         // Expand ~ to home directory
         let expanded = if partial.starts_with('~') {
-            if let Ok(home) = std::env::var("HOME") {
+            if let Some(home) = crate::shell::var_get_opt("HOME") {
                 if partial == "~" {
                     home.clone()
                 } else {
@@ -264,7 +261,7 @@ fn get_char_or_ansi(s: &str) -> Vec<CharOrAnsi> {
                         // CSI
                         let (_, c2) = chars.next().unwrap();
                         ansi.push(c2);
-                        while let Some((_, c)) = chars.next() {
+                        for (_, c) in chars.by_ref() {
                             ansi.push(c);
                             if ('@'..='~').contains(&c) {
                                 break;
@@ -326,29 +323,22 @@ impl Completer for MeowshHelper {
         _ctx: &rustyline::Context<'_>,
     ) -> Result<(usize, Vec<rustyline::completion::Pair>), ReadlineError> {
         let (clean_line, mappings) = crate::get_clean_and_mappings(line);
-
-        // Map raw pos to clean_pos
-        let mut clean_pos = 0;
-        for (i, &raw_idx) in mappings.iter().enumerate() {
-            if raw_idx >= pos {
-                clean_pos = i;
-                break;
-            }
-        }
-
-        // Find the start of the word being completed in the clean line
-        let word_start_in_clean = clean_line[..clean_pos]
-            .rfind(|c: char| c.is_whitespace() || ";|&".contains(c))
+        // `mappings` has one entry per character of `clean_line`, so all
+        // positions below are character indices, not byte offsets.
+        let chars: Vec<char> = clean_line.chars().collect();
+        let clean_pos = mappings
+            .iter()
+            .position(|&raw| raw >= pos)
+            .unwrap_or(chars.len())
+            .min(chars.len());
+        let word_start = chars[..clean_pos]
+            .iter()
+            .rposition(|c| c.is_whitespace() || ";|&".contains(*c))
             .map(|i| i + 1)
             .unwrap_or(0);
-
-        // Map word_start back to original line
-        let start = mappings[word_start_in_clean];
-
-        Ok((
-            start,
-            self.get_completions(&clean_line[..clean_pos.min(clean_line.len())]),
-        ))
+        let start = mappings[word_start];
+        let prefix: String = chars[..clean_pos].iter().collect();
+        Ok((start, self.get_completions(&prefix)))
     }
 }
 
@@ -588,85 +578,92 @@ impl Validator for MeowshHelper {}
 
 impl Helper for MeowshHelper {}
 
-pub fn run_interactive() {
-    let mut rl: Editor<MeowshHelper, FileHistory> = match Editor::new() {
-        Ok(rl) => rl,
-        Err(_) => {
-            return run_noninteractive();
-        }
-    };
-
-    rl.set_color_mode(ColorMode::Forced);
-    rl.set_helper(Some(MeowshHelper));
-
-    let shell = crate::shell::SHELL.shell.lock().unwrap();
-    let history_file = shell.history_file.clone();
-    drop(shell);
-
-    if !history_file.is_empty() {
-        if let Ok(content) = std::fs::read_to_string(&history_file) {
-            let shell = crate::shell::SHELL.shell.lock().unwrap();
-            let mut history = shell.history.lock().unwrap();
-            history.clear();
-            for line in content.lines() {
-                let clean = strip_ansi(line);
-                if !clean.is_empty() {
-                    rl.add_history_entry(&clean).ok();
-                    history.push(clean);
-                }
-            }
-        }
-    }
-
-    loop {
-        let prompt = build_prompt();
-
-        let readline = rl.readline(&prompt);
-        match readline {
-            Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                if !line.is_empty() {
-                    let clean_line = strip_ansi(&line);
-                    rl.add_history_entry(clean_line.as_str()).ok();
-                }
-
-                crate::exec::execute_line(trimmed);
-            }
-            Err(ReadlineError::Interrupted) => {
-                println!("^C");
-                continue;
-            }
-            Err(ReadlineError::Eof) => {
-                println!("logout");
-                break;
-            }
-            Err(err) => {
-                eprintln!("Error: {:?}", err);
-                break;
-            }
-        }
-    }
-
-    if !history_file.is_empty() {
-        let _ = rl.save_history(&history_file);
-    }
+fn continuation_prompt() -> String {
+    let ps2 = crate::shell::var_get_opt("PS2").unwrap_or_else(|| "> ".to_string());
+    crate::expand::expand_prompt_string(&ps2).unwrap_or(ps2)
 }
 
-pub fn run_noninteractive() {
-    use std::io::{self, Read};
+fn primary_prompt() -> String {
+    crate::builtins::call_if_defined("precmd");
+    build_prompt()
+}
 
-    let mut buffer = String::new();
-    io::stdin().read_to_string(&mut buffer).ok();
+/// Reads commands from `fd` until end of input. Prompts go to standard
+/// error when `prompts` is set (an interactive shell without a terminal).
+pub fn run_fd(fd: i32, prompts: bool) -> i32 {
+    let mut reader = crate::sys::LineReader::new(fd);
+    crate::exec::run_input(
+        |cont| {
+            if prompts {
+                let p = if cont {
+                    continuation_prompt()
+                } else {
+                    primary_prompt()
+                };
+                let _ = crate::sys::write_fd(2, p.as_bytes());
+            }
+            match reader.read_line() {
+                Some(l) => InputLine::Line(l),
+                None => InputLine::Eof,
+            }
+        },
+        crate::exec::history_add,
+    )
+}
 
-    for line in buffer.lines() {
-        if !line.trim().is_empty() {
-            crate::exec::execute_line(line);
-        }
+/// The interactive read-eval loop with line editing and history.
+pub fn run_interactive() -> i32 {
+    if unsafe { libc::isatty(0) } != 1 {
+        return run_fd(0, true);
     }
+    let mut rl: Editor<MeowshHelper, FileHistory> = match Editor::new() {
+        Ok(rl) => rl,
+        Err(_) => return run_fd(0, true),
+    };
+    rl.set_color_mode(ColorMode::Forced);
+    rl.set_helper(Some(MeowshHelper));
+    let _ = rl.set_max_history_size(1000);
+
+    let history_file = crate::shell::with_shell(|s| s.history_file.clone());
+    if !history_file.is_empty() {
+        let _ = rl.load_history(&history_file);
+    }
+    let entries: Vec<String> = rl.history().iter().cloned().collect();
+    crate::shell::with_shell(|s| *s.history.lock().unwrap_or_else(|e| e.into_inner()) = entries);
+
+    let rl = RefCell::new(rl);
+    let status = crate::exec::run_input(
+        |cont| {
+            let prompt = if cont {
+                continuation_prompt()
+            } else {
+                primary_prompt()
+            };
+            let line = rl.borrow_mut().readline(&prompt);
+            match line {
+                Ok(line) => InputLine::Line(line + "\n"),
+                Err(ReadlineError::Interrupted) => InputLine::Interrupted,
+                Err(ReadlineError::Eof) => InputLine::Eof,
+                Err(err) => {
+                    crate::sys::err_line(&format!("meowsh: {}", err));
+                    InputLine::Eof
+                }
+            }
+        },
+        |text| {
+            let clean = strip_ansi(text);
+            crate::exec::history_add(&clean);
+            let mut rl = rl.borrow_mut();
+            let _ = rl.add_history_entry(clean.as_str());
+            if !history_file.is_empty() {
+                let _ = rl.append_history(&history_file);
+            }
+        },
+    );
+    if !matches!(crate::exec::flow(), crate::types::Flow::Exit(_)) {
+        crate::sys::err_line("exit");
+    }
+    status
 }
 
 #[cfg(test)]
@@ -915,7 +912,7 @@ mod tests {
         helper.complete_paths("~/", &mut completions, false);
         // We can't assert specific files in HOME, but we should get some results
         // and no panics. Just verify it doesn't crash.
-        assert!(completions.len() > 0 || true); // no-panic check
+        drop(completions);
     }
 
     #[test]

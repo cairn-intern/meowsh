@@ -3,7 +3,7 @@ PREFIX ?= /usr/local
 
 all: $(TARGET)
 
-$(TARGET):
+$(TARGET): Cargo.toml Cargo.lock $(shell find src -name '*.rs')
 	cargo build --release
 	cp target/release/meowsh $(TARGET)
 
