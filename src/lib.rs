@@ -87,6 +87,28 @@ pub fn strip_ansi(s: &str) -> String {
     get_clean_and_mappings(s).0
 }
 
+/// Terminal columns taken by `s` (no escape sequences): two for wide
+/// East Asian characters and emoji, none for combining marks.
+pub fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c as u32 {
+            0x0300..=0x036F | 0x200B..=0x200F | 0xFE00..=0xFE0F => 0,
+            c if c < 0x20 || c == 0x7F => 0,
+            0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
@@ -107,5 +129,12 @@ mod tests {
         // Test other ESC
         assert_eq!(strip_ansi("\x1b(Bcharset"), "charset");
         assert_eq!(strip_ansi("\x1bAcursor up"), "cursor up");
+    }
+
+    #[test]
+    fn display_widths() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("日本"), 4);
+        assert_eq!(display_width("e\u{301}"), 1);
     }
 }

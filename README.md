@@ -120,6 +120,9 @@ and builtins include:
   `emulate -L`), `AUTO_CD`, `$0` as the function or sourced file name
 - `$RANDOM`, `$SECONDS`, `$EPOCHSECONDS`, `$EPOCHREALTIME`, `$COLUMNS`,
   `$LINES`, `$pipestatus`, `$HOST`, `$commands`, `$langinfo`
+- right prompts: `$RPROMPT`/`$RPS1` (and `$RPROMPT2`/`$RPS2` on
+  continuation lines) at the right edge, `$ZLE_RPROMPT_INDENT` columns in,
+  hidden when the input reaches them; starship's `right_format` uses this
 - prompts: `$PROMPT`/`$PS1` and `$PROMPT2`/`$PS2` get parameter and
   command substitution first, then zsh `%` escapes including `%N<..<`
   truncation
@@ -127,7 +130,7 @@ and builtins include:
 There is no zle: `zle`, `bindkey`, `compinit`, `compdef` and `zcompile`
 are accepted and do nothing, so zle plugins such as zsh-autosuggestions
 load but stay inactive (meowsh shows its own history suggestions), and
-zsh completion scripts (`#compdef`) are not run. `RPROMPT` is not shown.
+zsh completion scripts (`#compdef`) are not run.
 Other zsh options are recorded by `setopt` but have no effect. Up and Down
 search history for lines starting with the typed text. History is kept in
 `~/.meowsh_history`; `$HISTFILE` is not used, so zsh's history file is

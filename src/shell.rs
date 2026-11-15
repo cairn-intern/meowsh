@@ -193,7 +193,7 @@ pub fn build_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static RANDOM_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn terminal_size() -> Option<(u16, u16)> {
+pub fn terminal_size() -> Option<(u16, u16)> {
     let tty = crate::jobs::TTY_FD.load(std::sync::atomic::Ordering::SeqCst);
     for fd in [tty, 2, 0, 1] {
         if fd < 0 {

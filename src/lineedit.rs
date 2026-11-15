@@ -15,6 +15,154 @@ use std::cell::RefCell;
 pub struct MeowshHelper;
 
 impl MeowshHelper {
+    // Syntax colors for the input line.
+    fn highlight_line(&self, line: &str) -> String {
+        let parts = get_char_or_ansi(line);
+        let mut colored = String::with_capacity(line.len() * 2);
+        let mut i = 0;
+        let mut is_start_of_command = true;
+
+        while i < parts.len() {
+            match &parts[i] {
+                CharOrAnsi::Ansi(ansi) => {
+                    colored.push_str(ansi);
+                    i += 1;
+                }
+                CharOrAnsi::Char(c) => match *c {
+                    ' ' | '\t' => {
+                        colored.push(*c);
+                        i += 1;
+                    }
+                    '#' if is_start_of_command => {
+                        colored.push_str("\x1b[90m");
+                        while i < parts.len() {
+                            match &parts[i] {
+                                CharOrAnsi::Char(c) => colored.push(*c),
+                                CharOrAnsi::Ansi(ansi) => colored.push_str(ansi),
+                            }
+                            i += 1;
+                        }
+                        colored.push_str("\x1b[0m");
+                        break;
+                    }
+                    ';' | '|' | '&' => {
+                        colored.push_str("\x1b[36m");
+                        colored.push(*c);
+                        i += 1;
+                        if i < parts.len() {
+                            if let CharOrAnsi::Char(next_c) = &parts[i] {
+                                if *next_c == *c && (*c == '|' || *c == '&') {
+                                    colored.push(*next_c);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        colored.push_str("\x1b[0m");
+                        is_start_of_command = true;
+                    }
+                    '\'' | '"' => {
+                        let quote = *c;
+                        colored.push_str("\x1b[33m");
+                        colored.push(quote);
+                        i += 1;
+                        while i < parts.len() {
+                            match &parts[i] {
+                                CharOrAnsi::Char(c) if *c == quote => break,
+                                CharOrAnsi::Char(c) if *c == '\\' => {
+                                    colored.push('\\');
+                                    i += 1;
+                                    if i < parts.len() {
+                                        if let CharOrAnsi::Char(c2) = &parts[i] {
+                                            colored.push(*c2);
+                                            i += 1;
+                                        }
+                                    }
+                                }
+                                CharOrAnsi::Char(c) => {
+                                    colored.push(*c);
+                                    i += 1;
+                                }
+                                CharOrAnsi::Ansi(ansi) => {
+                                    colored.push_str(ansi);
+                                    i += 1;
+                                }
+                            }
+                        }
+                        if i < parts.len() {
+                            colored.push(quote);
+                            i += 1;
+                        }
+                        colored.push_str("\x1b[0m");
+                        is_start_of_command = false;
+                    }
+                    '$' => {
+                        colored.push_str("\x1b[35m");
+                        colored.push('$');
+                        i += 1;
+                        while i < parts.len() {
+                            if let CharOrAnsi::Char(c) = &parts[i] {
+                                if c.is_alphanumeric() || *c == '_' {
+                                    colored.push(*c);
+                                    i += 1;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        colored.push_str("\x1b[0m");
+                        is_start_of_command = false;
+                    }
+                    _ => {
+                        let mut word_parts = Vec::new();
+                        let mut visible_word = String::new();
+                        while i < parts.len() {
+                            match &parts[i] {
+                                CharOrAnsi::Char(c)
+                                    if c.is_whitespace() || ";|&'\"$".contains(*c) =>
+                                {
+                                    break;
+                                }
+                                CharOrAnsi::Char(c) => {
+                                    visible_word.push(*c);
+                                    word_parts.push(&parts[i]);
+                                }
+                                CharOrAnsi::Ansi(_) => {
+                                    word_parts.push(&parts[i]);
+                                }
+                            }
+                            i += 1;
+                        }
+
+                        if is_start_of_command {
+                            if self.command_exists(&visible_word) {
+                                colored.push_str("\x1b[32m");
+                            } else {
+                                colored.push_str("\x1b[31m");
+                            }
+                            for p in word_parts {
+                                match p {
+                                    CharOrAnsi::Char(c) => colored.push(*c),
+                                    CharOrAnsi::Ansi(ansi) => colored.push_str(ansi),
+                                }
+                            }
+                            colored.push_str("\x1b[0m");
+                            is_start_of_command = false;
+                        } else {
+                            for p in word_parts {
+                                match p {
+                                    CharOrAnsi::Char(c) => colored.push(*c),
+                                    CharOrAnsi::Ansi(ansi) => colored.push_str(ansi),
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        colored
+    }
+
     pub fn command_exists(&self, name: &str) -> bool {
         crate::shell::command_exists(name)
     }
@@ -342,160 +490,119 @@ impl Completer for MeowshHelper {
     }
 }
 
+// zsh's RPROMPT for the line being read: its rendered text and width,
+// and the width of the last line of the left prompt.
+struct RightPrompt {
+    text: String,
+    width: usize,
+    left: usize,
+}
+
+static RIGHT_PROMPT: std::sync::Mutex<Option<RightPrompt>> = std::sync::Mutex::new(None);
+
+// Renders $RPROMPT/$RPS1 (or $RPROMPT2/$RPS2 for continuation lines) for
+// the next read, beside `prompt`.
+fn set_right_prompt(prompt: &str, continuation: bool) {
+    let names = if continuation {
+        ["RPROMPT2", "RPS2"]
+    } else {
+        ["RPROMPT", "RPS1"]
+    };
+    let value = names
+        .iter()
+        .find_map(|n| crate::shell::var_get_opt(n).filter(|v| !v.is_empty()));
+    let rp = value.map(|v| {
+        let text = crate::shell::render_prompt(&v);
+        let width = crate::display_width(&strip_ansi(&text));
+        let last = prompt.rsplit('\n').next().unwrap_or(prompt);
+        // highlight_prompt adds a space when the prompt has none.
+        let left = crate::display_width(&strip_ansi(last)) + usize::from(!prompt.ends_with(' '));
+        RightPrompt { text, width, left }
+    });
+    if let Ok(mut r) = RIGHT_PROMPT.lock() {
+        *r = rp.filter(|r| r.width > 0);
+    }
+}
+
+// Width of the input line last drawn, for the hint that follows it.
+static LINE_WIDTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// The column (0-based) where the right prompt starts, and the width of
+// the left prompt; None when there is no right prompt.
+fn right_prompt_start() -> Option<(usize, usize)> {
+    let guard = RIGHT_PROMPT.lock().ok()?;
+    let rp = guard.as_ref()?;
+    let cols = crate::shell::terminal_size()
+        .map(|(c, _)| c as usize)
+        .or_else(|| crate::shell::var_get_opt("COLUMNS").and_then(|c| c.parse().ok()))
+        .unwrap_or(80);
+    let indent = crate::shell::var_get_opt("ZLE_RPROMPT_INDENT")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1);
+    Some((cols.checked_sub(indent + rp.width)?, rp.left))
+}
+
+// Whether a right prompt starting at column `start` fits beside a left
+// prompt and line taking `used` columns: zsh wants a blank between them.
+fn right_prompt_fits(start: usize, used: usize) -> bool {
+    used < start
+}
+
+// The escape sequences that draw the right prompt at the end of the
+// row, leaving the cursor where it was. Empty when the line would reach
+// it, as zsh then hides it.
+fn right_prompt_overlay(line: &str) -> String {
+    let width = crate::display_width(&strip_ansi(line));
+    LINE_WIDTH.store(width, std::sync::atomic::Ordering::Relaxed);
+    if line.contains('\n') {
+        return String::new();
+    }
+    let Some((start, left)) = right_prompt_start() else {
+        return String::new();
+    };
+    if !right_prompt_fits(start, left + width) {
+        return String::new();
+    }
+    let text = RIGHT_PROMPT
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|r| r.text.clone()))
+        .unwrap_or_default();
+    format!("\x1b7\x1b[{}G{}\x1b[0m\x1b8", start + 1, text)
+}
+
+// After a suggestion that reaches the right prompt: clears what is left
+// of it on the row.
+fn hint_clears_right_prompt(hint: &str) -> bool {
+    let Some((start, left)) = right_prompt_start() else {
+        return false;
+    };
+    let line = LINE_WIDTH.load(std::sync::atomic::Ordering::Relaxed);
+    !right_prompt_fits(start, left + line + crate::display_width(hint))
+}
+
 impl Highlighter for MeowshHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        let overlay = right_prompt_overlay(line);
         if line.is_empty() {
-            return Cow::Borrowed(line);
+            return if overlay.is_empty() {
+                Cow::Borrowed(line)
+            } else {
+                Cow::Owned(overlay)
+            };
         }
-
-        let parts = get_char_or_ansi(line);
-        let mut colored = String::with_capacity(line.len() * 2);
-        let mut i = 0;
-        let mut is_start_of_command = true;
-
-        while i < parts.len() {
-            match &parts[i] {
-                CharOrAnsi::Ansi(ansi) => {
-                    colored.push_str(ansi);
-                    i += 1;
-                }
-                CharOrAnsi::Char(c) => match *c {
-                    ' ' | '\t' => {
-                        colored.push(*c);
-                        i += 1;
-                    }
-                    '#' if is_start_of_command => {
-                        colored.push_str("\x1b[90m");
-                        while i < parts.len() {
-                            match &parts[i] {
-                                CharOrAnsi::Char(c) => colored.push(*c),
-                                CharOrAnsi::Ansi(ansi) => colored.push_str(ansi),
-                            }
-                            i += 1;
-                        }
-                        colored.push_str("\x1b[0m");
-                        break;
-                    }
-                    ';' | '|' | '&' => {
-                        colored.push_str("\x1b[36m");
-                        colored.push(*c);
-                        i += 1;
-                        if i < parts.len() {
-                            if let CharOrAnsi::Char(next_c) = &parts[i] {
-                                if *next_c == *c && (*c == '|' || *c == '&') {
-                                    colored.push(*next_c);
-                                    i += 1;
-                                }
-                            }
-                        }
-                        colored.push_str("\x1b[0m");
-                        is_start_of_command = true;
-                    }
-                    '\'' | '"' => {
-                        let quote = *c;
-                        colored.push_str("\x1b[33m");
-                        colored.push(quote);
-                        i += 1;
-                        while i < parts.len() {
-                            match &parts[i] {
-                                CharOrAnsi::Char(c) if *c == quote => break,
-                                CharOrAnsi::Char(c) if *c == '\\' => {
-                                    colored.push('\\');
-                                    i += 1;
-                                    if i < parts.len() {
-                                        if let CharOrAnsi::Char(c2) = &parts[i] {
-                                            colored.push(*c2);
-                                            i += 1;
-                                        }
-                                    }
-                                }
-                                CharOrAnsi::Char(c) => {
-                                    colored.push(*c);
-                                    i += 1;
-                                }
-                                CharOrAnsi::Ansi(ansi) => {
-                                    colored.push_str(ansi);
-                                    i += 1;
-                                }
-                            }
-                        }
-                        if i < parts.len() {
-                            colored.push(quote);
-                            i += 1;
-                        }
-                        colored.push_str("\x1b[0m");
-                        is_start_of_command = false;
-                    }
-                    '$' => {
-                        colored.push_str("\x1b[35m");
-                        colored.push('$');
-                        i += 1;
-                        while i < parts.len() {
-                            if let CharOrAnsi::Char(c) = &parts[i] {
-                                if c.is_alphanumeric() || *c == '_' {
-                                    colored.push(*c);
-                                    i += 1;
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
-                        colored.push_str("\x1b[0m");
-                        is_start_of_command = false;
-                    }
-                    _ => {
-                        let mut word_parts = Vec::new();
-                        let mut visible_word = String::new();
-                        while i < parts.len() {
-                            match &parts[i] {
-                                CharOrAnsi::Char(c)
-                                    if c.is_whitespace() || ";|&'\"$".contains(*c) =>
-                                {
-                                    break;
-                                }
-                                CharOrAnsi::Char(c) => {
-                                    visible_word.push(*c);
-                                    word_parts.push(&parts[i]);
-                                }
-                                CharOrAnsi::Ansi(_) => {
-                                    word_parts.push(&parts[i]);
-                                }
-                            }
-                            i += 1;
-                        }
-
-                        if is_start_of_command {
-                            if self.command_exists(&visible_word) {
-                                colored.push_str("\x1b[32m");
-                            } else {
-                                colored.push_str("\x1b[31m");
-                            }
-                            for p in word_parts {
-                                match p {
-                                    CharOrAnsi::Char(c) => colored.push(*c),
-                                    CharOrAnsi::Ansi(ansi) => colored.push_str(ansi),
-                                }
-                            }
-                            colored.push_str("\x1b[0m");
-                            is_start_of_command = false;
-                        } else {
-                            for p in word_parts {
-                                match p {
-                                    CharOrAnsi::Char(c) => colored.push(*c),
-                                    CharOrAnsi::Ansi(ansi) => colored.push_str(ansi),
-                                }
-                            }
-                        }
-                    }
-                },
-            }
-        }
-
+        let mut colored = self.highlight_line(line);
+        colored.push_str(&overlay);
         Cow::Owned(colored)
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
-        Cow::Owned(format!("\x1b[90m{}\x1b[0m", hint))
+        let clear = if hint_clears_right_prompt(hint) {
+            "\x1b[K"
+        } else {
+            ""
+        };
+        Cow::Owned(format!("\x1b[90m{}\x1b[0m{}", hint, clear))
     }
 
     fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
@@ -652,6 +759,7 @@ pub fn run_interactive() -> i32 {
             } else {
                 primary_prompt()
             };
+            set_right_prompt(&prompt, cont);
             let line = rl.borrow_mut().readline(&prompt);
             match line {
                 Ok(line) => InputLine::Line(line + "\n"),
@@ -684,6 +792,13 @@ mod tests {
     use super::*;
     use crate::shell::SHELL;
     use crate::TEST_LOCK;
+
+    #[test]
+    fn right_prompt_needs_a_blank_before_it() {
+        // 60 columns, a 7-column right prompt, indent 1: it starts at 52.
+        assert!(right_prompt_fits(52, 51));
+        assert!(!right_prompt_fits(52, 52));
+    }
     use rustyline::hint::Hinter;
 
     #[test]

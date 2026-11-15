@@ -726,3 +726,68 @@ fn output_files_equals_and_glob_exclusions() {
         err
     );
 }
+
+// ---- right prompt ---------------------------------------------------------
+
+// Runs an interactive meowsh on a 60-column pseudo-terminal, types
+// `input`, and returns everything it drew.
+fn on_terminal(zshrc: &str, input: &str) -> String {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    let home = TempDir::new().unwrap();
+    std::fs::write(home.path().join(".zshrc"), zshrc).unwrap();
+    let (mut master, mut slave) = (0, 0);
+    let ws = libc::winsize {
+        ws_row: 10,
+        ws_col: 60,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let ok = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    };
+    assert_eq!(ok, 0, "openpty");
+    let tty = |fd: i32| unsafe { Stdio::from_raw_fd(libc::dup(fd)) };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .env("HOME", home.path())
+        .env("TERM", "xterm")
+        .arg("-i")
+        .stdin(tty(slave))
+        .stdout(tty(slave))
+        .stderr(tty(slave))
+        .spawn()
+        .unwrap();
+    unsafe { libc::close(slave) };
+    let mut m = unsafe { std::fs::File::from_raw_fd(master) };
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    m.write_all(input.as_bytes()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let _ = child.kill();
+    let _ = child.wait();
+    let mut out = Vec::new();
+    unsafe {
+        let flags = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = m.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn rprompt_is_drawn_at_the_right_edge() {
+    let out = on_terminal("PROMPT='> '\nRPROMPT='[right]'\n", "echo hi");
+    // 60 columns, 7 wide, one column of indent: column 53 (1-based).
+    assert!(out.contains("\x1b[53G[right]"), "output: {:?}", out);
+}
