@@ -2,6 +2,7 @@ pub mod arith;
 pub mod builtins;
 pub mod exec;
 pub mod expand;
+pub mod globber;
 pub mod jobs;
 pub mod lexer;
 pub mod lineedit;

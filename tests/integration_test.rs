@@ -595,15 +595,11 @@ fn test_zshrc_sourced_when_interactive() {
 }
 
 #[test]
-fn test_zshrc_skips_oh_my_zsh_bootstrap() {
+fn test_zshrc_sources_oh_my_zsh_bootstrap() {
     let temp_dir = TempDir::new().unwrap();
     let omz_dir = temp_dir.path().join(".oh-my-zsh");
     fs::create_dir(&omz_dir).unwrap();
-    fs::write(
-        omz_dir.join("oh-my-zsh.sh"),
-        "echo should_not_source_oh_my_zsh\n",
-    )
-    .unwrap();
+    fs::write(omz_dir.join("oh-my-zsh.sh"), "echo sourced_oh_my_zsh\n").unwrap();
     fs::write(
         temp_dir.path().join(".zshrc"),
         r#"
@@ -629,7 +625,7 @@ fn test_zshrc_skips_oh_my_zsh_bootstrap() {
 
     assert!(stdout.contains("startup_continued"));
     assert!(stdout.contains("command_ran"));
-    assert!(!stdout.contains("should_not_source_oh_my_zsh"));
+    assert!(stdout.contains("sourced_oh_my_zsh"));
     assert!(!stderr.contains("command not found"));
 }
 

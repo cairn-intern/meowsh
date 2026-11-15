@@ -72,6 +72,18 @@ pub fn shell_init() {
         VAR_EXPORT,
     );
     set_default(&mut shell, "PS2", "> ".to_string(), 0);
+    set_default(&mut shell, "HISTSIZE", "1000".to_string(), 0);
+    set_default(&mut shell, "SAVEHIST", "1000".to_string(), 0);
+    // zsh frameworks such as oh-my-zsh refuse to load without
+    // ZSH_VERSION. The suffix keeps per-version files (for example
+    // ~/.zcompdump-host-$ZSH_VERSION) apart from real zsh's.
+    for (name, value) in [
+        ("ZSH_VERSION", "5.9-meowsh".to_string()),
+        ("MEOWSH_VERSION", env!("CARGO_PKG_VERSION").to_string()),
+        ("HOST", hostname_full()),
+    ] {
+        shell.vars.insert(name.to_string(), Var { value, flags: 0 });
+    }
     set_default(&mut shell, "PS4", "+ ".to_string(), 0);
     // POSIX: IFS is reset at startup rather than inherited.
     shell.vars.insert(
@@ -124,6 +136,22 @@ pub fn shell_init() {
     }
 
     START.get_or_init(std::time::Instant::now);
+    // zsh/langinfo: the character set of the locale.
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|k| env::var(k).ok().filter(|v| !v.is_empty()))
+        .unwrap_or_default()
+        .to_lowercase();
+    let codeset = if locale.contains("utf-8") || locale.contains("utf8") {
+        "UTF-8"
+    } else {
+        "US-ASCII"
+    };
+    shell
+        .assoc_arrays
+        .entry("langinfo".to_string())
+        .or_default()
+        .insert("CODESET".to_string(), codeset.to_string());
     seed_tied_array(&mut shell, "path", "PATH");
     seed_tied_array(&mut shell, "fpath", "FPATH");
 }
@@ -150,7 +178,11 @@ pub fn opt_set(flag: u32) -> bool {
 }
 
 pub fn alias_get(name: &str) -> Option<String> {
-    with_shell(|s| s.aliases.get(name).cloned())
+    with_shell(|s| s.alias(name, false).cloned())
+}
+
+pub fn galias_get(name: &str) -> Option<String> {
+    with_shell(|s| s.alias(name, true).cloned())
 }
 
 /// Value of a parameter, or None if it is unset.
@@ -511,6 +543,15 @@ pub fn assoc_declare(name: &str) -> bool {
     true
 }
 
+pub fn assoc_set(name: &str, key: &str, value: &str) {
+    let mut shell = SHELL.shell.lock().unwrap();
+    shell
+        .assoc_arrays
+        .entry(name.to_string())
+        .or_default()
+        .insert(key.to_string(), value.to_string());
+}
+
 pub fn assoc_get(name: &str, key: &str) -> Option<String> {
     SHELL
         .shell
@@ -729,6 +770,49 @@ pub fn expand_prompt(s: &str) -> String {
             out.push(c);
             continue;
         }
+        // %N<str< ... %<< and %N>str> ... %>>: truncate the text up to
+        // the closing marker to N characters, marking the cut with str.
+        let mut digits = String::new();
+        while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+            digits.push(chars.next().unwrap());
+        }
+        if matches!(chars.peek(), Some('<' | '>')) {
+            let dir = chars.next().unwrap();
+            let mut marker = String::new();
+            for ch in chars.by_ref() {
+                if ch == dir {
+                    break;
+                }
+                marker.push(ch);
+            }
+            if digits.is_empty() {
+                // A bare %<< ends a truncation region; nothing to do here.
+                continue;
+            }
+            let end_tag = format!("%{0}{0}", dir);
+            let rest: String = chars.collect();
+            let (region, after) = match rest.find(&end_tag) {
+                Some(k) => (&rest[..k], &rest[k + end_tag.len()..]),
+                None => (rest.as_str(), ""),
+            };
+            let text: Vec<char> = expand_prompt(region).chars().collect();
+            let n: usize = digits.parse().unwrap_or(0);
+            if text.len() <= n {
+                out.extend(text);
+            } else {
+                let keep = n.saturating_sub(marker.chars().count());
+                if dir == '<' {
+                    out.push_str(&marker);
+                    out.extend(&text[text.len() - keep..]);
+                } else {
+                    out.extend(&text[..keep]);
+                    out.push_str(&marker);
+                }
+            }
+            out.push_str(&expand_prompt(after));
+            return out;
+        }
+        // Numeric arguments to other escapes (%3~ and so on) are ignored.
         match chars.next() {
             None => out.push('%'),
             Some('%') => out.push('%'),
@@ -921,6 +1005,21 @@ fn color_bg(name: &str) -> String {
     }
 }
 
+/// Names of all executables in $PATH, for zsh's `${(k)commands}`.
+pub fn all_commands() -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for dir in var_get("PATH").split(':').filter(|d| !d.is_empty()) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if is_executable(&e.path()) {
+                    names.insert(e.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
 pub fn find_command(name: &str) -> Option<String> {
     if name.contains('/') {
         let p = std::path::Path::new(name);
@@ -958,7 +1057,7 @@ pub fn command_exists(name: &str) -> bool {
     let name = name.as_str();
     {
         let shell = SHELL.shell.lock().unwrap();
-        if shell.aliases.contains_key(name) || shell.functions.contains_key(name) {
+        if shell.alias(name, false).is_some() || shell.functions.contains_key(name) {
             return true;
         }
     }
@@ -1040,6 +1139,13 @@ mod tests {
         shell_init();
         let s = expand_prompt("%{\x1b[31m%}red%{\x1b[0m%}");
         assert_eq!(s, "\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn test_prompt_truncation() {
+        assert_eq!(expand_prompt("%5<..<abcdefgh%<<!"), "..fgh!");
+        assert_eq!(expand_prompt("%5>..>abcdefgh%>>!"), "abc..!");
+        assert_eq!(expand_prompt("%9<..<short%<<"), "short");
     }
 
     #[test]

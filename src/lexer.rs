@@ -19,8 +19,8 @@ pub enum LexError {
 }
 
 const OPERATORS: &[&str] = &[
-    "<<-", "&&", "||", ";;", ";&", "<<", ">>", "<&", ">&", "<>", ">|", "|", "&", ";", "<", ">",
-    "(", ")",
+    "&>>", "<<<", "<<-", "&&", "||", ";;", ";&", "<<", ">>", "<&", ">&", "<>", ">|", "&>", "&|",
+    "&!", "|", "&", ";", "<", ">", "(", ")",
 ];
 
 fn is_operator_start(c: char) -> bool {
@@ -246,6 +246,67 @@ pub fn scan_paren(chars: &[char], i: usize) -> Option<usize> {
     None
 }
 
+/// `$((...))` with `i` at the first `(`: returns the index after `))`, or
+/// None if the parentheses do not close that way (then it is a command
+/// substitution starting with a subshell). Unlike `scan_paren`, `#` is
+/// not a comment here: `$(( #c ))` is a character code.
+pub fn scan_arith(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i + 1) != Some(&'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut j = i;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 1,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 1 {
+                    return (chars.get(j + 1) == Some(&')')).then_some(j + 2);
+                }
+                if depth == 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Length of a zsh numeric range glob `<->`, `<1-10>`, `<5->` at `i`.
+pub fn numeric_range_len(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i) != Some(&'<') {
+        return None;
+    }
+    let mut j = i + 1;
+    while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+        j += 1;
+    }
+    if chars.get(j) != Some(&'-') {
+        return None;
+    }
+    j += 1;
+    while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+        j += 1;
+    }
+    (chars.get(j) == Some(&'>')).then_some(j + 1 - i)
+}
+
+// True if `word` is `name=`, `name+=` or `name[sub]=`: a following `(`
+// starts an array value rather than continuing the word.
+fn is_assign_prefix(word: &str) -> bool {
+    let w = word.strip_suffix('=').unwrap_or("");
+    let w = w.strip_suffix('+').unwrap_or(w);
+    let name = match w.find('[') {
+        Some(k) if w.ends_with(']') => &w[..k],
+        _ => w,
+    };
+    word.ends_with('=') && is_valid_name(name)
+}
+
 /// Removes quoting from a here-document delimiter word. Returns the
 /// delimiter and whether any part of it was quoted.
 pub fn unquote_delimiter(raw: &str) -> (String, bool) {
@@ -312,6 +373,15 @@ impl Lexer {
 
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// 1-based line number of the current position.
+    pub fn line(&self) -> usize {
+        self.chars[..self.pos.min(self.chars.len())]
+            .iter()
+            .filter(|&&c| c == '\n')
+            .count()
+            + 1
     }
 
     pub fn rest(&self) -> String {
@@ -455,7 +525,8 @@ impl Lexer {
         }
 
         let procsub = matches!(c, '<' | '>') && self.chars.get(self.pos + 1) == Some(&'(');
-        if is_operator_start(c) && !procsub {
+        let range = numeric_range_len(&self.chars, self.pos).is_some();
+        if is_operator_start(c) && !procsub && !range {
             for op in OPERATORS {
                 let len = op.chars().count();
                 if self.pos + len <= self.chars.len()
@@ -476,19 +547,15 @@ impl Lexer {
     // `((` starts an arithmetic command when its parentheses close with
     // `))`; otherwise it is two subshell openers, as in `((cmd); cmd)`.
     fn try_arith(&mut self) -> Result<Option<Tok>, LexError> {
-        let Some(inner_end) = scan_paren(&self.chars, self.pos + 1) else {
-            return if self.final_input {
-                Ok(None)
-            } else {
-                Err(LexError::Incomplete)
-            };
-        };
-        if self.chars.get(inner_end) != Some(&')') {
-            return Ok(None);
+        if let Some(end) = scan_arith(&self.chars, self.pos) {
+            let expr: String = self.chars[self.pos + 2..end - 2].iter().collect();
+            self.pos = end;
+            return Ok(Some(Tok::Arith(expr)));
         }
-        let expr: String = self.chars[self.pos + 2..inner_end - 1].iter().collect();
-        self.pos = inner_end + 1;
-        Ok(Some(Tok::Arith(expr)))
+        if scan_paren(&self.chars, self.pos).is_none() && !self.final_input {
+            return Err(LexError::Incomplete);
+        }
+        Ok(None)
     }
 
     fn read_word(&mut self) -> Result<String, LexError> {
@@ -500,6 +567,24 @@ impl Lexer {
                 // Process substitution `<(...)` / `>(...)` at word start.
                 '<' | '>' if out.is_empty() && self.chars.get(self.pos + 1) == Some(&'(') => {
                     let end = scan_paren(&self.chars, self.pos + 1).ok_or_else(|| {
+                        self.incomplete("unexpected end of file while looking for matching `)'")
+                    })?;
+                    out.extend(&self.chars[self.pos..end]);
+                    self.pos = end;
+                }
+                '<' if numeric_range_len(&self.chars, self.pos).is_some() => {
+                    let len = numeric_range_len(&self.chars, self.pos).unwrap();
+                    out.extend(&self.chars[self.pos..self.pos + len]);
+                    self.pos += len;
+                }
+                // zsh: `(` inside a word continues it, as in the glob
+                // qualifier `*(N)` or the pattern `x_(a|b)_*`. Not after
+                // `name=` (array value) and not `name()` (function).
+                '(' if !out.is_empty()
+                    && !is_assign_prefix(&out)
+                    && self.chars.get(self.pos + 1) != Some(&')') =>
+                {
+                    let end = scan_paren(&self.chars, self.pos).ok_or_else(|| {
                         self.incomplete("unexpected end of file while looking for matching `)'")
                     })?;
                     out.extend(&self.chars[self.pos..end]);
@@ -545,9 +630,17 @@ impl Lexer {
                 '$' if self.pos + 1 < self.chars.len() => {
                     let next = self.chars[self.pos + 1];
                     let end = match next {
-                        '(' => Some(scan_paren(&self.chars, self.pos + 1).ok_or_else(|| {
-                            self.incomplete("unexpected end of file while looking for matching `)'")
-                        })?),
+                        '(' => Some(
+                            match scan_arith(&self.chars, self.pos + 1) {
+                                Some(e) => Some(e),
+                                None => scan_paren(&self.chars, self.pos + 1),
+                            }
+                            .ok_or_else(|| {
+                                self.incomplete(
+                                    "unexpected end of file while looking for matching `)'",
+                                )
+                            })?,
+                        ),
                         '{' => {
                             Some(scan_brace(&self.chars, self.pos + 1, false).ok_or_else(|| {
                                 self.incomplete(

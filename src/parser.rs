@@ -37,9 +37,12 @@ pub struct Parser {
     // also checked for alias expansion.
     alias_next: bool,
     alias_lookup: AliasLookup,
+    galias_lookup: AliasLookup,
     // Open `{ ... }` groups; inside one, a bare `}` ends a simple command
     // as in zsh (`{ echo hi }`).
     brace_depth: usize,
+    // Second half of `&>file`, which redirects both stdout and stderr.
+    pending_redir: Option<Redir>,
 }
 
 impl Parser {
@@ -51,7 +54,9 @@ impl Parser {
             alias_guard: Vec::new(),
             alias_next: false,
             alias_lookup: Box::new(crate::shell::alias_get),
+            galias_lookup: Box::new(crate::shell::galias_get),
             brace_depth: 0,
+            pending_redir: None,
         }
     }
 
@@ -59,7 +64,12 @@ impl Parser {
     pub fn without_aliases(input: &str, final_input: bool) -> Self {
         let mut p = Parser::new(input, final_input);
         p.alias_lookup = Box::new(|_| None);
+        p.galias_lookup = Box::new(|_| None);
         p
+    }
+
+    pub fn line(&self) -> usize {
+        self.lex.line()
     }
 
     /// Input not yet consumed. Only meaningful between complete commands.
@@ -170,15 +180,24 @@ impl Parser {
             if self.at_list_end()? {
                 break;
             }
-            let node = self.parse_and_or()?;
+            let mut node = self.parse_and_or()?;
             let mut background = false;
             match self.peek()? {
                 Tok::Op(";") => {
                     self.next()?;
                 }
-                Tok::Op("&") => {
+                // `&|` and `&!` (zsh: background without job control).
+                Tok::Op(op @ ("&" | "&|" | "&!")) => {
+                    let disown = *op != "&";
                     self.next()?;
                     background = true;
+                    if disown {
+                        node = Node::Disowned(Box::new(node));
+                    }
+                    // zsh accepts `cmd &|;`.
+                    if self.peek_is_op(";")? {
+                        self.next()?;
+                    }
                 }
                 Tok::Newline => {
                     if top_level {
@@ -276,6 +295,11 @@ impl Parser {
     /// If the next token is an unquoted word naming an alias, replaces it
     /// with the alias text. Returns true if a substitution happened.
     fn try_alias(&mut self) -> PResult<bool> {
+        self.try_alias_in(false)
+    }
+
+    // With `global`, only zsh global aliases (`alias -g`) apply.
+    fn try_alias_in(&mut self, global: bool) -> PResult<bool> {
         let name = match self.peek()? {
             Tok::Word(w) => w.clone(),
             _ => return Ok(false),
@@ -283,7 +307,12 @@ impl Parser {
         if self.alias_blocked(&name) {
             return Ok(false);
         }
-        let Some(value) = (self.alias_lookup)(&name) else {
+        let found = if global {
+            (self.galias_lookup)(&name)
+        } else {
+            (self.alias_lookup)(&name).or_else(|| (self.galias_lookup)(&name))
+        };
+        let Some(value) = found else {
             return Ok(false);
         };
         // The peeked token has been lexed; the lexer sits right after it.
@@ -319,7 +348,21 @@ impl Parser {
                     self.brace_depth -= 1;
                     let body = body?;
                     self.expect_word("}")?;
-                    Node::Brace(Box::new(body))
+                    if self.peek_is_word("always")? {
+                        self.next()?;
+                        self.skip_newlines()?;
+                        if !self.peek_is_word("{")? {
+                            let t = self.peek()?.clone();
+                            return Err(self.unexpected(&t));
+                        }
+                        let always = self.parse_command()?;
+                        Node::Always {
+                            body: Box::new(Node::Brace(Box::new(body))),
+                            always: Box::new(always),
+                        }
+                    } else {
+                        Node::Brace(Box::new(body))
+                    }
                 }
                 "[[" => self.parse_dbracket()?,
                 "function" => return self.parse_function_keyword(),
@@ -330,6 +373,9 @@ impl Parser {
             },
             Tok::Op("(") => {
                 self.next()?;
+                if self.peek_is_op(")")? {
+                    return self.parse_anon_func();
+                }
                 let body = self.parse_list(false)?;
                 self.expect_op(")")?;
                 Node::Subshell(Box::new(body))
@@ -367,7 +413,30 @@ impl Parser {
         }
     }
 
+    // `() compound-command [args]`, after the `(`.
+    fn parse_anon_func(&mut self) -> PResult<Node> {
+        self.next()?; // )
+        self.skip_newlines()?;
+        let body = self.parse_command()?;
+        let mut args = Vec::new();
+        while let Tok::Word(w) = self.peek()? {
+            if LIST_TERMINATORS.contains(&w.as_str()) {
+                break;
+            }
+            let w = w.clone();
+            self.next()?;
+            args.push(w);
+        }
+        Ok(Node::AnonFunc {
+            body: std::sync::Arc::new(body),
+            args,
+        })
+    }
+
     fn try_parse_redirect(&mut self) -> PResult<Option<Redir>> {
+        if let Some(r) = self.pending_redir.take() {
+            return Ok(Some(r));
+        }
         let mut fd = None;
         if let Tok::IoNumber(n) = self.peek()? {
             fd = Some(*n);
@@ -392,6 +461,31 @@ impl Parser {
             "<&" => (RedirOp::DupIn, 0),
             ">&" => (RedirOp::DupOut, 1),
             "<<" | "<<-" => (RedirOp::HereDoc, 0),
+            "<<<" => (RedirOp::HereStr, 0),
+            "&>" | "&>>" if fd.is_none() => {
+                self.next()?;
+                let target = match self.next()? {
+                    Tok::Word(w) => w,
+                    Tok::Eof => return Err(self.eof_error("a redirection target")),
+                    t => return Err(self.unexpected(&t)),
+                };
+                self.pending_redir = Some(Redir {
+                    fd: 2,
+                    op: RedirOp::DupOut,
+                    target: "1".to_string(),
+                    heredoc: None,
+                });
+                return Ok(Some(Redir {
+                    fd: 1,
+                    op: if op == "&>" {
+                        RedirOp::Write
+                    } else {
+                        RedirOp::Append
+                    },
+                    target,
+                    heredoc: None,
+                }));
+            }
             _ => {
                 if fd.is_some() {
                     return Err(ParseError::Syntax(format!(
@@ -439,6 +533,9 @@ impl Parser {
                 if check && self.try_alias()? {
                     continue;
                 }
+            }
+            if !cmd.words.is_empty() && self.try_alias_in(true)? {
+                continue;
             }
             let word = match self.peek()? {
                 Tok::Word(w) => w.clone(),
@@ -515,23 +612,43 @@ impl Parser {
     }
 
     // function name [()] compound-command
+    // function name... [()] compound-command; zsh allows several names
+    // sharing one body.
     fn parse_function_keyword(&mut self) -> PResult<Node> {
         self.next()?;
-        let name = match self.next()? {
+        let mut names = vec![match self.next()? {
             Tok::Word(w) => w,
             Tok::Eof => return Err(self.eof_error("a function name")),
             t => return Err(self.unexpected(&t)),
-        };
+        }];
+        while let Tok::Word(w) = self.peek()? {
+            if w == "{" || !is_func_name(w) {
+                break;
+            }
+            let w = w.clone();
+            self.next()?;
+            names.push(w);
+        }
         if self.peek_is_op("(")? {
             self.next()?;
             self.expect_op(")")?;
         }
         self.skip_newlines()?;
         let body = self.parse_command()?;
-        Ok(Node::FuncDef {
-            name,
-            body: Box::new(body),
-        })
+        let mut defs: Vec<ListItem> = names
+            .into_iter()
+            .map(|name| ListItem {
+                node: Node::FuncDef {
+                    name,
+                    body: Box::new(body.clone()),
+                },
+                background: false,
+            })
+            .collect();
+        if defs.len() == 1 {
+            return Ok(defs.pop().unwrap().node);
+        }
+        Ok(Node::List(defs))
     }
 
     fn parse_if(&mut self) -> PResult<Node> {
@@ -611,11 +728,51 @@ impl Parser {
                 body: Box::new(body),
             });
         }
-        let var = match self.next()? {
+        let mut vars = vec![match self.next()? {
             Tok::Word(w) if is_valid_name(&w) => w,
             Tok::Eof => return Err(self.eof_error("a variable name")),
             t => return Err(self.unexpected(&t)),
-        };
+        }];
+        // zsh: several names take that many words per iteration.
+        while let Tok::Word(w) = self.peek()? {
+            if w == "in" || w == "do" || !is_valid_name(w) {
+                break;
+            }
+            let w = w.clone();
+            self.next()?;
+            vars.push(w);
+        }
+        // zsh: `for x (a b c) body`
+        if self.peek_is_op("(")? {
+            self.next()?;
+            let mut list = Vec::new();
+            loop {
+                match self.next()? {
+                    Tok::Word(w) => list.push(w),
+                    Tok::Newline => {}
+                    Tok::Op(")") => break,
+                    Tok::Eof => return Err(self.eof_error("`)'")),
+                    t => return Err(self.unexpected(&t)),
+                }
+            }
+            if self.peek_is_op(";")? {
+                self.next()?;
+            }
+            self.skip_newlines()?;
+            let body = if self.peek_is_word("do")? {
+                self.next()?;
+                let body = self.parse_list(false)?;
+                self.expect_word("done")?;
+                body
+            } else {
+                self.parse_command()?
+            };
+            return Ok(Node::For {
+                vars,
+                words: Some(list),
+                body: Box::new(body),
+            });
+        }
         self.skip_newlines()?;
         let mut words = None;
         if self.peek_is_word("in")? {
@@ -637,7 +794,7 @@ impl Parser {
         let body = self.parse_list(false)?;
         self.expect_word("done")?;
         Ok(Node::For {
-            var,
+            vars,
             words,
             body: Box::new(body),
         })
@@ -658,21 +815,42 @@ impl Parser {
                 self.next()?;
                 break;
             }
+            let mut patterns = Vec::new();
+            // A leading `(` is POSIX's optional paren, or a zsh pattern
+            // that starts with a group.
+            let mut done = false;
             if self.peek_is_op("(")? {
                 self.next()?;
-            }
-            let mut patterns = Vec::new();
-            loop {
-                match self.next()? {
-                    Tok::Word(w) => patterns.push(w),
-                    Tok::Eof => return Err(self.eof_error("a case pattern")),
-                    t => return Err(self.unexpected(&t)),
+                let (alts, group) = self.case_group()?;
+                match group {
+                    Some(pat) => patterns.push(pat),
+                    None => {
+                        patterns.extend(alts);
+                        done = true;
+                    }
                 }
-                match self.next()? {
-                    Tok::Op("|") => continue,
-                    Tok::Op(")") => break,
-                    Tok::Eof => return Err(self.eof_error("`)'")),
-                    t => return Err(self.unexpected(&t)),
+                if !done {
+                    match self.next()? {
+                        Tok::Op("|") => {}
+                        Tok::Op(")") => done = true,
+                        Tok::Eof => return Err(self.eof_error("`)'")),
+                        t => return Err(self.unexpected(&t)),
+                    }
+                }
+            }
+            if !done {
+                loop {
+                    match self.next()? {
+                        Tok::Word(w) => patterns.push(w),
+                        Tok::Eof => return Err(self.eof_error("a case pattern")),
+                        t => return Err(self.unexpected(&t)),
+                    }
+                    match self.next()? {
+                        Tok::Op("|") => continue,
+                        Tok::Op(")") => break,
+                        Tok::Eof => return Err(self.eof_error("`)'")),
+                        t => return Err(self.unexpected(&t)),
+                    }
                 }
             }
             let body = self.parse_list(false)?;
@@ -701,6 +879,38 @@ impl Parser {
             });
         }
         Ok(Node::Case { word, items })
+    }
+
+    // After a `(` that opens a case item: reads `a|b|c)`. If a pattern
+    // character follows the `)` (or another `)`/`|`), this was a zsh
+    // group such as `(darwin|freebsd)*)` and the grouped pattern is
+    // returned; otherwise it was POSIX's optional paren and the
+    // alternatives are the item's patterns.
+    fn case_group(&mut self) -> PResult<(Vec<String>, Option<String>)> {
+        let mut alts = Vec::new();
+        loop {
+            match self.next()? {
+                Tok::Word(w) => alts.push(w),
+                Tok::Op("|") => {}
+                Tok::Op(")") => break,
+                Tok::Eof => return Err(self.eof_error("`)'")),
+                t => return Err(self.unexpected(&t)),
+            }
+        }
+        let zsh_group = match self.peek()? {
+            Tok::Op(")") | Tok::Op("|") => true,
+            Tok::Word(w) => w.starts_with(['*', '?', '[']),
+            _ => false,
+        };
+        if !zsh_group {
+            return Ok((alts, None));
+        }
+        let mut pat = format!("({})", alts.join("|"));
+        if let Tok::Word(w) = self.peek()?.clone() {
+            self.next()?;
+            pat.push_str(&w);
+        }
+        Ok((Vec::new(), Some(pat)))
     }
 
     // [[ expr ]]: operands and operators are kept as raw words and
@@ -768,7 +978,11 @@ fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
         Node::List(items) => items
             .iter_mut()
             .for_each(|i| fill_heredocs(&mut i.node, bodies)),
-        Node::Subshell(b) | Node::Brace(b) => fill_heredocs(b, bodies),
+        Node::Subshell(b) | Node::Brace(b) | Node::Disowned(b) => fill_heredocs(b, bodies),
+        Node::Always { body, always } => {
+            fill_heredocs(body, bodies);
+            fill_heredocs(always, bodies);
+        }
         Node::If {
             branches,
             else_body,
@@ -797,6 +1011,11 @@ fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
         Node::Redirected { node, redirs } => {
             fill_heredocs(node, bodies);
             fill_redirs(redirs, bodies);
+        }
+        Node::AnonFunc { body, .. } => {
+            if let Some(b) = std::sync::Arc::get_mut(body) {
+                fill_heredocs(b, bodies);
+            }
         }
         Node::DBracket(_) | Node::Arith(_) | Node::Empty => {}
     }
@@ -898,6 +1117,33 @@ mod tests {
             Node::ForArith { .. }
         ));
         assert!(matches!(parse_one("((echo a); echo b)"), Node::Subshell(_)));
+    }
+
+    #[test]
+    fn zsh_short_for_anonymous_function_and_both_redirect() {
+        assert!(matches!(parse_one("for x (a b) echo $x"), Node::For { .. }));
+        assert!(
+            matches!(parse_one("for k v (a 1 b 2); do :; done"), Node::For { vars, .. } if vars.len() == 2)
+        );
+        assert!(
+            matches!(parse_one("() { echo $1 } a"), Node::AnonFunc { args, .. } if args == vec!["a"])
+        );
+        match parse_one("cmd &>out") {
+            Node::Simple(c) => assert_eq!(c.redirs.len(), 2),
+            n => panic!("{:?}", n),
+        }
+    }
+
+    #[test]
+    fn case_patterns_with_zsh_groups() {
+        match parse_one("case x in (a|b)*) echo g;; (c) echo p;; plugin::(x|y)) echo m;; esac") {
+            Node::Case { items, .. } => {
+                assert_eq!(items[0].patterns, vec!["(a|b)*"]);
+                assert_eq!(items[1].patterns, vec!["c"]);
+                assert_eq!(items[2].patterns, vec!["plugin::(x|y)"]);
+            }
+            n => panic!("{:?}", n),
+        }
     }
 
     #[test]

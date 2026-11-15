@@ -225,46 +225,13 @@ fn source_startup(path: &str) {
     if !Path::new(path).is_file() {
         return;
     }
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let filtered = filter_startup_content(&content);
-    if filtered == content {
-        source_file(path, None);
-    } else {
-        with_shell(|s| s.source_depth += 1);
-        run_string(&filtered);
-        with_shell(|s| s.source_depth -= 1);
-    }
+    source_file(path, None);
     if !matches!(flow(), Flow::Exit(_)) {
         set_flow(Flow::None);
     }
     if let Flow::Exit(n) = flow() {
         exit_shell(n);
     }
-}
-
-fn filter_startup_content(content: &str) -> String {
-    let mut filtered = String::with_capacity(content.len());
-    for line in content.lines() {
-        if !is_unsupported_zsh_framework_source(line) {
-            filtered.push_str(line);
-            filtered.push('\n');
-        }
-    }
-    if !content.ends_with('\n') && filtered.ends_with('\n') {
-        filtered.pop();
-    }
-    filtered
-}
-
-fn is_unsupported_zsh_framework_source(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') {
-        return false;
-    }
-    let is_source = trimmed.starts_with("source ") || trimmed.starts_with(". ");
-    is_source && trimmed.contains("oh-my-zsh.sh")
 }
 
 #[cfg(test)]

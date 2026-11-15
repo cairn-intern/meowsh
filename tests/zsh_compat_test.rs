@@ -184,3 +184,135 @@ fn prompt_substitutes_before_percent_escapes() {
     };
     assert!(err.starts_with(expected), "prompt was {:?}", err);
 }
+
+// ---- oh-my-zsh ------------------------------------------------------------
+
+#[test]
+fn zsh_version_and_emulate() {
+    let (_, out, _) = sh("[ -n \"$ZSH_VERSION\" ] && echo set; emulate; is-at-least 5.0 && echo ok; is-at-least 9.0 || echo old");
+    assert_eq!(out, "set\nzsh\nok\nold\n");
+}
+
+#[test]
+fn nested_expansion_flags_and_modifiers() {
+    let (_, out, err) = sh("v='git version 2.43.0'; echo ${${(As: :)v}[3]}; \
+         p=/a/b/c.tar.gz; echo ${p:t} ${p:h} ${p:r} ${p:e} ${p:h:t}; \
+         a=(b a c a); echo ${(j:,:)a} ${(o)a} ${(u)a} ${#a} ${a[2,-1]}; \
+         codes=(1 2); x=(\"<\"${^codes}\">\"); echo ${x[@]}; \
+         s=hello; echo ${s[2]} ${s[2,3]} $#s; \
+         typeset -A m; m=(k1 v1 k2 v2); echo ${(k)m} ${(kv)m} ${(k)m[(r)v2]}; \
+         l='l1\nl2'; arr=(\"${(@f)$(printf \"$l\")}\"); echo ${#arr} $arr[2]; \
+         echo $+commands[sh] $+commands[no-such-cmd-xyz]; \
+         o='a b'; set -- ${=o}; echo $#; \
+         h=(x.zsh y.sh); echo ${h:#*.sh} ${(M)h:#*.sh}; \
+         k=(1 2); w=(a b); echo ${k:^w}");
+    assert_eq!(
+        out,
+        "2.43.0\nc.tar.gz /a/b /a/b/c.tar gz b\nb,a,c,a a a b c b a c 4 a c a\n<1> <2>\n\
+         e el 5\nk1 k2 k1 v1 k2 v2 k2\n2 l2\n1 0\n2\nx.zsh y.sh\n1 a 2 b\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
+fn global_aliases_and_the_aliases_array() {
+    let (_, out, _) = sh(
+        "alias -g G='| grep b'\nprintf 'a\\nb\\n' G\nalias ll='ls -l'\n\
+         echo ${aliases[ll]} ${#galiases}\naliases[hi]='echo hello'\nhi",
+    );
+    assert_eq!(out, "b\nls -l 1\nhello\n");
+}
+
+#[test]
+fn short_loops_multiple_names_and_anonymous_functions() {
+    let (_, out, _) = sh(
+        "for k v (a 1 b 2); do echo $k=$v; done; for x (p q) echo $x; \
+         () { echo anon $1 } arg; function f1 f2 { echo $0 }; f1; f2",
+    );
+    assert_eq!(out, "a=1\nb=2\np\nq\nanon arg\nf1\nf2\n");
+}
+
+#[test]
+fn always_here_string_and_redirect_both() {
+    let home = TempDir::new().unwrap();
+    let (_, out, _) = sh_home(
+        "cd; f() { { return 3 } always { echo cleanup } }; f; echo $?; \
+         read x <<< 'from string'; echo $x; \
+         { echo out; echo err >&2 } &> both; cat both; \
+         (echo bg > bgout) &|; while [ ! -s bgout ]; do :; done; cat bgout; jobs | wc -l",
+        &home,
+    );
+    assert_eq!(out, "cleanup\n3\nfrom string\nout\nerr\nbg\n0\n");
+}
+
+#[test]
+fn case_patterns_with_groups() {
+    let (_, out, _) = sh(
+        "for v in freebsd13 plugin::load x; do case $v in \
+         (darwin|freebsd)*) echo bsd;; plugin::(disable|load)) echo plug;; (x) echo posix;; esac; done",
+    );
+    assert_eq!(out, "bsd\nplug\nposix\n");
+}
+
+#[test]
+fn glob_groups_ranges_and_qualifiers() {
+    let home = TempDir::new().unwrap();
+    for f in ["a.rs", "b.toml", "c.txt", "f1", "f2", "f10"] {
+        std::fs::write(home.path().join(f), "").unwrap();
+    }
+    std::fs::create_dir(home.path().join("sub")).unwrap();
+    let script = format!(
+        "cd {}; echo *.(rs|toml); echo f<1-2>; echo *(/); echo none*(N) end; echo f<->(.)",
+        home.path().display()
+    );
+    let (_, out, _) = sh_home(&script, &home);
+    assert_eq!(out, "a.rs b.toml\nf1 f2\nsub\nend\nf1 f10 f2\n");
+}
+
+#[test]
+fn zparseopts_and_fc() {
+    let (_, out, _) = sh(
+        "f() { local -a opts; local clear stamp; zparseopts -D -E -a opts c=clear t:=stamp P; \
+         echo \"c=$clear t=${stamp[*]} o=${opts[*]} rest=$*\"; }; f -c -t fmt x -P y",
+    );
+    assert_eq!(out, "c=-c t=-t fmt o=-P rest=x y\n");
+    let (_, out) = interactive("", "echo a\nfc -ln -2\n");
+    assert_eq!(out, "a\necho a\nfc -ln -2\n");
+}
+
+#[test]
+fn function_exit_trap_and_local_traps() {
+    let (_, out, _) = sh("f() { trap 'echo fexit' EXIT; echo in; }; f; echo after; \
+         g() { emulate -L zsh; trap 'echo int' INT; setopt autocd; }; g; trap; echo end");
+    assert_eq!(out, "in\nfexit\nafter\nend\n");
+}
+
+#[test]
+fn auto_cd_in_interactive_shell() {
+    let (_, out) = interactive("setopt auto_cd\n", "/\npwd\n");
+    assert_eq!(out, "/\n");
+}
+
+#[test]
+fn read_keys_and_yes_no() {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args([
+            "-c",
+            "read -q && echo yes; read -k 1 c; echo \"[$c]\"; read -k 2; echo \"[$REPLY]\"",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"yZab").unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "yes\n[Z]\n[ab]\n");
+}
+
+#[test]
+fn colors_and_prompt_truncation() {
+    let (_, out, _) = sh("colors; print -n $fg[red]x$reset_color | od -An -c | tr -s ' '; print -P '%5<..<abcdefgh%<<'");
+    assert_eq!(out, " 033 [ 3 1 m x 033 [ 0 0 m\n..fgh\n");
+}

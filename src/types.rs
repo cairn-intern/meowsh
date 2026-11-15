@@ -98,7 +98,6 @@ pub struct Shell {
     // True in forked subshells (command substitution, pipelines, `( )`).
     pub in_subshell: bool,
     pub vars: HashMap<String, Var>,
-    pub aliases: HashMap<String, String>,
     pub pos_params: Vec<String>,
     pub jobs: Mutex<Vec<Job>>,
     pub history: Mutex<Vec<String>>,
@@ -159,7 +158,6 @@ impl Shell {
             job_control: false,
             in_subshell: false,
             vars: HashMap::new(),
-            aliases: HashMap::new(),
             pos_params: Vec::new(),
             jobs: Mutex::new(Vec::new()),
             history: Mutex::new(Vec::new()),
@@ -182,12 +180,32 @@ impl Shell {
             named_opts: HashMap::new(),
             zstyles: Vec::new(),
             arrays: HashMap::new(),
-            assoc_arrays: HashMap::new(),
+            assoc_arrays: HashMap::from([
+                (ALIASES.to_string(), BTreeMap::new()),
+                (GALIASES.to_string(), BTreeMap::new()),
+            ]),
             unique_arrays: HashSet::new(),
             dir_stack: Vec::new(),
         }
     }
+
+    /// The alias table (`global`: zsh `alias -g`). As in zsh, aliases
+    /// live in the associative arrays `$aliases` and `$galiases`.
+    pub fn alias_map(&mut self, global: bool) -> &mut BTreeMap<String, String> {
+        self.assoc_arrays
+            .entry(if global { GALIASES } else { ALIASES }.to_string())
+            .or_default()
+    }
+
+    pub fn alias(&self, name: &str, global: bool) -> Option<&String> {
+        self.assoc_arrays
+            .get(if global { GALIASES } else { ALIASES })
+            .and_then(|m| m.get(name))
+    }
 }
+
+pub const ALIASES: &str = "aliases";
+pub const GALIASES: &str = "galiases";
 
 impl Default for Shell {
     fn default() -> Self {
@@ -205,6 +223,7 @@ pub enum RedirOp {
     DupIn,     // <&
     DupOut,    // >&
     HereDoc,   // << and <<-
+    HereStr,   // <<< word
 }
 
 #[derive(Clone, Debug)]
@@ -292,6 +311,18 @@ pub enum Node {
     },
     // `(( expr ))`
     Arith(String),
+    // Run in the background with `&|` / `&!`: no job entry, no notice.
+    Disowned(Box<Node>),
+    // zsh `{ try } always { cleanup }`
+    Always {
+        body: Box<Node>,
+        always: Box<Node>,
+    },
+    // zsh anonymous function `() { body } args`, run immediately.
+    AnonFunc {
+        body: std::sync::Arc<Node>,
+        args: Vec<String>,
+    },
     // `for (( init; cond; step ))`
     ForArith {
         init: String,
@@ -300,7 +331,7 @@ pub enum Node {
         body: Box<Node>,
     },
     For {
-        var: String,
+        vars: Vec<String>,
         words: Option<Vec<String>>,
         body: Box<Node>,
     },

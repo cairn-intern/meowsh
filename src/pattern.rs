@@ -11,6 +11,8 @@ enum Item {
     Class { negated: bool, set: Vec<ClassItem> },
     // `(alt1|alt2)`: matches any alternative.
     Group(Vec<Vec<Item>>),
+    // zsh `<lo-hi>`: a run of digits whose value is in range.
+    Range(Option<u64>, Option<u64>),
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +65,13 @@ fn compile_seq(p: &[char], i: &mut usize, nested: bool) -> Vec<Vec<Item>> {
             '|' if nested => {
                 alts.push(std::mem::take(&mut items));
                 *i += 1;
+            }
+            '<' if crate::lexer::numeric_range_len(p, i0).is_some() => {
+                let len = crate::lexer::numeric_range_len(p, i0).unwrap();
+                let inner: String = p[i0 + 1..i0 + len - 1].iter().collect();
+                let (lo, hi) = inner.split_once('-').unwrap_or(("", ""));
+                items.push(Item::Range(lo.parse().ok(), hi.parse().ok()));
+                *i += len;
             }
             '(' if group_end(p, i0).is_some() => {
                 *i += 1;
@@ -189,12 +198,14 @@ fn item_matches(item: &Item, c: char) -> bool {
         Item::Any => true,
         Item::Class { negated, set } => class_matches(set, c) != *negated,
         Item::Star => true,
-        Item::Group(_) => false,
+        Item::Group(_) | Item::Range(..) => false,
     }
 }
 
 fn has_group(items: &[Item]) -> bool {
-    items.iter().any(|i| matches!(i, Item::Group(_)))
+    items
+        .iter()
+        .any(|i| matches!(i, Item::Group(_) | Item::Range(..)))
 }
 
 // Backtracking matcher for patterns containing groups.
@@ -206,6 +217,16 @@ fn match_rec(items: &[Item], s: &[char]) -> bool {
         Item::Star => (0..=s.len()).any(|k| match_rec(rest, &s[k..])),
         Item::Group(alts) => (0..=s.len())
             .any(|k| alts.iter().any(|alt| match_items(alt, &s[..k])) && match_rec(rest, &s[k..])),
+        Item::Range(lo, hi) => {
+            let digits = s.iter().take_while(|c| c.is_ascii_digit()).count();
+            (1..=digits).any(|k| {
+                let text: String = s[..k].iter().collect();
+                let in_range = text
+                    .parse::<u64>()
+                    .is_ok_and(|v| lo.is_none_or(|lo| v >= lo) && hi.is_none_or(|hi| v <= hi));
+                in_range && match_rec(rest, &s[k..])
+            })
+        }
         item => !s.is_empty() && item_matches(item, s[0]) && match_rec(rest, &s[1..]),
     }
 }
@@ -270,17 +291,20 @@ pub fn matches(pattern: &str, s: &str) -> bool {
     Pattern::new(pattern).matches(s)
 }
 
-/// True if the pattern contains an unescaped glob metacharacter.
+/// True if the pattern contains an unescaped glob metacharacter: `*`,
+/// `?`, `[`, a `(...)` group, or a `<n-m>` range.
 pub fn has_meta(pattern: &str) -> bool {
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
+    let p: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < p.len() {
+        match p[i] {
+            '\\' => i += 1,
             '*' | '?' | '[' => return true,
+            '(' if group_end(&p, i).is_some() => return true,
+            '<' if crate::lexer::numeric_range_len(&p, i).is_some() => return true,
             _ => {}
         }
+        i += 1;
     }
     false
 }
@@ -412,6 +436,10 @@ mod tests {
         assert!(matches("(a|b)(c|d)", "bd"));
         assert!(!matches("(a|b)(c|d)", "ab"));
         assert!(matches("a(", "a("));
+        assert!(matches("<->", "123"));
+        assert!(!matches("<->", "12a"));
+        assert!(matches("file<1-3>.txt", "file2.txt"));
+        assert!(!matches("file<1-3>.txt", "file4.txt"));
         assert!(matches("\\(x\\)", "(x)"));
     }
 

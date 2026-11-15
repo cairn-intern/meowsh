@@ -38,28 +38,48 @@ order: `~/.zshenv`, `~/.zprofile` (login), `~/.zshrc` (interactive),
 
 ## zsh startup files
 
-meowsh reads an existing zsh configuration and supports what common
-configs and tool hooks (starship, direnv) generate:
+meowsh reads an existing zsh configuration, including oh-my-zsh, its
+plugins and themes, and the hooks that tools such as starship and direnv
+generate. It sets `$ZSH_VERSION` (to `5.9-meowsh`, so per-version files
+stay apart from real zsh's) and `$MEOWSH_VERSION`. Supported zsh syntax
+and builtins include:
 
-- process substitution `<(...)` and `>(...)`
-- `(( ... ))`, `for (( ; ; ))`, floating-point arithmetic and the
-  `zsh/mathfunc` functions (`int`, `rint`, `floor`, `sqrt`, ...)
+- process substitution `<(...)` and `>(...)`, here-strings `<<<`, `&>`,
+  `&|`, `{ ... } always { ... }`, `{ cmd }` without a closing `;`
+- `(( ... ))`, `for (( ; ; ))`, `for x (list)`, `for k v (list)`,
+  anonymous functions `() { ... } args`, `function a b { ... }`
+- floating-point arithmetic and `zsh/mathfunc` functions (`int`, `rint`,
+  `floor`, `sqrt`, ...)
+- parameter expansion: nested `${${x}[2]}`, flags such as `(s:,:)`,
+  `(j: :)`, `(f)`, `(@)`, `(k)`, `(kv)`, `(o)`, `(u)`, `(q)`, `(Q)`, `(U)`,
+  `(%)`, `(P)`, `(t)`, `(l:n:)`; modifiers `:h`, `:t`, `:r`, `:e`, `:a`,
+  `:A`, `:l`, `:u`, `:q`, `:s/a/b/`; `${a[2,-1]}`, `${^a}`, `${=a}`,
+  `${a:#pat}`, `${a:^b}`; `$name[sub]`, `$+name`, `$#name` without braces
+- subscript flags `(i)`, `(I)`, `(r)`, `(R)`, `(e)`, `(w)` and `^pat`
+- patterns and globs with `(a|b)` groups and `<n-m>` ranges, `**/`, and
+  glob qualifiers such as `(N)`, `(.)`, `(/)`, `(@)`, `(m-1)`, `(D)`
+- `[[ x == (a|b)* ]]` and `[[ -v name[key] ]]`
 - hooks: `precmd`, `preexec`, `chpwd`, `zshexit`, their `*_functions`
   arrays, and `add-zsh-hook`
-- `autoload` of functions from `$fpath`
-- subscript flags `${a[(i)pat]}`, `(I)`, `(r)`, `(R)`, `(e)`
-- `[[ x == (a|b)* ]]` grouped patterns and `[[ -v name[key] ]]`
-- `print`, `{ cmd }` without a closing `;`
+- `autoload` from `$fpath`, `print`, `emulate`, `is-at-least`,
+  `zparseopts`, `fc -l`, `colors`, `unfunction`, `builtin`, `read -k`/`-q`,
+  global aliases (`alias -g`) and the `$aliases`/`$galiases` arrays
+- function-scoped EXIT traps, `LOCAL_OPTIONS`/`LOCAL_TRAPS` (also set by
+  `emulate -L`), `AUTO_CD`, `$0` as the function or sourced file name
 - `$RANDOM`, `$SECONDS`, `$EPOCHSECONDS`, `$EPOCHREALTIME`, `$COLUMNS`,
-  `$LINES`, `$pipestatus`
+  `$LINES`, `$pipestatus`, `$HOST`, `$commands`, `$langinfo`
 - prompts: `$PROMPT`/`$PS1` and `$PROMPT2`/`$PS2` get parameter and
-  command substitution first, then zsh `%` escapes
+  command substitution first, then zsh `%` escapes including `%N<..<`
+  truncation
 
-Lines that source `oh-my-zsh.sh` are skipped, and zsh completion scripts
-(`#compdef`) are not run. `zle`, `bindkey`, `compinit` and `compdef` are
-accepted and do nothing; `RPROMPT` is not shown. Up and Down search
-history for lines starting with the typed text. History is kept in
-`~/.meowsh_history`.
+There is no zle: `zle`, `bindkey`, `compinit`, `compdef` and `zcompile`
+are accepted and do nothing, so zle plugins such as zsh-autosuggestions
+load but stay inactive (meowsh shows its own history suggestions), and
+zsh completion scripts (`#compdef`) are not run. `RPROMPT` is not shown.
+Other zsh options are recorded by `setopt` but have no effect. Up and Down
+search history for lines starting with the typed text. History is kept in
+`~/.meowsh_history`; `$HISTFILE` is not used, so zsh's history file is
+never rewritten in a different format.
 
 ## Using meowsh as your shell
 

@@ -268,6 +268,11 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
         return Ok(Target::Opened(fd));
     }
     let target = expand_string(&r.target).map_err(|_| None)?;
+    if r.op == RedirOp::HereStr {
+        let fd = temp_file_with(format!("{}\n", target).as_bytes())
+            .map_err(|e| Some(format!("here-string: {}", e)))?;
+        return Ok(Target::Opened(fd));
+    }
     let file = |flags| open_file(&target, flags).map(Target::Opened).map_err(Some);
     match r.op {
         RedirOp::DupIn | RedirOp::DupOut => {
@@ -295,7 +300,7 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
         RedirOp::Write | RedirOp::Clobber => file(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC),
         RedirOp::Append => file(libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND),
         RedirOp::ReadWrite => file(libc::O_RDWR | libc::O_CREAT),
-        RedirOp::HereDoc => unreachable!(),
+        RedirOp::HereDoc | RedirOp::HereStr => unreachable!(),
     }
 }
 
@@ -588,7 +593,27 @@ fn exec_node_inner(node: &Node) -> i32 {
             else_body,
         } => exec_if(branches, else_body.as_deref()),
         Node::Loop { cond, body, until } => exec_loop(cond, body, *until),
-        Node::For { var, words, body } => exec_for(var, words.as_deref(), body),
+        Node::For { vars, words, body } => exec_for(vars, words.as_deref(), body),
+        Node::Disowned(inner) => exec_node(inner),
+        Node::Always { body, always } => {
+            let st = exec_node(body);
+            // The cleanup runs even after break, return or an error; a
+            // pending flow resumes afterwards unless the cleanup sets one.
+            let pending = flow();
+            set_flow(Flow::None);
+            exec_node(always);
+            if flow() == Flow::None {
+                set_flow(pending);
+            }
+            st
+        }
+        Node::AnonFunc { body, args } => match expand_words(args) {
+            Ok(mut words) => {
+                words.insert(0, "(anon)".to_string());
+                call_function(body, &words)
+            }
+            Err(e) => expansion_failed(e),
+        },
         Node::Arith(expr) => {
             let st = arith_status(expr);
             check_errexit(st);
@@ -708,6 +733,24 @@ fn run_command(
             return 0;
         }
     }
+    // zsh/bash `builtin name ...` runs the builtin even if a function or
+    // alias shadows it.
+    let mut builtin_only = false;
+    if words[0] == "builtin" {
+        words.remove(0);
+        if words.is_empty() {
+            return 0;
+        }
+        if !crate::builtins::is_builtin(&words[0]) {
+            err_line(&format!(
+                "meowsh: builtin: {}: not a shell builtin",
+                words[0]
+            ));
+            return 1;
+        }
+        builtin_only = true;
+        skip_functions = true;
+    }
     let name = words[0].clone();
 
     if name == "exec" && !skip_functions {
@@ -754,7 +797,7 @@ fn run_command(
         return st;
     }
 
-    if crate::builtins::is_builtin(&name) {
+    if builtin_only || crate::builtins::is_builtin(&name) {
         let tmp = match TempVars::set(assigns) {
             Ok(t) => t,
             Err(st) => return st,
@@ -769,6 +812,16 @@ fn run_command(
         };
         tmp.restore();
         return st;
+    }
+
+    // zsh AUTO_CD: a directory name typed as a command changes to it.
+    if words.len() == 1
+        && interactive()
+        && with_shell(|s| s.named_opts.get("autocd").copied().unwrap_or(false))
+        && crate::shell::find_command(&name).is_none()
+        && std::path::Path::new(&name).is_dir()
+    {
+        return crate::builtins::run("cd", &["cd".to_string(), name]);
     }
 
     let overrides: Vec<(String, String)> = assigns
@@ -831,6 +884,56 @@ fn exec_builtin(args: &[String], assigns: &[Expanded], redirs: &[Redir]) -> i32 
     exec_external(args, &env)
 }
 
+type Frame = (
+    std::collections::HashMap<i32, String>,
+    u32,
+    std::collections::HashMap<String, bool>,
+);
+
+// zsh function scoping: an EXIT trap set inside a function runs when it
+// returns; with LOCAL_TRAPS / LOCAL_OPTIONS (also set by `emulate -L`)
+// traps / options go back to their values at entry.
+fn restore_function_frame(entry: Frame, status: i32) {
+    let (traps, opts, named) = entry;
+    let (local_traps, local_opts, exit_action) = with_shell(|s| {
+        let on = |k: &str| s.named_opts.get(k).copied().unwrap_or(false);
+        let exit = s.traps.get(&0).cloned();
+        let changed = exit != traps.get(&0).cloned();
+        (
+            on("localtraps"),
+            on("localoptions"),
+            exit.filter(|_| changed),
+        )
+    });
+    if exit_action.is_some() || local_traps {
+        let current = with_shell(|s| s.traps.clone());
+        let mut sigs: Vec<i32> = current.keys().chain(traps.keys()).copied().collect();
+        sigs.sort();
+        sigs.dedup();
+        for sig in sigs {
+            let before = traps.get(&sig).cloned();
+            if (local_traps || sig == 0) && current.get(&sig) != before.as_ref() {
+                crate::trap::set_trap(sig, before);
+            }
+        }
+    }
+    if local_opts {
+        with_shell(|s| {
+            s.opts = opts;
+            s.named_opts = named;
+        });
+    }
+    if let Some(action) = exit_action {
+        with_shell(|s| s.last_status = status);
+        let pending = flow();
+        set_flow(Flow::None);
+        crate::trap::run_action(&action);
+        if flow() == Flow::None || matches!(flow(), Flow::Return(_)) {
+            set_flow(pending);
+        }
+    }
+}
+
 pub fn call_function(body: &Arc<Node>, words: &[String]) -> i32 {
     let depth = with_shell(|s| s.func_depth);
     if depth >= MAX_FUNC_DEPTH {
@@ -840,14 +943,17 @@ pub fn call_function(body: &Arc<Node>, words: &[String]) -> i32 {
         ));
         return 1;
     }
-    let (saved_params, saved_loops) = with_shell(|s| {
+    // zsh (FUNCTION_ARGZERO): $0 is the function name while it runs.
+    let (saved_params, saved_loops, saved_argv0) = with_shell(|s| {
         s.func_depth += 1;
         let loops = std::mem::replace(&mut s.loop_depth, 0);
         (
             std::mem::replace(&mut s.pos_params, words[1..].to_vec()),
             loops,
+            std::mem::replace(&mut s.argv0, words[0].clone()),
         )
     });
+    let entry = with_shell(|s| (s.traps.clone(), s.opts, s.named_opts.clone()));
     push_scope();
     let mut st = exec_node(body);
     with_shell(|s| {
@@ -856,10 +962,12 @@ pub fn call_function(body: &Arc<Node>, words: &[String]) -> i32 {
             s.flow = Flow::None;
         }
     });
+    restore_function_frame(entry, st);
     pop_scope();
     with_shell(|s| {
         s.pos_params = saved_params;
         s.loop_depth = saved_loops;
+        s.argv0 = saved_argv0;
         s.func_depth -= 1;
         s.last_status = st;
     });
@@ -1036,6 +1144,10 @@ fn exec_list(items: &[ListItem]) -> i32 {
 }
 
 fn exec_background(node: &Node) -> i32 {
+    let (node, disown) = match node {
+        Node::Disowned(inner) => (inner.as_ref(), true),
+        n => (n, false),
+    };
     let jc = with_shell(|s| s.job_control);
     let pid = fork_process(ForkKind::Background);
     if pid == 0 {
@@ -1053,6 +1165,9 @@ fn exec_background(node: &Node) -> i32 {
         return 1;
     }
     with_shell(|s| s.last_bg_pid = pid);
+    if disown {
+        return 0;
+    }
     let id = add_job(pid, &[pid], JobState::Running, &describe(node));
     if interactive() {
         err_line(&format!("[{}] {}", id, pid));
@@ -1129,7 +1244,7 @@ fn exec_loop(cond: &Node, body: &Node, until: bool) -> i32 {
     status
 }
 
-fn exec_for(var: &str, words: Option<&[String]>, body: &Node) -> i32 {
+fn exec_for(vars: &[String], words: Option<&[String]>, body: &Node) -> i32 {
     let items = match words {
         Some(ws) => match expand_words(ws) {
             Ok(v) => v,
@@ -1139,8 +1254,12 @@ fn exec_for(var: &str, words: Option<&[String]>, body: &Node) -> i32 {
     };
     let mut status = 0;
     with_shell(|s| s.loop_depth += 1);
-    for item in items {
-        if !var_set(var, &item, false) {
+    for chunk in items.chunks(vars.len().max(1)) {
+        let ok = vars
+            .iter()
+            .enumerate()
+            .all(|(k, v)| var_set(v, chunk.get(k).map(|s| s.as_str()).unwrap_or(""), false));
+        if !ok {
             status = 1;
             break;
         }
@@ -1236,6 +1355,11 @@ fn exec_case(word: &str, items: &[CaseItem]) -> i32 {
 /// defined by earlier commands apply to later ones. Used for `-c`,
 /// `eval`, `.`, and trap actions.
 pub fn run_string(src: &str) -> i32 {
+    run_string_named(src, None)
+}
+
+/// Like `run_string`; syntax errors name `file` and the line.
+pub fn run_string_named(src: &str, file: Option<&str>) -> i32 {
     let mut parser = Parser::new(src, true);
     let mut status = 0;
     loop {
@@ -1253,7 +1377,10 @@ pub fn run_string(src: &str) -> i32 {
                     ParseError::Syntax(m) => m,
                     ParseError::Incomplete => "syntax error: unexpected end of file".to_string(),
                 };
-                err_line(&format!("meowsh: {}", msg));
+                match file {
+                    Some(f) => err_line(&format!("meowsh: {}:{}: {}", f, parser.line(), msg)),
+                    None => err_line(&format!("meowsh: {}", msg)),
+                }
                 status = 2;
                 with_shell(|s| s.last_status = 2);
                 break;
@@ -1537,7 +1664,7 @@ mod tests {
         shell.zstyles.clear();
         shell.functions.clear();
         shell.local_scopes.clear();
-        shell.aliases.clear();
+        shell.alias_map(false).clear();
         shell.pos_params.clear();
         shell.last_status = 0;
         shell.loop_depth = 0;
@@ -1553,12 +1680,13 @@ mod tests {
     }
 
     #[test]
-    fn test_local_outside_function_errors() {
+    fn test_local_outside_function_acts_like_typeset() {
+        // zsh accepts `local` at the top level of a sourced file.
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_shell();
         execute_line("local x=1");
-        assert_eq!(last_status(), 1);
-        assert!(var("x").is_none());
+        assert_eq!(last_status(), 0);
+        assert_eq!(var("x").as_deref(), Some("1"));
     }
 
     #[test]

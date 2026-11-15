@@ -204,7 +204,8 @@ pub fn run_pending() {
     }
 }
 
-fn run_action(action: &str) {
+/// Runs a trap action with `$?` preserved.
+pub fn run_action(action: &str) {
     IN_TRAP.store(true, Ordering::SeqCst);
     let saved = with_shell(|s| s.last_status);
     crate::exec::run_string(action);

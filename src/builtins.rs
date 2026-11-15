@@ -66,6 +66,17 @@ const REGULAR: &[&str] = &[
     "emulate",
     "print",
     "zle",
+    "zcompile",
+    "zrecompile",
+    "builtin",
+    "unfunction",
+    "is-at-least",
+    "zparseopts",
+    "fc",
+    "colors",
+    "bashcompinit",
+    "complete",
+    "compctl",
 ];
 
 const KEYWORDS: &[&str] = &[
@@ -137,7 +148,16 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "print" => builtin_print(words),
         // Accepted for zsh startup-file compatibility; no effect. There is
         // no zle, so widgets defined with `zle -N` never run.
-        "bindkey" | "compinit" | "compdef" | "compaudit" | "zmodload" | "emulate" | "zle" => 0,
+        "emulate" => builtin_emulate(words),
+        "unfunction" => {
+            builtin_unset(&[&["unset".to_string(), "-f".to_string()], &words[1..]].concat())
+        }
+        "is-at-least" => builtin_is_at_least(words),
+        "zparseopts" => builtin_zparseopts(words),
+        "fc" => builtin_fc(words),
+        "colors" => builtin_colors(),
+        "bindkey" | "compinit" | "compdef" | "compaudit" | "zmodload" | "zle" | "zcompile"
+        | "zrecompile" | "bashcompinit" | "complete" | "compctl" => 0,
         _ => {
             err_line(&format!("meowsh: {}: not a builtin", name));
             1
@@ -272,10 +292,15 @@ pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
         return 0;
     }
     let saved = args.map(|a| with_shell(|s| std::mem::replace(&mut s.pos_params, a.to_vec())));
-    with_shell(|s| s.source_depth += 1);
-    let mut st = run_string(&content);
+    // zsh: $0 is the sourced file while it runs.
+    let saved_argv0 = with_shell(|s| {
+        s.source_depth += 1;
+        std::mem::replace(&mut s.argv0, path.to_string())
+    });
+    let mut st = crate::exec::run_string_named(&content, Some(path));
     with_shell(|s| {
         s.source_depth -= 1;
+        s.argv0 = saved_argv0;
         if let Flow::Return(n) = s.flow {
             st = n;
             s.flow = Flow::None;
@@ -598,9 +623,9 @@ fn builtin_shift(words: &[String]) -> i32 {
 }
 
 fn builtin_local(words: &[String]) -> i32 {
+    // zsh accepts `local` outside a function; it then acts like typeset.
     if !in_function_scope() {
-        err_line("meowsh: local: can only be used in a function");
-        return 1;
+        return builtin_typeset(words);
     }
     for arg in &words[1..] {
         if arg.starts_with('-') {
@@ -789,6 +814,8 @@ fn read_split(chars: &[(char, bool)], ifs: &str, n: usize) -> Vec<String> {
 }
 
 fn builtin_read(words: &[String]) -> i32 {
+    let mut keys: Option<usize> = None;
+    let mut yes_no = false;
     let mut raw = false;
     let mut prompt = None;
     let mut delim = b'\n';
@@ -816,7 +843,28 @@ fn builtin_read(words: &[String]) -> i32 {
                 's' => {}
                 'p' => prompt = take_arg(),
                 'd' => delim = take_arg().and_then(|d| d.bytes().next()).unwrap_or(0),
-                'a' => array = take_arg(),
+                'a' | 'A' => array = take_arg(),
+                // zsh: -k [n] reads n characters, -q one y/n answer.
+                'k' => {
+                    let rest: String = chars.by_ref().collect();
+                    keys = Some(if !rest.is_empty() {
+                        rest.parse().unwrap_or(1)
+                    } else if let Some(n) = words.get(i + 1).and_then(|w| w.parse::<usize>().ok()) {
+                        i += 1;
+                        n
+                    } else {
+                        1
+                    });
+                }
+                'q' => {
+                    keys = Some(1);
+                    yes_no = true;
+                }
+                // zsh: -E echo the line, -t timeout; accepted and ignored.
+                'E' => {}
+                't' => {
+                    take_arg();
+                }
                 _ => return usage("read", &format!("-{}: invalid option", c)),
             }
         }
@@ -833,6 +881,23 @@ fn builtin_read(words: &[String]) -> i32 {
         if unsafe { libc::isatty(0) } == 1 {
             let _ = crate::sys::write_fd(2, p.as_bytes());
         }
+    }
+
+    if let Some(n) = keys {
+        let text = match read_chars(n) {
+            Some(t) => t,
+            None => return 1,
+        };
+        let target = names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "REPLY".to_string());
+        if yes_no {
+            let yes = matches!(text.as_str(), "y" | "Y");
+            var_set(&target, if yes { "y" } else { "n" }, false);
+            return if yes { 0 } else { 1 };
+        }
+        return if var_set(&target, &text, false) { 0 } else { 2 };
     }
 
     let mut bytes: Vec<u8> = Vec::new();
@@ -904,6 +969,41 @@ fn builtin_read(words: &[String]) -> i32 {
     } else {
         1
     }
+}
+
+// Reads `n` characters from standard input, from a terminal without
+// waiting for Enter. None at end of input.
+fn read_chars(n: usize) -> Option<String> {
+    let tty = unsafe { libc::isatty(0) } == 1;
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if tty && unsafe { libc::tcgetattr(0, &mut saved) } == 0 {
+        let mut raw = saved;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) };
+    }
+    let mut bytes = Vec::new();
+    let mut count = 0;
+    while count < n {
+        match read_byte(0) {
+            Ok(Some(b)) => {
+                bytes.push(b);
+                // Count a character once its UTF-8 sequence is complete.
+                if std::str::from_utf8(&bytes).is_ok() {
+                    count = String::from_utf8_lossy(&bytes).chars().count();
+                }
+            }
+            _ => break,
+        }
+    }
+    if tty {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+    }
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---- getopts --------------------------------------------------------------
@@ -1257,18 +1357,29 @@ fn builtin_history() -> i32 {
 // ---- aliases --------------------------------------------------------------
 
 fn builtin_alias(words: &[String]) -> i32 {
-    let args = &words[1..];
-    if args.is_empty() || (args.len() == 1 && args[0] == "-p") {
-        let mut all: Vec<(String, String)> = with_shell(|s| {
-            s.aliases
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        });
+    let mut args = &words[1..];
+    let mut global = false;
+    // -g global (zsh), -s suffix (accepted, treated as global), -L/-p list.
+    while let Some(a) = args.first() {
+        match a.as_str() {
+            "-g" | "-s" => global = true,
+            "-p" | "-L" | "-r" | "+g" => {}
+            "--" => {
+                args = &args[1..];
+                break;
+            }
+            _ => break,
+        }
+        args = &args[1..];
+    }
+    let table = |s: &mut crate::types::Shell| s.alias_map(global).clone();
+    if args.is_empty() {
+        let mut all: Vec<(String, String)> = with_shell(|s| table(s).into_iter().collect());
         all.sort();
+        let flag = if global { "-g " } else { "" };
         let text: String = all
             .iter()
-            .map(|(k, v)| format!("alias {}={}\n", k, shell_quote(v)))
+            .map(|(k, v)| format!("alias {}{}={}\n", flag, k, shell_quote(v)))
             .collect();
         out(&text);
         return 0;
@@ -1277,10 +1388,10 @@ fn builtin_alias(words: &[String]) -> i32 {
     for a in args {
         match a.find('=') {
             Some(i) => {
-                let (name, value) = (&a[..i], &a[i + 1..]);
-                with_shell(|s| s.aliases.insert(name.to_string(), value.to_string()));
+                let (name, value) = (a[..i].to_string(), a[i + 1..].to_string());
+                with_shell(|s| s.alias_map(global).insert(name, value));
             }
-            None => match with_shell(|s| s.aliases.get(a.as_str()).cloned()) {
+            None => match with_shell(|s| table(s).get(a.as_str()).cloned()) {
                 Some(v) => {
                     out(&format!("alias {}={}\n", a, shell_quote(&v)));
                 }
@@ -1298,10 +1409,20 @@ fn builtin_unalias(words: &[String]) -> i32 {
     let mut status = 0;
     for a in &words[1..] {
         if a == "-a" {
-            with_shell(|s| s.aliases.clear());
+            with_shell(|s| {
+                s.alias_map(false).clear();
+                s.alias_map(true).clear();
+            });
             continue;
         }
-        if with_shell(|s| s.aliases.remove(a.as_str())).is_none() {
+        if a.starts_with('-') {
+            continue;
+        }
+        let removed = with_shell(|s| {
+            s.alias_map(false).remove(a.as_str()).is_some()
+                | s.alias_map(true).remove(a.as_str()).is_some()
+        });
+        if !removed {
             err_line(&format!("meowsh: unalias: {}: not found", a));
             status = 1;
         }
@@ -1312,7 +1433,7 @@ fn builtin_unalias(words: &[String]) -> i32 {
 // ---- command lookup -------------------------------------------------------
 
 fn describe_command(name: &str, verbose: bool) -> Option<String> {
-    if let Some(v) = with_shell(|s| s.aliases.get(name).cloned()) {
+    if let Some(v) = with_shell(|s| s.alias(name, false).cloned()) {
         return Some(if verbose {
             format!("{} is an alias for {}", name, v)
         } else {
@@ -2049,6 +2170,360 @@ pub fn run_hooks(hook: &str, args: &[String]) {
     restore();
 }
 
+// fc -l [-n] [-r] [-d|-f|-E|-i|-t fmt] [first [last]]: lists history.
+// Other forms (editing, -p/-P/-R/-W/-A history files) are accepted and
+// do nothing.
+fn builtin_fc(words: &[String]) -> i32 {
+    let (mut list, mut numbers, mut reverse) = (false, true, false);
+    let mut range = Vec::new();
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        if a == "--" {
+            range.extend(words[i + 1..].iter().cloned());
+            break;
+        }
+        match a
+            .strip_prefix('-')
+            .filter(|f| !f.is_empty() && !f.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            Some(flags) => {
+                for c in flags.chars() {
+                    match c {
+                        'l' => list = true,
+                        'n' => numbers = false,
+                        'r' => reverse = true,
+                        't' => i += 1,
+                        _ => {}
+                    }
+                }
+            }
+            None if a.is_empty() => {}
+            None => range.push(a.clone()),
+        }
+        i += 1;
+    }
+    if !list {
+        return 0;
+    }
+    let lines = with_shell(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    let n = lines.len() as i64;
+    let pos = |spec: &str, default: i64| -> i64 {
+        match spec.parse::<i64>() {
+            Ok(k) if k < 0 => (n + k + 1).max(1),
+            Ok(k) => k.max(1),
+            Err(_) => lines
+                .iter()
+                .rposition(|l| l.starts_with(spec))
+                .map(|k| k as i64 + 1)
+                .unwrap_or(default),
+        }
+    };
+    let first = range.first().map(|f| pos(f, 1)).unwrap_or((n - 15).max(1));
+    let last = range.get(1).map(|l| pos(l, n)).unwrap_or(n);
+    let mut picked: Vec<(i64, &String)> = (first..=last.min(n))
+        .filter_map(|k| lines.get((k - 1) as usize).map(|l| (k, l)))
+        .collect();
+    if reverse {
+        picked.reverse();
+    }
+    let text: String = picked
+        .iter()
+        .map(|(k, l)| {
+            if numbers {
+                format!("{:5}  {}\n", k, l)
+            } else {
+                format!("{}\n", l)
+            }
+        })
+        .collect();
+    out(&text);
+    0
+}
+
+fn drop_unknown_escapes(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&n) = chars.peek() {
+                if !n.is_alphanumeric() {
+                    out.push(n);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+// zparseopts [-D] [-E] [-F] [-K] [-M] [-a array] [-A assoc] [--] spec...
+// Parses options from the positional parameters. A spec is
+// name[+][:|::][=array]; matched options are stored as `-name` (and the
+// argument) in the spec's array or the -a array, and as keys in -A.
+fn builtin_zparseopts(words: &[String]) -> i32 {
+    struct Spec {
+        name: String,
+        arg: u8, // 0 none, 1 required, 2 optional (attached only)
+        append: bool,
+        array: Option<String>,
+    }
+    let (mut delete, mut extract, mut fail_unknown, mut keep) = (false, false, false, false);
+    let (mut def_array, mut assoc) = (None::<String>, None::<String>);
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        match a.as_str() {
+            "-D" => delete = true,
+            "-E" => extract = true,
+            "-F" => fail_unknown = true,
+            "-K" => keep = true,
+            "-M" => {}
+            "-a" => {
+                i += 1;
+                def_array = words.get(i).cloned();
+            }
+            "-A" => {
+                i += 1;
+                assoc = words.get(i).cloned();
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    let mut specs = Vec::new();
+    for raw in &words[i.min(words.len())..] {
+        let (body, array) = match raw.split_once('=') {
+            Some((b, a)) => (b, Some(a.to_string())),
+            None => (raw.as_str(), None),
+        };
+        let mut name = body.to_string();
+        let mut arg = 0;
+        if let Some(n) = name.strip_suffix("::") {
+            name = n.to_string();
+            arg = 2;
+        } else if let Some(n) = name.strip_suffix(":-").or_else(|| name.strip_suffix(':')) {
+            name = n.to_string();
+            arg = 1;
+        }
+        let append = name.ends_with('+') && name.len() > 1;
+        if append {
+            name.pop();
+        }
+        specs.push(Spec {
+            name,
+            arg,
+            append,
+            array,
+        });
+    }
+    let params = with_shell(|s| s.pos_params.clone());
+    let mut results: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut assoc_out: Vec<(String, String)> = Vec::new();
+    let mut kept = Vec::new();
+    let mut k = 0;
+    while k < params.len() {
+        let p = &params[k];
+        if p == "-" || p == "--" {
+            if !delete {
+                kept.push(p.clone());
+            }
+            kept.extend(params[k + 1..].iter().cloned());
+            break;
+        }
+        let Some(opt) = p.strip_prefix('-').filter(|o| !o.is_empty()) else {
+            kept.push(p.clone());
+            if !extract {
+                kept.extend(params[k + 1..].iter().cloned());
+                break;
+            }
+            k += 1;
+            continue;
+        };
+        // Longest spec name that the option starts with.
+        let found = specs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| opt == s.name || (s.arg > 0 && opt.starts_with(&s.name)))
+            .max_by_key(|(_, s)| s.name.len());
+        let Some((idx, spec)) = found else {
+            if fail_unknown {
+                err_line(&format!("meowsh: zparseopts: bad option: {}", p));
+                return 1;
+            }
+            kept.push(p.clone());
+            if !extract {
+                kept.extend(params[k + 1..].iter().cloned());
+                break;
+            }
+            k += 1;
+            continue;
+        };
+        let mut vals = vec![format!("-{}", spec.name)];
+        let attached = &opt[spec.name.len()..];
+        let mut value = None;
+        if spec.arg > 0 {
+            if !attached.is_empty() {
+                value = Some(attached.to_string());
+            } else if spec.arg == 1 {
+                k += 1;
+                match params.get(k) {
+                    Some(v) => value = Some(v.clone()),
+                    None => {
+                        err_line(&format!(
+                            "meowsh: zparseopts: missing argument for option: {}",
+                            p
+                        ));
+                        return 1;
+                    }
+                }
+            }
+        }
+        if let Some(v) = &value {
+            vals.push(v.clone());
+        }
+        assoc_out.push((format!("-{}", spec.name), value.unwrap_or_default()));
+        match results.iter_mut().find(|(j, _)| *j == idx) {
+            Some((_, existing)) if spec.append => existing.extend(vals),
+            Some((_, existing)) => *existing = vals,
+            None => results.push((idx, vals)),
+        }
+        k += 1;
+    }
+    let mut default_items = Vec::new();
+    for (idx, vals) in &results {
+        match &specs[*idx].array {
+            Some(arr) => {
+                array_set(arr, vals.clone());
+            }
+            None => default_items.extend(vals.iter().cloned()),
+        }
+    }
+    if let Some(arr) = def_array {
+        if !(keep && default_items.is_empty()) {
+            array_set(&arr, default_items);
+        }
+    }
+    if let Some(name) = assoc {
+        assoc_declare(&name);
+        for (key, v) in assoc_out {
+            crate::shell::assoc_set(&name, &key, &v);
+        }
+    }
+    if delete {
+        with_shell(|s| s.pos_params = kept);
+    }
+    0
+}
+
+// is-at-least min [version]: true if version (default $ZSH_VERSION) is
+// at least min, comparing the numeric parts of each `.`/`-` component.
+fn builtin_is_at_least(words: &[String]) -> i32 {
+    let Some(min) = words.get(1) else {
+        return usage("is-at-least", "usage: is-at-least min [version]");
+    };
+    let have = words
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| var_get("ZSH_VERSION"));
+    let parts = |v: &str| -> Vec<u64> {
+        v.split(['.', '-'])
+            .map(|p| {
+                let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse().unwrap_or(0)
+            })
+            .collect()
+    };
+    let (a, b) = (parts(&have), parts(min));
+    for k in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(k).copied().unwrap_or(0),
+            b.get(k).copied().unwrap_or(0),
+        );
+        if x != y {
+            return if x > y { 0 } else { 1 };
+        }
+    }
+    0
+}
+
+// zsh's `colors` function: $fg, $bg, $fg_bold, $fg_no_bold, $bg_bold,
+// $bg_no_bold and $color tables, and $reset_color.
+fn builtin_colors() -> i32 {
+    const NAMES: [&str; 8] = [
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    ];
+    let mut tables: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+    let mk = |f: &dyn Fn(usize) -> String| -> Vec<(String, String)> {
+        NAMES
+            .iter()
+            .enumerate()
+            .flat_map(|(k, n)| {
+                let v = f(k);
+                [(n.to_string(), v.clone()), (n.to_uppercase(), v)]
+            })
+            .collect()
+    };
+    tables.push(("fg", mk(&|k| format!("\x1b[{}m", 30 + k))));
+    tables.push(("bg", mk(&|k| format!("\x1b[{}m", 40 + k))));
+    tables.push(("fg_bold", mk(&|k| format!("\x1b[01;{}m", 30 + k))));
+    tables.push(("fg_no_bold", mk(&|k| format!("\x1b[22;{}m", 30 + k))));
+    tables.push(("bg_bold", mk(&|k| format!("\x1b[01;{}m", 40 + k))));
+    tables.push(("bg_no_bold", mk(&|k| format!("\x1b[22;{}m", 40 + k))));
+    let mut color: Vec<(String, String)> = Vec::new();
+    for (k, n) in NAMES.iter().enumerate() {
+        color.push((n.to_string(), (30 + k).to_string()));
+        color.push((format!("bg-{}", n), (40 + k).to_string()));
+    }
+    for (n, c) in [
+        ("reset", 0),
+        ("bold", 1),
+        ("faint", 2),
+        ("italic", 3),
+        ("underline", 4),
+        ("blink", 5),
+        ("reverse", 7),
+        ("normal", 22),
+    ] {
+        color.push((n.to_string(), c.to_string()));
+    }
+    tables.push(("color", color));
+    for (name, entries) in tables {
+        assoc_declare(name);
+        for (k, v) in entries {
+            crate::shell::assoc_set(name, &k, &v);
+        }
+    }
+    var_set("reset_color", "\x1b[00m", false);
+    var_set("bold_color", "\x1b[01m", false);
+    0
+}
+
+// emulate: meowsh always behaves as zsh here. With no arguments it
+// reports the mode; `-c cmd` runs cmd; option changes are ignored.
+fn builtin_emulate(words: &[String]) -> i32 {
+    if words.len() == 1 {
+        out("zsh\n");
+        return 0;
+    }
+    if words.iter().any(|w| w == "-L") {
+        for o in ["localoptions", "localtraps", "localpatterns"] {
+            toggle_named_opt(o, true);
+        }
+    }
+    match words.iter().position(|w| w == "-c") {
+        Some(k) => match words.get(k + 1) {
+            Some(cmd) => run_string(cmd),
+            None => usage("emulate", "-c requires an argument"),
+        },
+        None => 0,
+    }
+}
+
 // add-zsh-hook [-d] hook function
 fn builtin_add_zsh_hook(words: &[String]) -> i32 {
     let mut args: Vec<&str> = words[1..].iter().map(|s| s.as_str()).collect();
@@ -2142,6 +2617,11 @@ fn builtin_print(words: &[String]) -> i32 {
             t = crate::expand::decode_escapes(&t);
         }
         if prompt {
+            // Backslashes that quoted prompt characters (as `${x:q}`
+            // leaves them) are dropped before prompt expansion.
+            if !raw {
+                t = drop_unknown_escapes(&t);
+            }
             t = crate::shell::expand_prompt(&t);
         }
         parts.push(t);

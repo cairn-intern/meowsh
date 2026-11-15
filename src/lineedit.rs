@@ -49,7 +49,12 @@ impl MeowshHelper {
         if is_cmd_position {
             let current = parts.last().unwrap_or(&"");
 
-            for name in shell.aliases.keys() {
+            let aliases: Vec<String> = shell
+                .assoc_arrays
+                .get(crate::types::ALIASES)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            for name in &aliases {
                 if self.fuzzy_match(current, name) {
                     completions.push(rustyline::completion::Pair {
                         display: name.clone(),
