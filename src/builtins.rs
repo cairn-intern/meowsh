@@ -103,7 +103,7 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "break" => builtin_break(words, true),
         "continue" => builtin_break(words, false),
         "." | "source" => builtin_source(words),
-        "eval" => run_string(&words[1..].join(" ")),
+        "eval" => builtin_eval(words),
         "exit" => builtin_exit(words),
         "export" => builtin_export(words),
         "readonly" => builtin_readonly(words),
@@ -212,6 +212,22 @@ fn builtin_break(words: &[String], is_break: bool) -> i32 {
     0
 }
 
+// zsh: an error inside eval ends the eval with status 1 instead of
+// leaving the shell.
+fn builtin_eval(words: &[String]) -> i32 {
+    let st = run_string(&words[1..].join(" "));
+    with_shell(|s| {
+        if s.error_exit {
+            s.error_exit = false;
+            if matches!(s.flow, Flow::Exit(_)) {
+                s.flow = Flow::None;
+                return 1;
+            }
+        }
+        st
+    })
+}
+
 fn builtin_exit(words: &[String]) -> i32 {
     let code = match words.get(1) {
         None => last_status(),
@@ -223,6 +239,7 @@ fn builtin_exit(words: &[String]) -> i32 {
             }
         },
     };
+    with_shell(|s| s.error_exit = false);
     set_flow(Flow::Exit(code));
     code
 }

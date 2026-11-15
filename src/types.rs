@@ -117,6 +117,9 @@ pub struct Shell {
     // (conditions, non-final AND-OR elements, negated pipelines).
     pub errexit_suppressed: usize,
     pub flow: Flow,
+    // The pending Flow::Exit comes from an error (expansion, assignment,
+    // redirection) rather than `exit`; `eval` stops it, as in zsh.
+    pub error_exit: bool,
     // Exit status of the last command substitution in the current simple
     // command; becomes `$?` when the command has no command name.
     pub last_cmdsub_status: Option<i32>,
@@ -174,6 +177,7 @@ impl Shell {
             source_depth: 0,
             errexit_suppressed: 0,
             flow: Flow::None,
+            error_exit: false,
             last_cmdsub_status: None,
             getopts_pos: 0,
             local_scopes: Vec::new(),

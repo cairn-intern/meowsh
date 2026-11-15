@@ -103,3 +103,12 @@ cargo fmt --check
 RUSTFLAGS="-Dwarnings" cargo clippy --all-targets
 cargo test
 ```
+
+To measure zsh compatibility, run zsh's own test suite (`Test/*.ztst` in a
+zsh source checkout) against a release build:
+
+```bash
+cargo build --release
+python3 scripts/ztst.py --zsh-src ../zsh            # summary per file
+python3 scripts/ztst.py --zsh-src ../zsh -v D04parameter  # show failures
+```

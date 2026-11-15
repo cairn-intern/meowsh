@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Run zsh's own test suite (Test/*.ztst) against meowsh.
+
+Usage:
+    python3 scripts/ztst.py --zsh-src PATH [--meowsh BIN] [-v] [FILE...]
+
+PATH is a zsh source checkout. FILE names select test files (for example
+`A01grammar` or `D04parameter.ztst`); by default all are run.
+
+Each .ztst file becomes one meowsh script, so shell state carries from one
+test to the next as in zsh's harness (Test/ztst.zsh). Every chunk runs as
+`() { eval "$code" }` with its stdin, stdout, stderr and status captured
+in files, then compared here. The harness itself runs in Python so a bug
+in meowsh cannot break it. Tests run in a temporary copy of Test/, where
+`Src/zsh` is a link to meowsh.
+
+A test passes when status and stdout match and, unless flagged `D`,
+stderr matches. "stdout-only" counts tests whose status and stdout match
+but whose stderr differs, which is mostly wording of error messages.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+STATUS_RE = re.compile(r"^([-0-9]+)([A-Za-z]*)(?::(.*))?$")
+
+
+class Case:
+    def __init__(self, code, line):
+        self.code = code
+        self.line = line
+        self.status = "-"
+        self.flags = ""
+        self.message = ""
+        self.stdin = None
+        self.out = None
+        self.err = None
+        self.out_pat = False
+        self.err_pat = False
+
+
+def parse(path):
+    """Returns (prep chunks, test cases, clean chunks)."""
+    with open(path, encoding="utf-8", errors="surrogateescape") as f:
+        lines = f.read().split("\n")
+    prep, tests, clean = [], [], []
+    section = None
+    i = 0
+    n = len(lines)
+
+    def is_code(s):
+        return bool(s) and s[0] in " \t" and s.strip() != ""
+
+    def blank(s):
+        return s.strip() == ""
+
+    while i < n:
+        line = lines[i]
+        if line.startswith("%"):
+            section = line[1:].split()[0] if line[1:].split() else None
+            i += 1
+            continue
+        if line.startswith("#") or blank(line):
+            i += 1
+            continue
+        if section in ("prep", "clean"):
+            if is_code(line):
+                start = i
+                code = []
+                while i < n and is_code(lines[i]):
+                    code.append(lines[i])
+                    i += 1
+                (prep if section == "prep" else clean).append(("\n".join(code), start + 1))
+                continue
+            i += 1
+            continue
+        if section != "test":
+            i += 1
+            continue
+        if not is_code(line):
+            i += 1
+            continue
+        start = i
+        code = []
+        while i < n and is_code(lines[i]):
+            code.append(lines[i])
+            i += 1
+        case = Case("\n".join(code), start + 1)
+        if i < n:
+            m = STATUS_RE.match(lines[i])
+            if m:
+                case.status, case.flags = m.group(1), m.group(2)
+                case.message = m.group(3) or ""
+                i += 1
+        redirs = {"<": [], ">": [], "?": []}
+        while i < n:
+            l = lines[i]
+            if l.startswith("*>") or l.startswith("*?"):
+                if l[1] == ">":
+                    case.out_pat = True
+                else:
+                    case.err_pat = True
+                l = l[1:]
+            if l[:1] in redirs:
+                redirs[l[0]].append(l[1:])
+                i += 1
+                continue
+            if l.startswith("F:"):
+                i += 1
+                continue
+            break
+        case.stdin = "\n".join(redirs["<"]) + "\n" if redirs["<"] else ""
+        case.out = "\n".join(redirs[">"]) + "\n" if redirs[">"] else ""
+        case.err = "\n".join(redirs["?"]) + "\n" if redirs["?"] else ""
+        tests.append(case)
+    return prep, tests, clean
+
+
+def zsh_glob_to_regex(p):
+    """Translates the zsh pattern syntax used in `*>` lines to a regex."""
+    out = []
+    i = 0
+    while i < len(p):
+        c = p[i]
+        if c == "\\" and i + 1 < len(p):
+            out.append(re.escape(p[i + 1]))
+            i += 2
+            continue
+        if c == "*":
+            out.append(".*")
+        elif c == "?":
+            out.append(".")
+        elif c == "[":
+            j = p.find("]", i + 2)
+            if j < 0:
+                out.append(re.escape(c))
+            else:
+                body = p[i + 1 : j]
+                if body.startswith(("!", "^")):
+                    body = "^" + body[1:]
+                body = body.replace("[:digit:]", r"\d").replace("[:space:]", r"\s")
+                body = body.replace("[:alpha:]", "a-zA-Z").replace("[:alnum:]", "a-zA-Z0-9")
+                out.append("[" + body + "]")
+                i = j
+        elif c == "(":
+            out.append("(?:")
+        elif c == ")":
+            out.append(")")
+        elif c == "|":
+            out.append("|")
+        elif c == "#":
+            if i + 1 < len(p) and p[i + 1] == "#":
+                out.append("+")
+                i += 1
+            else:
+                out.append("*")
+        elif c == "<":
+            m = re.match(r"<(\d*)-(\d*)>", p[i:])
+            if m:
+                out.append(r"\d+")
+                i += m.end() - 1
+            else:
+                out.append(re.escape(c))
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return "".join(out)
+
+
+def matches(expected, actual, pattern):
+    if not pattern:
+        return expected == actual
+    el = expected.split("\n")
+    al = actual.split("\n")
+    if len(el) != len(al):
+        return False
+    for e, a in zip(el, al):
+        try:
+            if not re.fullmatch(zsh_glob_to_regex(e), a, re.S):
+                return False
+        except re.error:
+            if e != a:
+                return False
+    return True
+
+
+def sq(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def build_driver(work, testdir, prep, tests, clean):
+    w = lambda name, data: open(os.path.join(work, name), "w", encoding="utf-8", errors="surrogateescape").write(data)
+    lines = [
+        "ZTST_testdir=" + sq(testdir),
+        "ZTST_srcdir=" + sq(testdir),
+        "ZTST_fd=8",
+        "exec 8>/dev/null",
+        "cd " + sq(testdir),
+        "W=" + sq(work),
+    ]
+    for k, (code, _) in enumerate(prep):
+        w(f"prep.{k}", code)
+        lines.append(f'() {{ eval "$(<$W/prep.{k})" }} >/dev/null; print -r -- $? >$W/prepst.{k}')
+    lines.append('print -r -- "$ZTST_unimplemented" >$W/unimpl')
+    lines.append('if [[ -z $ZTST_unimplemented ]]; then')
+    for k, t in enumerate(tests):
+        w(f"code.{k}", t.code)
+        q = "q" in t.flags
+        w(f"inraw.{k}", t.stdin)
+        if q and t.stdin:
+            lines.append(f'print -rn -- "${{(e)$(<$W/inraw.{k})}}" >$W/in.{k}; print >>$W/in.{k}')
+        else:
+            lines.append(f"cat $W/inraw.{k} >$W/in.{k}")
+        lines.append("ZTST_skip=")
+        lines.append(
+            f'() {{ eval "$(<$W/code.{k})" }} <$W/in.{k} >$W/out.{k} 2>$W/err.{k}; '
+            f"print -r -- $? >$W/st.{k}; "
+            f'print -r -- "$ZTST_skip" >$W/skip.{k}'
+        )
+        if q:
+            for kind, text in (("out", t.out), ("err", t.err)):
+                if text:
+                    w(f"exp{kind}raw.{k}", text)
+                    lines.append(
+                        f'print -r -- "${{(e)$(<$W/exp{kind}raw.{k})}}" >$W/exp{kind}.{k} 2>/dev/null'
+                    )
+    lines.append("fi")
+    for k, (code, _) in enumerate(clean):
+        w(f"clean.{k}", code)
+        lines.append(f'() {{ eval "$(<$W/clean.{k})" }} >/dev/null 2>&1')
+    w("driver.zsh", "\n".join(lines) + "\n")
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def run_file(meowsh, testdir, path, timeout, verbose):
+    prep, tests, clean = parse(path)
+    work = tempfile.mkdtemp(prefix="ztst.", dir=testdir)
+    build_driver(work, testdir, prep, tests, clean)
+    # A minimal environment, as the tests expect and so nothing of the
+    # caller's leaks into results.
+    env = {k: os.environ[k] for k in ("PATH", "USER", "LOGNAME") if k in os.environ}
+    env["LANG"] = "C"
+    env["TERM"] = "dumb"
+    env["SHELL"] = meowsh
+    env["HOME"] = os.path.join(testdir, "home.tmp")
+    os.makedirs(env["HOME"], exist_ok=True)
+    timed_out = False
+    try:
+        subprocess.run(
+            [meowsh, os.path.join(work, "driver.zsh")],
+            cwd=testdir,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    res = {"pass": 0, "stdout-only": 0, "fail": 0, "skip": 0, "xfail": 0, "aborted": 0}
+    unimpl = (read(os.path.join(work, "unimpl")) or "").strip()
+    bad_prep = [k for k in range(len(prep)) if (read(os.path.join(work, f"prepst.{k}")) or "1").strip() != "0"]
+    if unimpl:
+        res["skip"] = len(tests)
+        return res, [f"unimplemented: {unimpl}"]
+    details = []
+    if bad_prep:
+        details.append(f"prep chunk(s) failed at line(s) {', '.join(str(prep[k][1]) for k in bad_prep)}")
+    for k, t in enumerate(tests):
+        st = read(os.path.join(work, f"st.{k}"))
+        if st is None:
+            res["aborted"] += 1
+            if verbose and res["aborted"] == 1:
+                details.append(f"line {t.line}: shell exited before this test{' (timeout)' if timed_out else ''}")
+            continue
+        if (read(os.path.join(work, f"skip.{k}")) or "").strip():
+            res["skip"] += 1
+            continue
+        out = read(os.path.join(work, f"out.{k}")) or ""
+        err = read(os.path.join(work, f"err.{k}")) or ""
+        exp_out = read(os.path.join(work, f"expout.{k}")) if "q" in t.flags and t.out else t.out
+        exp_err = read(os.path.join(work, f"experr.{k}")) if "q" in t.flags and t.err else t.err
+        exp_out = exp_out if exp_out is not None else t.out
+        exp_err = exp_err if exp_err is not None else t.err
+        ok_status = t.status == "-" or t.status == st.strip()
+        ok_out = "d" in t.flags or matches(exp_out, out, t.out_pat)
+        ok_err = "D" in t.flags or matches(exp_err, err, t.err_pat)
+        if "f" in t.flags:
+            res["xfail"] += 1
+            continue
+        if ok_status and ok_out and ok_err:
+            res["pass"] += 1
+        elif ok_status and ok_out:
+            res["stdout-only"] += 1
+        else:
+            res["fail"] += 1
+            if verbose:
+                why = []
+                if not ok_status:
+                    why.append(f"status {st.strip()} (expected {t.status})")
+                if not ok_out:
+                    why.append(f"stdout {out!r} (expected {exp_out!r})")
+                if not ok_err:
+                    why.append(f"stderr {err!r}")
+                details.append(f"line {t.line}: {t.message}\n    " + "\n    ".join(why))
+    return res, details
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--zsh-src", required=True, help="zsh source checkout")
+    ap.add_argument("--meowsh", default=os.path.join(os.path.dirname(__file__), "..", "target", "release", "meowsh"))
+    ap.add_argument("--timeout", type=float, default=60)
+    ap.add_argument("-v", "--verbose", action="store_true", help="show each failing test")
+    ap.add_argument("files", nargs="*")
+    args = ap.parse_args()
+    meowsh = os.path.abspath(args.meowsh)
+    src_test = os.path.join(args.zsh_src, "Test")
+    if not os.access(meowsh, os.X_OK):
+        sys.exit(f"meowsh binary not found: {meowsh} (run cargo build --release)")
+    names = sorted(f for f in os.listdir(src_test) if f.endswith(".ztst"))
+    if args.files:
+        want = [f if f.endswith(".ztst") else f + ".ztst" for f in args.files]
+        names = [f for f in names if f in want or any(f.startswith(w[:-5]) for w in want)]
+    root = tempfile.mkdtemp(prefix="meowsh-ztst.")
+    try:
+        testdir = os.path.join(root, "Test")
+        shutil.copytree(src_test, testdir, symlinks=True)
+        os.makedirs(os.path.join(root, "Src"), exist_ok=True)
+        os.symlink(meowsh, os.path.join(root, "Src", "zsh"))
+        total = {}
+        print(f"{'file':24} {'pass':>5} {'out-ok':>6} {'fail':>5} {'abort':>5} {'skip':>5}")
+        for name in names:
+            res, details = run_file(meowsh, testdir, os.path.join(testdir, name), args.timeout, args.verbose)
+            for k, v in res.items():
+                total[k] = total.get(k, 0) + v
+            print(
+                f"{name[:-5]:24} {res['pass']:5} {res['stdout-only']:6} {res['fail']:5} "
+                f"{res['aborted']:5} {res['skip'] + res['xfail']:5}"
+            )
+            if args.verbose:
+                for d in details:
+                    print("  " + d)
+        run = sum(total.get(k, 0) for k in ("pass", "stdout-only", "fail", "aborted"))
+        print(
+            f"{'total':24} {total.get('pass', 0):5} {total.get('stdout-only', 0):6} "
+            f"{total.get('fail', 0):5} {total.get('aborted', 0):5} "
+            f"{total.get('skip', 0) + total.get('xfail', 0):5}"
+        )
+        if run:
+            print(f"\npassed {total.get('pass', 0)}/{run} ({100 * total.get('pass', 0) / run:.1f}%), "
+                  f"stdout and status right in {total.get('pass', 0) + total.get('stdout-only', 0)}/{run}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -316,3 +316,15 @@ fn colors_and_prompt_truncation() {
     let (_, out, _) = sh("colors; print -n $fg[red]x$reset_color | od -An -c | tr -s ' '; print -P '%5<..<abcdefgh%<<'");
     assert_eq!(out, " 033 [ 3 1 m x 033 [ 0 0 m\n..fgh\n");
 }
+
+#[test]
+fn eval_catches_expansion_errors_but_not_exit() {
+    let (status, out, _) = sh(
+        "eval 'echo ${(Z)x}; echo same-eval'; echo \"st=$? after\"; \
+         echo ${unset_v?gone}; echo not-reached",
+    );
+    assert_eq!(out, "st=1 after\n");
+    assert_eq!(status, 1);
+    let (status, out, _) = sh("eval 'exit 4'; echo not-reached");
+    assert_eq!((status, out.as_str()), (4, ""));
+}

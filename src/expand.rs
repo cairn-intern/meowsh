@@ -719,9 +719,11 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
                     f.pad_right = Some((n, fill));
                 }
             }
-            // Accepted without effect: A (assignment), M/R/B/E/N (match
-            // parts), V, w, W, c, X, ~, #, m, S, I.
-            _ => {}
+            // Accepted without effect: A (assignment), R/B/E/N (match
+            // parts), V, w, W, c, X, ~, #, m, S, I, p, g.
+            'A' | 'R' | 'B' | 'E' | 'N' | 'V' | 'w' | 'W' | 'c' | 'X' | '~' | '#' | 'm' | 'S'
+            | 'I' | 'p' | 'g' => {}
+            _ => return None,
         }
     }
     None
@@ -1407,7 +1409,7 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     let mut flags = PFlags::default();
     if body[0] == '(' {
         let Some((f, end)) = parse_flags(body) else {
-            return bad();
+            return fail(&format!("error in flags in '${{{}}}'", text));
         };
         flags = f;
         i = end;

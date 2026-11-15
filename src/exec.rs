@@ -52,6 +52,13 @@ fn suppress_errexit(delta: isize) {
     });
 }
 
+fn set_error_exit(status: i32) {
+    with_shell(|s| {
+        s.flow = Flow::Exit(status);
+        s.error_exit = true;
+    });
+}
+
 fn check_errexit(status: i32) {
     if status == 0 {
         return;
@@ -71,6 +78,7 @@ fn expansion_failed(e: ExpError) -> i32 {
             s.flow = if s.interactive {
                 Flow::Interrupt
             } else {
+                s.error_exit = true;
                 Flow::Exit(e.status)
             };
         }
@@ -688,7 +696,7 @@ fn exec_simple(cmd: &SimpleCmd, in_child: bool) -> i32 {
         for a in &assigns {
             if let Err(st) = apply_assign(a, false) {
                 if !interactive() {
-                    set_flow(Flow::Exit(st));
+                    set_error_exit(st);
                 }
                 return st;
             }
@@ -761,7 +769,7 @@ fn run_command(
         for a in assigns {
             if let Err(st) = apply_assign(a, false) {
                 if !interactive() {
-                    set_flow(Flow::Exit(st));
+                    set_error_exit(st);
                 }
                 return st;
             }
@@ -864,7 +872,7 @@ fn exec_builtin(args: &[String], assigns: &[Expanded], redirs: &[Redir]) -> i32 
             Ok(_) => 0,
             Err(RedirError) => {
                 if !interactive() {
-                    set_flow(Flow::Exit(1));
+                    set_error_exit(1);
                 }
                 1
             }
