@@ -63,6 +63,8 @@ pub struct FuncDef {
     pub body: Arc<Node>,
     // Where it was defined (file or shell name), for `whence -v`.
     pub origin: String,
+    // Line of the definition: error messages count lines from it.
+    pub line: usize,
 }
 
 /// Pending non-local control flow. Set by `break`, `continue`, `return`,
@@ -106,7 +108,6 @@ pub struct Shell {
     // Trap actions keyed by signal number; 0 is the EXIT condition.
     pub traps: HashMap<i32, String>,
     pub functions: HashMap<String, FuncDef>,
-    pub lineno: i32,
     pub loop_depth: usize,
     pub func_depth: usize,
     pub source_depth: usize,
@@ -176,7 +177,7 @@ impl Shell {
             history_file: String::new(),
             traps: HashMap::new(),
             functions: HashMap::new(),
-            lineno: 0,
+
             loop_depth: 0,
             func_depth: 0,
             source_depth: 0,
@@ -273,6 +274,8 @@ pub struct Assign {
 
 #[derive(Clone, Debug, Default)]
 pub struct SimpleCmd {
+    // Input line where it starts, for $LINENO and error messages.
+    pub line: usize,
     pub assigns: Vec<Assign>,
     pub words: Vec<String>,
     pub redirs: Vec<Redir>,
@@ -352,6 +355,7 @@ pub enum Node {
     AnonFunc {
         body: std::sync::Arc<Node>,
         args: Vec<String>,
+        line: usize,
     },
     // `for (( init; cond; step ))`
     ForArith {
@@ -372,6 +376,7 @@ pub enum Node {
     FuncDef {
         name: String,
         body: Box<Node>,
+        line: usize,
     },
     DBracket(Vec<String>),
     Redirected {

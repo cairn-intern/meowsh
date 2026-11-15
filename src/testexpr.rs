@@ -1,6 +1,7 @@
 //! `test`, `[`, and `[[ ]]` evaluation.
 
 use crate::expand::{expand_pattern, expand_string};
+use crate::shell::builtin_err;
 use crate::sys::err_line;
 use std::ffi::CString;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -33,6 +34,7 @@ fn is_unary(op: &str) -> bool {
             | "-N"
             | "-a"
             | "-v"
+            | "-o"
     )
 }
 
@@ -110,6 +112,9 @@ fn unary(op: &str, arg: &str) -> TResult {
             unsafe { libc::isatty(fd) == 1 }
         }
         "-v" => var_is_set(arg),
+        // -o option: whether the shell option is on.
+        "-o" => crate::options::resolve(arg)
+            .is_some_and(|(name, on)| crate::options::is_set(name) == on),
         _ => return Err(format!("{}: unary operator expected", op)),
     })
 }
@@ -330,7 +335,7 @@ pub fn builtin_test(words: &[String]) -> i32 {
         Ok(true) => 0,
         Ok(false) => 1,
         Err(e) => {
-            err_line(&format!("meowsh: {}: {}", name, e));
+            builtin_err(name, &e);
             2
         }
     }

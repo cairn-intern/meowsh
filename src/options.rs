@@ -99,7 +99,13 @@ pub fn resolve(name: &str) -> Option<(&'static str, bool)> {
 // parameter's value): a copy behind its own lock, which is never held
 // while taking the shell lock.
 static QUICK: std::sync::RwLock<Vec<&'static str>> = std::sync::RwLock::new(Vec::new());
-const QUICK_NAMES: &[&str] = &["cbases", "octalzeroes", "extendedglob"];
+const QUICK_NAMES: &[&str] = &[
+    "cbases",
+    "octalzeroes",
+    "extendedglob",
+    "ksharrays",
+    "kshzerosubscript",
+];
 
 /// For code that may run with the shell lock held: whether one of a few
 /// display options (cbases, octalzeroes) is on.
@@ -127,6 +133,16 @@ pub fn set_in(s: &mut Shell, name: &str, on: bool) {
     }
     s.assoc_entry("options")
         .insert(name.to_string(), if on { "on" } else { "off" }.to_string());
+}
+
+/// Puts back a saved option state (LOCAL_OPTIONS, `emulate cmd`),
+/// keeping the mirrors and `$options` in step.
+pub fn restore_in(s: &mut Shell, named: &std::collections::HashMap<String, bool>) {
+    for (k, &v) in named {
+        if is_set_in(s, k) != v {
+            set_in(s, k, v);
+        }
+    }
 }
 
 pub fn is_set_in(s: &Shell, name: &str) -> bool {
@@ -167,6 +183,11 @@ pub fn emulate_in(s: &mut Shell, emu: Emulation, all: bool) {
 pub fn init(s: &mut Shell, emu: Emulation) {
     for &(name, defaults, _, _) in OPTIONS {
         set_in(s, name, defaults & emu as u8 != 0);
+    }
+    // Started as sh or bash, meowsh keeps brace expansion as bash does
+    // (`emulate sh` still turns it off like zsh).
+    if matches!(emu, Emulation::Sh) {
+        set_in(s, "ignorebraces", false);
     }
     s.emulation = emu;
 }

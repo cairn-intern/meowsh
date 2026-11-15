@@ -84,10 +84,14 @@ pub fn parse_number(s: &str) -> Result<i64, String> {
     } else if let Some((base, digits)) = body.split_once('#') {
         let base: u32 = base.parse().map_err(|_| format!("{}: invalid number", s))?;
         if !(2..=36).contains(&base) {
-            return Err(format!("{}: invalid arithmetic base", s));
+            return Err(format!(
+                "invalid base (must be 2 to 36 inclusive): {}",
+                base
+            ));
         }
         u64::from_str_radix(digits, base).map(|v| v as i64)
-    } else if body.len() > 1 && body.starts_with('0') {
+    } else if body.len() > 1 && body.starts_with('0') && crate::options::quick("octalzeroes") {
+        // A leading zero means octal only with OCTAL_ZEROES (sh, ksh).
         u64::from_str_radix(&body[1..], 8).map(|v| v as i64)
     } else {
         body.parse::<u64>().map(|v| v as i64)
@@ -116,9 +120,11 @@ fn parse_value(s: &str) -> Result<Num, String> {
     parse_number(s).map(Num::I)
 }
 
-fn tokenize(s: &str) -> Result<Vec<T>, String> {
+// Tokens and where each starts in the text, for error messages.
+fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
     let c: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
+    let mut starts = Vec::new();
     let mut i = 0;
     while i < c.len() {
         let ch = c[i];
@@ -126,8 +132,30 @@ fn tokenize(s: &str) -> Result<Vec<T>, String> {
             i += 1;
             continue;
         }
+        starts.truncate(out.len());
+        starts.push(i);
         if ch.is_ascii_digit() || (ch == '.' && c.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
             let start = i;
+            // OCTAL_ZEROES: `09` is the number 0 followed by 9.
+            if ch == '0' && crate::options::quick("octalzeroes") {
+                let mut j = i + 1;
+                while j < c.len() && c[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let plain = !matches!(c.get(j), Some('.' | '#' | 'e' | 'E' | 'x' | 'X'));
+                if plain && j > i + 1 {
+                    let mut k = i + 1;
+                    while k < j && ('0'..='7').contains(&c[k]) {
+                        k += 1;
+                    }
+                    if k < j {
+                        let text: String = c[i..k].iter().collect();
+                        out.push(T::Num(parse_value(&text)?));
+                        i = k;
+                        continue;
+                    }
+                }
+            }
             while i < c.len() {
                 let d = c[i];
                 let exp_sign = matches!(d, '+' | '-')
@@ -142,6 +170,37 @@ fn tokenize(s: &str) -> Result<Vec<T>, String> {
             let text: String = c[start..i].iter().collect();
             out.push(T::Num(parse_value(&text)?));
             continue;
+        }
+        // `##c` (or `#\c`): the character code of c; `#name`: of the
+        // first character of $name.
+        if ch == '#' {
+            let code = |x: Option<&char>| x.map(|&x| x as i64);
+            if matches!(c.get(i + 1), Some('#' | '\\')) {
+                let mut k = i + 2;
+                if c[i + 1] == '#' && c.get(k) == Some(&'\\') && k + 1 < c.len() {
+                    k += 1;
+                }
+                let v = code(c.get(k)).ok_or("character missing after ##")?;
+                out.push(T::Num(Num::I(v)));
+                i = k + 1;
+                continue;
+            }
+            if c.get(i + 1)
+                .is_some_and(|x| x.is_ascii_alphabetic() || *x == '_')
+            {
+                let start = i + 1;
+                i = start;
+                while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') {
+                    i += 1;
+                }
+                let name: String = c[start..i].iter().collect();
+                let v = crate::shell::var_get(&name)
+                    .chars()
+                    .next()
+                    .map_or(0, |x| x as i64);
+                out.push(T::Num(Num::I(v)));
+                continue;
+            }
         }
         if ch.is_ascii_alphabetic() || ch == '_' {
             let start = i;
@@ -162,18 +221,18 @@ fn tokenize(s: &str) -> Result<Vec<T>, String> {
             }
         }
         if !matched {
-            return Err(format!(
-                "syntax error: invalid arithmetic operator (error token is \"{}\")",
-                c[i..].iter().collect::<String>()
-            ));
+            return Err(format!("bad math expression: illegal character: {}", c[i]));
         }
     }
-    Ok(out)
+    starts.truncate(out.len());
+    Ok((out, starts))
 }
 
 struct P {
     toks: Vec<T>,
     pos: usize,
+    src: Vec<char>,
+    starts: Vec<usize>,
 }
 
 type R = Result<Num, String>;
@@ -209,13 +268,13 @@ fn int_binop(op: &str, l: i64, r: i64) -> Result<i64, String> {
         "*" => l.wrapping_mul(r),
         "/" => {
             if r == 0 {
-                return Err("division by 0".to_string());
+                return Err("division by zero".to_string());
             }
             l.wrapping_div(r)
         }
         "%" => {
             if r == 0 {
-                return Err("division by 0".to_string());
+                return Err("division by zero".to_string());
             }
             l.wrapping_rem(r)
         }
@@ -310,6 +369,18 @@ fn call(name: &str, args: &[Num]) -> R {
 }
 
 impl P {
+    // zsh's "<what> expected at `rest'" or "... at end of string".
+    fn expected(&self, what: &str) -> String {
+        match self.starts.get(self.pos) {
+            Some(&k) => format!(
+                "bad math expression: {} expected at `{}'",
+                what,
+                self.src[k..].iter().collect::<String>()
+            ),
+            None => format!("bad math expression: {} expected at end of string", what),
+        }
+    }
+
     fn peek(&self) -> Option<&T> {
         self.toks.get(self.pos)
     }
@@ -368,7 +439,7 @@ impl P {
             let c = v.truthy();
             let a = self.comma(skip || !c)?;
             if self.eat_op(&[":"]).is_none() {
-                return Err("`:' expected for conditional expression".to_string());
+                return Err("bad math expression: ':' expected".to_string());
             }
             let b = self.assign(skip || c)?;
             return Ok(if c { a } else { b });
@@ -438,7 +509,7 @@ impl P {
             if op == "++" || op == "--" {
                 let name = match self.peek() {
                     Some(T::Ident(n)) => n.clone(),
-                    _ => return Err(format!("syntax error: operand expected after {}", op)),
+                    _ => return Err("bad math expression: lvalue required".to_string()),
                 };
                 self.pos += 1;
                 if skip {
@@ -510,11 +581,7 @@ impl P {
                 self.pos += 1;
                 Ok(v)
             }
-            Some(T::Op(op)) => Err(format!(
-                "syntax error: operand expected (error token is \"{}\")",
-                op
-            )),
-            None => Err("syntax error: operand expected".to_string()),
+            Some(T::Op(_)) | None => Err(self.expected("operand")),
         }
     }
 }
@@ -530,17 +597,23 @@ fn set_var(name: &str, v: Num) -> Result<(), String> {
 /// Evaluates an arithmetic expression whose parameter expansions and
 /// command substitutions have already been performed.
 pub fn eval_num(expr: &str) -> R {
-    let toks = tokenize(expr)?;
+    let (toks, starts) = tokenize(expr)?;
     if toks.is_empty() {
         return Ok(Num::I(0));
     }
-    let mut p = P { toks, pos: 0 };
+    let mut p = P {
+        toks,
+        pos: 0,
+        src: expr.chars().collect(),
+        starts,
+    };
     let v = p.comma(false)?;
     if p.pos < p.toks.len() {
-        return Err(format!(
-            "syntax error in expression (error token is \"{:?}\")",
-            p.toks[p.pos]
-        ));
+        return Err(match &p.toks[p.pos] {
+            T::Op(":") => "bad math expression: ':' without '?'".to_string(),
+            T::Op("=") => "bad math expression: lvalue required".to_string(),
+            _ => p.expected("operator"),
+        });
     }
     Ok(v)
 }
@@ -565,7 +638,9 @@ mod tests {
         assert_eq!(eval("5>3?1:2"), Ok(1));
         assert_eq!(eval("2**10"), Ok(1024));
         assert_eq!(eval("-2+3"), Ok(1));
-        assert_eq!(eval("0x10 + 010"), Ok(24));
+        assert_eq!(eval("0x10 + 8#10"), Ok(24));
+        // Without OCTAL_ZEROES a leading zero is decimal.
+        assert_eq!(eval("010"), Ok(10));
         assert_eq!(eval("1 || 1/0"), Ok(1));
     }
 

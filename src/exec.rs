@@ -9,7 +9,7 @@ use crate::lexer::assignment_split;
 use crate::parser::{ParseError, Parser};
 use crate::shell::{
     array_append, array_set_subscript, build_env, find_command, is_array, opt_set, pop_scope,
-    push_scope, var_get, var_get_opt, var_set, with_shell,
+    push_scope, shell_err, var_get, var_get_opt, var_set, with_shell,
 };
 use crate::sys::{close, dup_high, err_line, pipe_cloexec, read_all, temp_file_with};
 use crate::types::{
@@ -212,7 +212,7 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
         find_command(name)
     };
     let Some(path) = path else {
-        err_line(&format!("meowsh: {}: command not found", name));
+        shell_err(&format!("command not found: {}", name));
         unsafe { libc::_exit(127) }
     };
     let to_c = |s: &str| CString::new(s.as_bytes()).ok();
@@ -259,17 +259,34 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
 
 // ---- redirections ---------------------------------------------------------
 
+fn sh_emulation() -> bool {
+    with_shell(|s| matches!(s.emulation, crate::options::Emulation::Sh))
+}
+
 enum Target {
     Opened(i32),
+    // `>& file`: standard output and standard error both go to the file.
+    Both(i32),
     Dup(i32),
     Close,
 }
 
+// zsh's wording: the system message, lowercased, then the file.
+pub fn file_error(path: &str, errno: i32) -> String {
+    let msg = strerror(errno);
+    let mut c = msg.chars();
+    let msg = match c.next() {
+        Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+        None => msg,
+    };
+    format!("{}: {}", msg, path)
+}
+
 fn open_file(path: &str, flags: i32) -> Result<i32, String> {
-    let c = CString::new(path).map_err(|_| format!("{}: invalid file name", path))?;
+    let c = CString::new(path).map_err(|_| format!("invalid file name: {}", path))?;
     let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC, 0o666 as libc::c_uint) };
     if fd < 0 {
-        return Err(format!("{}: {}", path, strerror(last_errno())));
+        return Err(file_error(path, last_errno()));
     }
     Ok(fd)
 }
@@ -312,14 +329,17 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
                     }
                     Ok(Target::Dup(n))
                 }
+                _ if r.op == RedirOp::DupOut && !sh_emulation() => {
+                    open_file(&target, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
+                        .map(Target::Both)
+                        .map_err(Some)
+                }
                 _ => Err(Some(format!("{}: ambiguous redirect", target))),
             }
         }
         RedirOp::Read => file(libc::O_RDONLY),
         RedirOp::Write if opt_set(OPT_NOCLOBBER) => match std::fs::metadata(&target) {
-            Ok(m) if m.is_file() => {
-                Err(Some(format!("{}: cannot overwrite existing file", target)))
-            }
+            Ok(m) if m.is_file() => Err(Some(format!("file exists: {}", target))),
             Ok(_) => file(libc::O_WRONLY),
             Err(_) => file(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL),
         },
@@ -350,7 +370,7 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
             Ok(t) => t,
             Err(msg) => {
                 if let Some(m) = msg {
-                    err_line(&format!("meowsh: redirection: {}", m));
+                    shell_err(&m);
                 }
                 restore_redirs(saved);
                 return Err(RedirError);
@@ -366,6 +386,14 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
                         libc::fcntl(fd, libc::F_SETFD, 0);
                     }
                 }
+                ok
+            }
+            Target::Both(newfd) => {
+                if save {
+                    saved.push((2, dup_high(2)));
+                }
+                let ok = unsafe { libc::dup2(newfd, fd) >= 0 && libc::dup2(newfd, 2) >= 0 };
+                close(newfd);
                 ok
             }
             Target::Dup(src) => src == fd || unsafe { libc::dup2(src, fd) } >= 0,
@@ -481,34 +509,46 @@ fn is_readonly(name: &str) -> bool {
     with_shell(|s| s.param(name).is_some_and(|p| p.attrs & VAR_READONLY != 0))
 }
 
+/// `name[sub]=value` (`sub` not yet expanded): one element or key, a
+/// `[a,b]` range, or characters of a scalar.
+pub fn set_subscripted(name: &str, sub: &str, v: &str, append: bool) -> Result<bool, i32> {
+    let is_assoc = with_shell(|s| s.assoc(name).is_some());
+    if sub.contains(',') && !is_assoc {
+        let sub = expand_string(sub).map_err(|e| e.status)?;
+        return Ok(crate::shell::array_splice(name, &sub, vec![v.to_string()]));
+    }
+    let key = if is_assoc {
+        expand_string(sub).map_err(|e| e.status)?
+    } else {
+        let idx = expand_string(sub).map_err(|e| e.status)?;
+        match crate::arith::eval(&idx) {
+            Ok(n) => n.to_string(),
+            Err(e) => {
+                err_line(&format!("meowsh: {}: {}", idx, e));
+                return Err(1);
+            }
+        }
+    };
+    // A character of a scalar: `s[2]=x` replaces it.
+    let target = crate::shell::resolve_ref(name);
+    let scalar = with_shell(|s| s.scalar(&target).is_some());
+    if scalar && !append && !is_assoc && key != "0" {
+        return Ok(crate::shell::array_splice(
+            name,
+            &format!("{},{}", key, key),
+            vec![v.to_string()],
+        ));
+    }
+    Ok(array_set_subscript(name, &key, v.to_string(), append))
+}
+
 fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
     if is_readonly(&a.name) {
-        err_line(&format!("meowsh: read-only variable: {}", a.name));
+        shell_err(&format!("read-only variable: {}", a.name));
         return Err(1);
     }
     let ok = match (&a.subscript, &a.value) {
-        (Some(sub), Value::Scalar(v))
-            if sub.contains(',') && !with_shell(|s| s.assoc(&a.name).is_some()) =>
-        {
-            let sub = expand_string(sub).map_err(|e| e.status)?;
-            crate::shell::array_splice(&a.name, &sub, vec![v.clone()])
-        }
-        (Some(sub), Value::Scalar(v)) => {
-            let is_assoc = with_shell(|s| s.assoc(&a.name).is_some());
-            let key = if is_assoc {
-                expand_string(sub).map_err(|e| e.status)?
-            } else {
-                let idx = expand_string(sub).map_err(|e| e.status)?;
-                match crate::arith::eval(&idx) {
-                    Ok(n) => n.to_string(),
-                    Err(e) => {
-                        err_line(&format!("meowsh: {}: {}", idx, e));
-                        return Err(1);
-                    }
-                }
-            };
-            array_set_subscript(&a.name, &key, v.clone(), a.append)
-        }
+        (Some(sub), Value::Scalar(v)) => set_subscripted(&a.name, sub, v, a.append)?,
         (Some(sub), Value::Array(items)) => {
             let sub = expand_string(sub).map_err(|e| e.status)?;
             crate::shell::array_splice(&a.name, &sub, crate::shell::plain_items(items))
@@ -565,7 +605,7 @@ impl TempVars {
                 continue;
             }
             if is_readonly(&a.name) {
-                err_line(&format!("meowsh: read-only variable: {}", a.name));
+                shell_err(&format!("read-only variable: {}", a.name));
                 saved.restore();
                 return Err(1);
             }
@@ -717,10 +757,10 @@ fn exec_node_inner(node: &Node) -> i32 {
             }
             st
         }
-        Node::AnonFunc { body, args } => match expand_words(args) {
+        Node::AnonFunc { body, args, line } => match expand_words(args) {
             Ok(mut words) => {
                 words.insert(0, "(anon)".to_string());
-                call_function(body, &words)
+                call_function(body, &words, *line)
             }
             Err(e) => expansion_failed(e),
         },
@@ -739,13 +779,14 @@ fn exec_node_inner(node: &Node) -> i32 {
             body,
         } => exec_for_arith(init, cond, step, body),
         Node::Case { word, items } => exec_case(word, items),
-        Node::FuncDef { name, body } => {
+        Node::FuncDef { name, body, line } => {
             with_shell(|s| {
                 s.functions.insert(
                     name.clone(),
                     FuncDef {
                         body: Arc::new((**body).clone()),
                         origin: s.function_origin(),
+                        line: *line,
                     },
                 )
             });
@@ -784,6 +825,7 @@ fn exec_in_child(node: &Node) -> ! {
 }
 
 fn exec_simple(cmd: &SimpleCmd, in_child: bool) -> i32 {
+    crate::shell::with_err_ctx(|e| e.lineno = cmd.line);
     with_shell(|s| s.last_cmdsub_status = None);
     // zsh precommand modifiers that act before expansion: `noglob`
     // (no filename generation), `nocorrect`, and `-` (dashed argv[0]).
@@ -951,16 +993,16 @@ fn run_command(
     let func = if skip_functions {
         None
     } else {
-        with_shell(|s| s.functions.get(&name).map(|f| f.body.clone()))
+        with_shell(|s| s.functions.get(&name).map(|f| (f.body.clone(), f.line)))
     };
-    if let Some(body) = func {
+    if let Some((body, line)) = func {
         let tmp = match TempVars::set(assigns) {
             Ok(t) => t,
             Err(st) => return st,
         };
         let st = match apply_redirs(redirs, true) {
             Ok(saved) => {
-                let st = call_function(&body, &words);
+                let st = call_function(&body, &words, line);
                 restore_redirs(saved);
                 st
             }
@@ -1166,8 +1208,8 @@ fn restore_function_frame(entry: Frame, status: i32) {
     }
     if local_opts {
         with_shell(|s| {
+            crate::options::restore_in(s, &named);
             s.opts = opts;
-            s.named_opts = named;
         });
     }
     if let Some(action) = exit_action {
@@ -1181,15 +1223,19 @@ fn restore_function_frame(entry: Frame, status: i32) {
     }
 }
 
-pub fn call_function(body: &Arc<Node>, words: &[String]) -> i32 {
+pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
     let depth = with_shell(|s| s.func_depth);
     if depth >= MAX_FUNC_DEPTH {
-        err_line(&format!(
-            "meowsh: {}: maximum function nesting level exceeded",
+        shell_err(&format!(
+            "{}: maximum function nesting level exceeded",
             words[0]
         ));
         return 1;
     }
+    let saved_line = crate::shell::with_err_ctx(|e| {
+        e.stack.push((words[0].clone(), line));
+        e.lineno
+    });
     // zsh (FUNCTION_ARGZERO): $0 is the function name while it runs.
     let (saved_params, saved_loops, saved_argv0) = with_shell(|s| {
         s.func_depth += 1;
@@ -1217,6 +1263,10 @@ pub fn call_function(body: &Arc<Node>, words: &[String]) -> i32 {
         s.argv0 = saved_argv0;
         s.func_depth -= 1;
         s.last_status = st;
+    });
+    crate::shell::with_err_ctx(|e| {
+        e.stack.pop();
+        e.lineno = saved_line;
     });
     st
 }
@@ -1763,8 +1813,26 @@ pub fn run_string(src: &str) -> i32 {
     run_string_named(src, None)
 }
 
-/// Like `run_string`; syntax errors name `file` and the line.
-pub fn run_string_named(src: &str, file: Option<&str>) -> i32 {
+/// Like `run_string`, with errors naming `ctx` (`(eval)`, a sourced
+/// file) and counting lines from the start of `src`.
+pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
+    let saved_line = crate::shell::with_err_ctx(|e| {
+        if let Some(c) = ctx {
+            e.stack.push((c.to_string(), 0));
+        }
+        e.lineno
+    });
+    let st = run_parsed(src);
+    crate::shell::with_err_ctx(|e| {
+        if ctx.is_some() {
+            e.stack.pop();
+        }
+        e.lineno = saved_line;
+    });
+    st
+}
+
+fn run_parsed(src: &str) -> i32 {
     let mut parser = Parser::new(src, true);
     let mut status = 0;
     loop {
@@ -1782,10 +1850,8 @@ pub fn run_string_named(src: &str, file: Option<&str>) -> i32 {
                     ParseError::Syntax(m) => m,
                     ParseError::Incomplete => "syntax error: unexpected end of file".to_string(),
                 };
-                match file {
-                    Some(f) => err_line(&format!("meowsh: {}:{}: {}", f, parser.line(), msg)),
-                    None => err_line(&format!("meowsh: {}", msg)),
-                }
+                crate::shell::with_err_ctx(|e| e.lineno = parser.line());
+                shell_err(&msg);
                 status = 2;
                 with_shell(|s| s.last_status = 2);
                 break;
@@ -1934,6 +2000,8 @@ pub enum InputLine {
 /// an interactive shell. Returns the shell's exit status.
 pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl FnMut(&str)) -> i32 {
     let mut buf = String::new();
+    // Lines of input already run, so line numbers count from the start.
+    let mut lines_done = 0;
     loop {
         let is_interactive = interactive();
         if is_interactive && buf.is_empty() {
@@ -1960,14 +2028,17 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                 break;
             }
             let mut parser = Parser::new(&buf, eof);
+            parser.set_line_offset(lines_done);
             match parser.parse_complete_command() {
                 Ok(Some(node)) => {
                     let rest = parser.rest();
-                    let text = if buf.ends_with(&rest) {
-                        buf[..buf.len() - rest.len()].trim().to_string()
+                    let used = if buf.ends_with(&rest) {
+                        &buf[..buf.len() - rest.len()]
                     } else {
-                        buf.trim().to_string()
+                        &buf[..]
                     };
+                    lines_done += used.matches('\n').count();
+                    let text = used.trim().to_string();
                     buf = rest;
                     if is_interactive {
                         on_command(&text);
@@ -1995,7 +2066,8 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                 }
                 Err(ParseError::Incomplete) => break,
                 Err(ParseError::Syntax(msg)) => {
-                    err_line(&format!("meowsh: {}", msg));
+                    crate::shell::with_err_ctx(|e| e.lineno = parser.line());
+                    shell_err(&msg);
                     with_shell(|s| s.last_status = 2);
                     buf.clear();
                     if !is_interactive {

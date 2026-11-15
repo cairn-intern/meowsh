@@ -357,6 +357,10 @@ pub struct Lexer {
     pending: Vec<PendingHeredoc>,
     pub heredoc_bodies: HashMap<usize, String>,
     next_heredoc_id: usize,
+    // (position, line) of the last `line()` answer, to count on from.
+    line_cache: std::cell::Cell<(usize, usize)>,
+    // Lines of the same input read before this text.
+    pub line_offset: usize,
 }
 
 impl Lexer {
@@ -368,6 +372,8 @@ impl Lexer {
             pending: Vec::new(),
             heredoc_bodies: HashMap::new(),
             next_heredoc_id: 0,
+            line_cache: std::cell::Cell::new((0, 1)),
+            line_offset: 0,
         }
     }
 
@@ -377,11 +383,14 @@ impl Lexer {
 
     /// 1-based line number of the current position.
     pub fn line(&self) -> usize {
-        self.chars[..self.pos.min(self.chars.len())]
-            .iter()
-            .filter(|&&c| c == '\n')
-            .count()
-            + 1
+        let pos = self.pos.min(self.chars.len());
+        let (mut from, mut line) = self.line_cache.get();
+        if pos < from {
+            (from, line) = (0, 1);
+        }
+        line += self.chars[from..pos].iter().filter(|&&c| c == '\n').count();
+        self.line_cache.set((pos, line));
+        line + self.line_offset
     }
 
     pub fn rest(&self) -> String {

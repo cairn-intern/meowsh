@@ -357,7 +357,7 @@ pub fn var_get_if_exists(name: &str) -> Option<i64> {
 }
 
 fn readonly_error(name: &str) {
-    eprintln!("meowsh: read-only variable: {}", name);
+    shell_err(&format!("read-only variable: {}", name));
 }
 
 /// Converts a value for a numeric parameter at assignment: integers
@@ -503,7 +503,7 @@ pub fn set_ref_target(name: &str, target: &str) -> bool {
             .as_ref()
             .is_none_or(|_| target.ends_with(']') && target.matches('[').count() == 1);
     if !target.is_empty() && !valid {
-        eprintln!("meowsh: invalid variable name: {}", target);
+        shell_err(&format!("invalid variable name: {}", target));
         return false;
     }
     let looping = with_shell(|s| {
@@ -523,7 +523,7 @@ pub fn set_ref_target(name: &str, target: &str) -> bool {
         true
     });
     if looping {
-        eprintln!("meowsh: {}: invalid self reference", name);
+        shell_err(&format!("{}: invalid self reference", name));
         return false;
     }
     with_shell(|s| {
@@ -565,7 +565,7 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
     let value = match convert_for(attrs, value) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("meowsh: {}: {}", name, e);
+            shell_err(&format!("{}: {}", name, e));
             return false;
         }
     };
@@ -599,6 +599,15 @@ pub fn array_set(name: &str, items: Vec<String>) -> bool {
         let assoc = assoc_from_items(items);
         shell.store(name, Value::Assoc(assoc));
         return true;
+    }
+    // A scalar given an array value becomes a plain array: its scalar
+    // attributes (-i, -Z3, -u, -x...) go.
+    if let Some(p) = shell.param_mut(name) {
+        if matches!(p.value, Value::Scalar(_)) && p.tie.is_none() {
+            p.attrs &= crate::params::SPECIAL | crate::params::HIDE | crate::params::DECLARED;
+            p.width = 0;
+            p.base = 0;
+        }
     }
     let items = maybe_unique_items(&shell, name, items);
     shell.store(name, Value::Array(items));
@@ -639,10 +648,7 @@ pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool
     let is_assoc = with_shell(|s| s.assoc(&target).is_some());
     if is_assoc {
         if items.iter().any(|i| matches!(i, ArrItem::Plain(_))) {
-            eprintln!(
-                "meowsh: {}: bad [key]=value syntax for associative array",
-                name
-            );
+            shell_err("bad [key]=value syntax for associative array");
             return false;
         }
         let mut map = if append {
@@ -679,9 +685,12 @@ pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool
                 idx += 1;
             }
             ArrItem::Key(k, v, add) => {
-                let n = crate::arith::eval(&k).unwrap_or(0);
+                let mut n = crate::arith::eval(&k).unwrap_or(0);
+                if n >= 0 && crate::options::quick("ksharrays") {
+                    n += 1;
+                }
                 if n < 1 {
-                    eprintln!("meowsh: {}: assignment to invalid subscript range", name);
+                    shell_err(&format!("{}: assignment to invalid subscript range", name));
                     return false;
                 }
                 let k = (n - 1) as usize;
@@ -708,10 +717,14 @@ pub fn array_splice(name: &str, sub: &str, items: Vec<String>) -> bool {
         Some((a, b)) => (crate::arith::eval(a), crate::arith::eval(b)),
         None => (crate::arith::eval(sub), crate::arith::eval(sub)),
     };
-    let (Ok(a), Ok(b)) = (a, b) else {
-        eprintln!("meowsh: {}: bad subscript", name);
+    let (Ok(mut a), Ok(mut b)) = (a, b) else {
+        shell_err(&format!("{}: bad subscript", name));
         return false;
     };
+    if crate::options::quick("ksharrays") {
+        a += i64::from(a >= 0);
+        b += i64::from(b >= 0);
+    }
     let scalar = with_shell(|s| s.scalar(&target).map(|v| v.to_string()));
     let mut arr: Vec<String> = match &scalar {
         Some(v) => v.chars().map(|c| c.to_string()).collect(),
@@ -775,10 +788,18 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
         return true;
     }
 
-    let Ok(index) = subscript.parse::<isize>() else {
+    let Ok(mut index) = subscript.parse::<isize>() else {
         return false;
     };
+    if index >= 0 && crate::options::quick("ksharrays") {
+        index += 1;
+    }
+    if index == 0 && crate::options::quick("kshzerosubscript") {
+        index = 1;
+    }
     if index == 0 {
+        drop(shell);
+        shell_err(&format!("{}: assignment to invalid subscript range", name));
         return false;
     }
     let mut items = shell.array(name).cloned().unwrap_or_default();
@@ -1305,6 +1326,71 @@ pub fn command_exists(name: &str) -> bool {
     }
 
     find_command(name).is_some()
+}
+
+/// Where errors say they happened, kept apart from the shell state so an
+/// error can be reported while the shell is locked.
+pub struct ErrCtx {
+    // (name, line the numbering starts after) for each function,
+    // `(eval)` or sourced file being run.
+    pub stack: Vec<(String, usize)>,
+    // Line of the command running, in its input.
+    pub lineno: usize,
+    // The script, or the shell's name for `-c` and standard input.
+    pub name: String,
+    pub interactive: bool,
+}
+
+static ERR_CTX: std::sync::Mutex<ErrCtx> = std::sync::Mutex::new(ErrCtx {
+    stack: Vec::new(),
+    lineno: 0,
+    name: String::new(),
+    interactive: false,
+});
+
+pub fn with_err_ctx<R>(f: impl FnOnce(&mut ErrCtx) -> R) -> R {
+    let mut guard = ERR_CTX.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut guard)
+}
+
+/// zsh's prefix for an error message: `name:line: ` (or
+/// `name:builtin:line: `), where name is the function, `(eval)`, sourced
+/// file or script running. Interactive commands typed at the prompt get
+/// just `name: ` / `builtin: `.
+pub fn err_prefix(builtin: Option<&str>) -> String {
+    with_err_ctx(|e| {
+        if e.interactive && e.stack.is_empty() {
+            return match builtin {
+                Some(b) => format!("{}: ", b),
+                None => format!("{}: ", e.name),
+            };
+        }
+        let (name, base) = e
+            .stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| (e.name.clone(), 0));
+        let line = e.lineno.saturating_sub(base);
+        let line = if line > 0 {
+            format!(":{}", line)
+        } else {
+            String::new()
+        };
+        match builtin {
+            Some(b) => format!("{}:{}{}: ", name, b, line),
+            None => format!("{}{}: ", name, line),
+        }
+    })
+}
+
+/// Prints a shell error in zsh's format.
+pub fn shell_err(msg: &str) {
+    crate::sys::err_line(&format!("{}{}", err_prefix(None), msg));
+}
+
+/// Prints an error from builtin `name` in zsh's format.
+pub fn builtin_err(name: &str, msg: &str) {
+    crate::sys::err_line(&format!("{}{}", err_prefix(Some(name)), msg));
 }
 
 #[cfg(test)]

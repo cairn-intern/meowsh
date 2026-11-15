@@ -74,6 +74,12 @@ impl Parser {
         self.lex.line()
     }
 
+    /// Counts lines from `n` + 1: the text continues an input of which
+    /// `n` lines were already read.
+    pub fn set_line_offset(&mut self, n: usize) {
+        self.lex.line_offset = n;
+    }
+
     /// Input not yet consumed. Only meaningful between complete commands.
     pub fn rest(&self) -> String {
         self.lex.rest()
@@ -102,10 +108,7 @@ impl Parser {
     }
 
     fn unexpected(&self, tok: &Tok) -> ParseError {
-        ParseError::Syntax(format!(
-            "syntax error near unexpected token `{}'",
-            tok_text(tok)
-        ))
+        ParseError::Syntax(format!("parse error near `{}'", tok_text(tok)))
     }
 
     fn peek_is_word(&mut self, w: &str) -> PResult<bool> {
@@ -464,6 +467,7 @@ impl Parser {
 
     // `() compound-command [args]`, after the `(`.
     fn parse_anon_func(&mut self) -> PResult<Node> {
+        let line = self.lex.line();
         self.next()?; // )
         self.skip_newlines()?;
         let body = self.parse_command()?;
@@ -479,6 +483,7 @@ impl Parser {
         Ok(Node::AnonFunc {
             body: std::sync::Arc::new(body),
             args,
+            line,
         })
     }
 
@@ -570,7 +575,11 @@ impl Parser {
     }
 
     fn parse_simple_or_funcdef(&mut self) -> PResult<Node> {
-        let mut cmd = SimpleCmd::default();
+        let mut cmd = SimpleCmd {
+            line: self.lex.line(),
+            ..SimpleCmd::default()
+        };
+        let line = cmd.line;
         loop {
             if let Some(r) = self.try_parse_redirect()? {
                 cmd.redirs.push(r);
@@ -673,6 +682,7 @@ impl Parser {
                         node: Node::FuncDef {
                             name,
                             body: Box::new(body.clone()),
+                            line,
                         },
                         background: false,
                     })
@@ -698,6 +708,7 @@ impl Parser {
                 return Ok(Node::FuncDef {
                     name: word,
                     body: Box::new(body),
+                    line,
                 });
             }
             cmd.words.push(word);
@@ -716,6 +727,7 @@ impl Parser {
     // function name... [()] compound-command; zsh allows several names
     // sharing one body.
     fn parse_function_keyword(&mut self) -> PResult<Node> {
+        let line = self.lex.line();
         self.next()?;
         let mut names = vec![match self.next()? {
             Tok::Word(w) => w,
@@ -742,6 +754,7 @@ impl Parser {
                 node: Node::FuncDef {
                     name,
                     body: Box::new(body.clone()),
+                    line,
                 },
                 background: false,
             })

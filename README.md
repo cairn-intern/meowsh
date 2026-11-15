@@ -61,20 +61,33 @@ and builtins include:
   `(j: :)`, `(f)`, `(@)`, `(k)`, `(kv)`, `(o)`, `(u)`, `(q)`, `(Q)`, `(U)`,
   `(%)`, `(P)`, `(t)`, `(l:n:)`; modifiers `:h`, `:t`, `:r`, `:e`, `:a`,
   `:A`, `:l`, `:u`, `:q`, `:s/a/b/`; `${a[2,-1]}`, `${^a}`, `${=a}`,
-  `${a:#pat}`, `${a:^b}`; `$name[sub]`, `$+name`, `$#name` without braces
+  `${==a}`, `${~a}`, `${~~a}`, `${a:#pat}`, `${a:^b}`; `$name[sub]`,
+  `$+name`, `$#name` without braces; flags apply in zsh's documented
+  order, and quoted arrays join before operators and nested subscripts
+- brace expansion after parameter expansion (`IF{${^a},x}`), numeric
+  sorting `(n)` and `(-)`, `$11` as the eleventh argument
 - match flags `(S)`, `(I:n:)`, `(M)`, `(R)`, `(B)`, `(E)`, `(N)` with
-  `#`, `%` and `/`; `${a:/pat/repl}`, `${name::=word}`, `${a:|b}`,
+  `#`, `%` and `/`; `${a:/pat/repl}`, `${name::=word}` (also
+  `${a[2]::=x}` and `${2::=x}`), `${a:|b}`,
   `${a:*b}`, `(A)` assignment, `(e)`, `(%)`/`(%%)`, `(V)`, `(g)`,
   `(qqqq)`, `(c)`/`(w)`/`(W)` counts, `(l)`/`(r)` padding with two strings
 - subscript flags `(i)`, `(I)`, `(r)`, `(R)`, `(e)`, `(w)` and `^pat`
-- `EXTENDED_GLOB`: `x#`, `x##`, `^pat`, `a~b`, `(#i)`
+- `EXTENDED_GLOB`: `x#`, `x##`, `x(#cN,M)`, `^pat`, `a~b`, `(#i)`, and
+  `(#b)`/`(#m)`, which set `$match`, `$mbegin`, `$mend` and `$MATCH`,
+  `$MBEGIN`, `$MEND`, also inside a `${x//pat/repl}` replacement
+- `KSH_ARRAYS`, `KSH_ZERO_SUBSCRIPT`, `OCTAL_ZEROES`, `IGNORE_BRACES`
+  (meowsh started as sh or bash keeps brace expansion, as bash does)
+- arithmetic `#name` and `##c` character codes
 - namerefs (`typeset -n`), `[key]=value` items in array assignments and
   slice assignment (`a[2,4]=(x y)`)
 - `whence` (`-v`, `-c`, `-w`, `-a`, `-p`, `-m`, `-s`, `-S`), `which`,
   `where`, `type`
 - patterns and globs with `(a|b)` groups and `<n-m>` ranges, `**/`, and
   glob qualifiers such as `(N)`, `(.)`, `(/)`, `(@)`, `(m-1)`, `(D)`
-- `[[ x == (a|b)* ]]` and `[[ -v name[key] ]]`
+- `[[ x == (a|b)* ]]`, `[[ -v name[key] ]]`, `[[ -o option ]]`
+- `>& file` sends standard output and error to the file
+- error messages in zsh's form, naming the script, function, `(eval)` or
+  sourced file and the line: `f:2: command not found: x`
 - hooks: `precmd`, `preexec`, `chpwd`, `zshexit`, their `*_functions`
   arrays, and `add-zsh-hook`
 - `typeset` and `declare`, `local`, `export`, `readonly`, `integer`,

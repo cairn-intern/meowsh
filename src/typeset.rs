@@ -3,8 +3,9 @@
 //! typeset_single in Src/builtin.c and printparamnode in Src/params.c.
 
 use crate::params::*;
+use crate::shell::builtin_err;
 use crate::shell::with_shell;
-use crate::sys::{err_line, out};
+use crate::sys::out;
 use crate::types::Shell;
 
 /// One argument to a declaration command: a plain word (option or name)
@@ -96,7 +97,7 @@ impl Opts {
 }
 
 fn warn(cmd: &str, msg: &str) {
-    err_line(&format!("meowsh: {}: {}", cmd, msg));
+    builtin_err(cmd, msg);
 }
 
 pub fn typeset(cmd: &str, args: &[DeclArg]) -> i32 {

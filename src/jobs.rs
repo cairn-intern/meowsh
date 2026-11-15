@@ -1,4 +1,4 @@
-use crate::shell::with_shell;
+use crate::shell::{builtin_err, with_shell};
 use crate::sys::{err_line, out};
 use crate::types::{Job, JobState, ProcState, Process};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -300,7 +300,7 @@ fn select_job(command: &str, args: &[String]) -> Result<(i32, i32, String), i32>
     let requested = match parse_job_id(args) {
         Ok(id) => id,
         Err(e) => {
-            err_line(&format!("meowsh: {}: {}", command, e));
+            builtin_err(command, &e.to_string());
             return Err(1);
         }
     };
@@ -360,7 +360,7 @@ pub fn builtin_jobs(args: &[String]) -> i32 {
 
 pub fn builtin_fg(args: &[String]) -> i32 {
     if !job_control() {
-        err_line("meowsh: fg: no job control");
+        builtin_err("fg", "no job control");
         return 1;
     }
     let (id, pgid, text) = match select_job("fg", args) {
@@ -378,7 +378,7 @@ pub fn builtin_fg(args: &[String]) -> i32 {
 
 pub fn builtin_bg(args: &[String]) -> i32 {
     if !job_control() {
-        err_line("meowsh: bg: no job control");
+        builtin_err("bg", "no job control");
         return 1;
     }
     let (id, pgid, text) = match select_job("bg", args) {
@@ -460,7 +460,7 @@ pub fn builtin_wait(args: &[String]) -> i32 {
                     }
                 }
                 None => {
-                    err_line(&format!("meowsh: wait: {}: no such job", arg));
+                    builtin_err("wait", &format!("{}: no such job", arg));
                     status = 127;
                 }
             }

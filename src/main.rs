@@ -123,13 +123,24 @@ fn main() {
                 .unwrap_or_else(|| "meowsh".to_string())
         });
         s.pos_params = args.positional.clone();
-        if let Some(script) = &args.script {
-            s.script_name = script.clone();
-        }
+        s.script_name = match &args.script {
+            Some(script) => script.clone(),
+            // `-c` and standard input: errors name the shell, as zsh's do.
+            None => {
+                let a0 = argv.first().map(|a| a.as_str()).unwrap_or("meowsh");
+                let base = a0.rsplit('/').next().unwrap_or(a0);
+                base.trim_start_matches('-').to_string()
+            }
+        };
         for (opt, on) in &args.options {
             options::set_in(s, opt, *on);
         }
         options::set_in(s, "interactive", interactive);
+        let name = s.script_name.clone();
+        meowsh::shell::with_err_ctx(|e| {
+            e.name = name;
+            e.interactive = interactive;
+        });
         options::set_in(s, "login", args.login);
         options::set_in(
             s,

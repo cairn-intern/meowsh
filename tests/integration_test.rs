@@ -177,7 +177,7 @@ fn test_redirection_failure_aborts_command() {
         run_script(r#"echo should_not_run > /definitely/missing/meowsh/out; echo "status=$?""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "status=1");
-    assert!(stderr.contains("redirection"));
+    assert!(stderr.contains("no such file or directory: /definitely/missing/meowsh/out"));
     assert!(!stdout.contains("should_not_run"));
 }
 

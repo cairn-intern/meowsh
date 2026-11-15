@@ -203,7 +203,7 @@ impl Deparser {
                 self.push(" always ");
                 self.node(always);
             }
-            Node::AnonFunc { body, args } => {
+            Node::AnonFunc { body, args, .. } => {
                 self.push("() {");
                 self.block(body);
                 self.newline();
@@ -262,7 +262,7 @@ impl Deparser {
                 self.newline();
                 self.push("esac");
             }
-            Node::FuncDef { name, body } => {
+            Node::FuncDef { name, body, .. } => {
                 self.push(name);
                 self.push(" () {");
                 self.block(body);

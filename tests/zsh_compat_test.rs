@@ -411,7 +411,7 @@ fn whence_family_formats() {
     );
     assert_eq!(
         out,
-        "ls -l\nll is an alias for ls -l\nf is a shell function from zsh\necho is a shell builtin\n\
+        "ls -l\nll is an alias for ls -l\nf is a shell function from meowsh\necho is a shell builtin\n\
          if is a reserved word\necho: shell built-in command\nif: shell reserved word\n\
          ll: alias\nf: function\necho: builtin\nif: reserved\nsh: command\nnope-xyz: none\necho: builtin\n"
     );
@@ -487,4 +487,94 @@ fn key_value_array_items_and_slices() {
         out,
         "one eins\nthree drei\ntwo zwei\nfirst\n\nthird\nfourth\n4 one umm er five\none five\naXYdef\n"
     );
+}
+
+// ---- glob/split toggles, KSH_ARRAYS, captures, assignment forms -----------
+
+#[test]
+fn glob_and_split_toggles_and_brace_order() {
+    let (_, out, err) = sh("cd $HOME && touch b1 b2; s='b*'; print $s ${~s} $~s; \
+         setopt shwordsplit; w='x y'; print -l ${==w}; unsetopt shwordsplit; \
+         a=(p q); print IF{${^a},T}E; print X{\"${a}\",T}Y");
+    assert_eq!(
+        out, "b* b1 b2 b1 b2\nx y\nIFpE IFTE IFqE IFTE\nXp qY XTY\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
+fn ksh_arrays_and_zero_subscript() {
+    let (_, out, _) = sh(
+        "setopt ksharrays; k=(x y z); print $k ${k[0]} ${k[1]} \"${k[0,1]}\" ${k[(i)y]}; \
+         k[0]=X; print ${k[@]}; unsetopt ksharrays; \
+         z=(one two); print X${z[0]}X; setopt kshzerosubscript; print ${z[0]}",
+    );
+    assert_eq!(out, "x x y x y 1\nX y z\nXX\none\n");
+}
+
+#[test]
+fn backreferences_and_match_counts() {
+    let (_, out, err) = sh("setopt extendedglob; s='look for a match'; \
+         [[ $s == (#b)(*)(match) ]] && print $match[1]x $match[2] $mbegin[2] $mend[2]; \
+         t='this is'; print ${t//(#m)s/<$MATCH$MBEGIN>}; \
+         f=aleftkept; print ${f//(#b)(*)left/${match/a/A}}; \
+         n=1_2_3_4; print ${n#(*_)(#c2)}; \
+         fn() { setopt localoptions noextendedglob; }; fn; [[ -o extendedglob ]] && print still");
+    assert_eq!(
+        out, "look for a x match 12 16\nthi<s4> i<s7>\nAkept\n3_4\nstill\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
+fn subscripted_and_positional_assignment_forms() {
+    let (_, out, err) = sh(
+        "typeset -Z3 z; print ${z::=15}; a=(a b c d); print ${a[2]::=X} $a; \
+         () { print ${2::=two} $2 } one; s=abc; s[2]=Z; print $s; \
+         x=sprodj; x[-10]=scrumf; print $x; typeset -i i=1; i=(3 4); typeset -p i; \
+         set a b c d e f g h i j k; print $11 $10; v=abc; print $(( #v )) $(( ##a )); \
+         set 1 2 3 4 5 6 7 8 9 10; print ${##} ${##1}; echo $(( 010 ))",
+    );
+    assert_eq!(
+        out,
+        "015\nX a X c d\ntwo two\naZc\nscrumfsprodj\ntypeset -a i=( 3 4 )\nk j\n97 97\n2 0\n10\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
+fn flag_order_and_double_quoted_joining() {
+    let (_, out, _) = sh("arr=(she sells z shells); (IFS=+; print ${(s.s.)arr}); \
+         x=b:a:b; print ${(us.:.)x} ${(os.:.j.-.)x}; \
+         foo=(a6 a117 a17 b-2 b-11); print ${(n)foo}; print ${(-)foo}; \
+         a=(et Swann avec); print \"${a#?}\" \"${${a}[2,4]}\" \"${${(@)a}[1,2]#?}\" \"${(o)a}\"");
+    assert_eq!(
+        out,
+        "he+ ell +z+ hell\nb a a b b\na6 a17 a117 b-2 b-11\na6 a17 a117 b-11 b-2\n\
+         t Swann avec t S t Swann et Swann avec\n"
+    );
+}
+
+#[test]
+fn errors_name_their_context_and_line() {
+    let (_, out, err) = sh(
+        "eval 'nosuchcmd-xyz'\nf() {\n  :\n  nosuchcmd-abc\n}\nf\n() { cd /nonexistent-dir-xyz }\n\
+         print $(( 3,,4 ))\nprint after",
+    );
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        "(eval):1: command not found: nosuchcmd-xyz\nf:2: command not found: nosuchcmd-abc\n\
+         (anon):cd: no such file or directory: /nonexistent-dir-xyz\n\
+         meowsh:8: bad math expression: operand expected at `,4 '\n"
+    );
+}
+
+#[test]
+fn redirect_both_streams_to_a_file() {
+    let (_, out, _) = sh("cd $HOME && { echo out; echo err >&2 } >& f.txt; cat f.txt");
+    assert_eq!(out, "out\nerr\n");
 }

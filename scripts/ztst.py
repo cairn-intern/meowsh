@@ -23,6 +23,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -261,6 +262,20 @@ def read(path):
         return None
 
 
+def kill_session(sid):
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                # Fields after the parenthesized command name; session is the 4th.
+                fields = f.read().rsplit(")", 1)[1].split()
+            if int(fields[3]) == sid:
+                os.kill(int(entry), signal.SIGKILL)
+        except (OSError, ValueError, IndexError):
+            pass
+
+
 def run_file(meowsh, testdir, path, timeout, verbose):
     prep, tests, clean = parse(path)
     work = tempfile.mkdtemp(prefix="ztst.", dir=testdir)
@@ -274,19 +289,24 @@ def run_file(meowsh, testdir, path, timeout, verbose):
     env["HOME"] = os.path.join(testdir, "home.tmp")
     os.makedirs(env["HOME"], exist_ok=True)
     timed_out = False
+    proc = subprocess.Popen(
+        [meowsh, os.path.join(work, "driver.zsh")],
+        cwd=testdir,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     try:
-        subprocess.run(
-            [meowsh, os.path.join(work, "driver.zsh")],
-            cwd=testdir,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            start_new_session=True,
-        )
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
+    # Kill everything left in the driver's session, including background
+    # jobs in their own process groups; a stray test process can loop
+    # forever writing to a deleted file.
+    kill_session(proc.pid)
+    proc.wait()
     res = {"pass": 0, "stdout-only": 0, "fail": 0, "skip": 0, "xfail": 0, "aborted": 0}
     unimpl = (read(os.path.join(work, "unimpl")) or "").strip()
     bad_prep = [k for k in range(len(prep)) if (read(os.path.join(work, f"prepst.{k}")) or "1").strip() != "0"]
@@ -322,6 +342,8 @@ def run_file(meowsh, testdir, path, timeout, verbose):
             res["pass"] += 1
         elif ok_status and ok_out:
             res["stdout-only"] += 1
+            if verbose:
+                details.append(f"line {t.line}: {t.message} (stderr only)\n    stderr {err!r} (expected {exp_err!r})")
         else:
             res["fail"] += 1
             if verbose:

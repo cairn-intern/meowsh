@@ -6,7 +6,7 @@ use crate::exec::{call_function, last_status, run_string, set_flow, strerror};
 use crate::jobs::{builtin_bg, builtin_fg, builtin_jobs, builtin_wait, kill_targets};
 use crate::lexer::is_valid_name;
 use crate::shell::{
-    array_set, assoc_declare, find_command, var_get, var_get_opt, var_set, with_shell,
+    array_set, assoc_declare, builtin_err, find_command, var_get, var_get_opt, var_set, with_shell,
 };
 use crate::sys::{err_line, out, read_byte};
 use crate::trap::{set_trap, signal_name, signal_number, SIGNALS};
@@ -159,7 +159,7 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "bindkey" | "compinit" | "compdef" | "compaudit" | "zmodload" | "zle" | "zcompile"
         | "zrecompile" | "bashcompinit" | "complete" | "compctl" => 0,
         _ => {
-            err_line(&format!("meowsh: {}: not a builtin", name));
+            builtin_err(name, "not a builtin");
             1
         }
     }
@@ -177,7 +177,7 @@ pub fn shell_quote(s: &str) -> String {
 }
 
 fn usage(name: &str, msg: &str) -> i32 {
-    err_line(&format!("meowsh: {}: {}", name, msg));
+    builtin_err(name, msg);
     2
 }
 
@@ -190,7 +190,7 @@ fn builtin_break(words: &[String], is_break: bool) -> i32 {
         Some(a) => match a.parse::<usize>() {
             Ok(n) if n >= 1 => n,
             _ => {
-                err_line(&format!("meowsh: {}: {}: loop count out of range", name, a));
+                builtin_err(name, &format!("{}: loop count out of range", a));
                 return 1;
             }
         },
@@ -215,7 +215,7 @@ fn builtin_break(words: &[String], is_break: bool) -> i32 {
 // zsh: an error inside eval ends the eval with status 1 instead of
 // leaving the shell.
 fn builtin_eval(words: &[String]) -> i32 {
-    let st = run_string(&words[1..].join(" "));
+    let st = crate::exec::run_string_named(&words[1..].join(" "), Some("(eval)"));
     with_shell(|s| {
         if s.error_exit {
             s.error_exit = false;
@@ -234,7 +234,7 @@ fn builtin_exit(words: &[String]) -> i32 {
         Some(a) => match a.trim().parse::<i64>() {
             Ok(n) => (n & 0xff) as i32,
             Err(_) => {
-                err_line(&format!("meowsh: exit: {}: numeric argument required", a));
+                builtin_err("exit", &format!("{}: numeric argument required", a));
                 2
             }
         },
@@ -247,7 +247,10 @@ fn builtin_exit(words: &[String]) -> i32 {
 fn builtin_return(words: &[String]) -> i32 {
     let (funcs, sources) = with_shell(|s| (s.func_depth, s.source_depth));
     if funcs == 0 && sources == 0 {
-        err_line("meowsh: return: can only `return' from a function or sourced script");
+        builtin_err(
+            "return",
+            "can only `return' from a function or sourced script",
+        );
         return 1;
     }
     let code = match words.get(1) {
@@ -255,7 +258,7 @@ fn builtin_return(words: &[String]) -> i32 {
         Some(a) => match a.trim().parse::<i64>() {
             Ok(n) => (n & 0xff) as i32,
             Err(_) => {
-                err_line(&format!("meowsh: return: {}: numeric argument required", a));
+                builtin_err("return", &format!("{}: numeric argument required", a));
                 2
             }
         },
@@ -338,7 +341,7 @@ fn builtin_source(words: &[String]) -> i32 {
         return usage(&words[0], "filename argument required");
     };
     let Some(path) = find_sourced(file) else {
-        err_line(&format!("meowsh: {}: {}: not found", words[0], file));
+        builtin_err(&words[0], &format!("{}: not found", file));
         return 1;
     };
     let args = if words.len() > 2 {
@@ -420,7 +423,7 @@ fn builtin_unset(words: &[String]) -> i32 {
                 .is_some_and(|p| p.attrs & VAR_READONLY != 0)
         });
         if readonly {
-            err_line(&format!("meowsh: unset: read-only variable: {}", a));
+            builtin_err("unset", &format!("read-only variable: {}", a));
             status = 1;
             continue;
         }
@@ -539,14 +542,14 @@ fn builtin_shift(words: &[String]) -> i32 {
         Some(a) => match a.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
-                err_line(&format!("meowsh: shift: {}: numeric argument required", a));
+                builtin_err("shift", &format!("{}: numeric argument required", a));
                 return 1;
             }
         },
     };
     with_shell(|s| {
         if n > s.pos_params.len() {
-            err_line("meowsh: shift: can't shift that many");
+            builtin_err("shift", "can't shift that many");
             return 1;
         }
         s.pos_params.drain(..n);
@@ -806,7 +809,7 @@ fn builtin_read(words: &[String]) -> i32 {
     }
     for n in &names {
         if !is_valid_name(n) {
-            err_line(&format!("meowsh: read: `{}': not a valid identifier", n));
+            builtin_err("read", &format!("`{}': not a valid identifier", n));
             return 2;
         }
     }
@@ -1093,7 +1096,7 @@ fn builtin_cd(words: &[String]) -> i32 {
         None => match var_get_opt("HOME").filter(|h| !h.is_empty()) {
             Some(h) => h,
             None => {
-                err_line("meowsh: cd: HOME not set");
+                builtin_err("cd", "HOME not set");
                 return 1;
             }
         },
@@ -1103,7 +1106,7 @@ fn builtin_cd(words: &[String]) -> i32 {
                 d
             }
             None => {
-                err_line("meowsh: cd: OLDPWD not set");
+                builtin_err("cd", "OLDPWD not set");
                 return 1;
             }
         },
@@ -1139,7 +1142,7 @@ fn builtin_cd(words: &[String]) -> i32 {
         .unwrap_or_default();
     let new = if physical {
         if let Err(e) = chdir(&dir) {
-            err_line(&format!("meowsh: cd: {}: {}", target, strerror(e)));
+            builtin_err("cd", &crate::exec::file_error(&target, e));
             return 1;
         }
         physical_cwd().unwrap_or(dir)
@@ -1150,7 +1153,7 @@ fn builtin_cd(words: &[String]) -> i32 {
             normalize_path(&format!("{}/{}", old, dir))
         };
         if let Err(e) = chdir(&logical) {
-            err_line(&format!("meowsh: cd: {}: {}", target, strerror(e)));
+            builtin_err("cd", &crate::exec::file_error(&target, e));
             return 1;
         }
         logical
@@ -1172,7 +1175,7 @@ fn builtin_pwd(words: &[String]) -> i32 {
         _ => match physical_cwd() {
             Some(p) => p,
             None => {
-                err_line("meowsh: pwd: cannot determine current directory");
+                builtin_err("pwd", "cannot determine current directory");
                 return 1;
             }
         },
@@ -1194,7 +1197,7 @@ fn builtin_pushd(words: &[String]) -> i32 {
                 dir
             }
             None => {
-                err_line("meowsh: pushd: directory stack empty");
+                builtin_err("pushd", "directory stack empty");
                 return 1;
             }
         },
@@ -1212,7 +1215,7 @@ fn builtin_pushd(words: &[String]) -> i32 {
 
 fn builtin_popd() -> i32 {
     let Some(target) = with_shell(|s| s.dir_stack.pop()) else {
-        err_line("meowsh: popd: directory stack empty");
+        builtin_err("popd", "directory stack empty");
         return 1;
     };
     let status = builtin_cd(&["cd".to_string(), target.clone()]);
@@ -1329,7 +1332,7 @@ fn builtin_alias(words: &[String]) -> i32 {
                     out(&format!("alias {}={}\n", a, shell_quote(&v)));
                 }
                 None => {
-                    err_line(&format!("meowsh: alias: {}: not found", a));
+                    builtin_err("alias", &format!("{}: not found", a));
                     status = 1;
                 }
             },
@@ -1356,7 +1359,7 @@ fn builtin_unalias(words: &[String]) -> i32 {
                 | s.alias_map(true).remove(a.as_str()).is_some()
         });
         if !removed {
-            err_line(&format!("meowsh: unalias: {}: not found", a));
+            builtin_err("unalias", &format!("{}: not found", a));
             status = 1;
         }
     }
@@ -1701,7 +1704,7 @@ fn builtin_command(words: &[String]) -> i32 {
             }
             None => {
                 if verbose {
-                    err_line(&format!("meowsh: command: {}: not found", name));
+                    builtin_err("command", &format!("{}: not found", name));
                 }
                 status = 1;
             }
@@ -1717,7 +1720,7 @@ fn builtin_hash(words: &[String]) -> i32 {
             continue;
         }
         if find_command(name).is_none() && !is_builtin(name) {
-            err_line(&format!("meowsh: hash: {}: not found", name));
+            builtin_err("hash", &format!("{}: not found", name));
             status = 1;
         }
     }
@@ -1796,13 +1799,13 @@ fn builtin_kill(words: &[String]) -> i32 {
                 for pid in pids {
                     if unsafe { libc::kill(pid, sig) } != 0 {
                         let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        err_line(&format!("meowsh: kill: ({}) - {}", pid, strerror(e)));
+                        builtin_err("kill", &format!("({}) - {}", pid, strerror(e)));
                         status = 1;
                     }
                 }
             }
             Err(e) => {
-                err_line(&format!("meowsh: kill: {}", e));
+                builtin_err("kill", &e.to_string());
                 status = 1;
             }
         }
@@ -1846,7 +1849,7 @@ fn builtin_trap(words: &[String]) -> i32 {
     for c in conds {
         match signal_number(c) {
             Some(sig) if sig == libc::SIGKILL || sig == libc::SIGSTOP => {
-                err_line(&format!("meowsh: trap: {}: cannot trap", c));
+                builtin_err("trap", &format!("{}: cannot trap", c));
                 status = 1;
             }
             Some(sig) => set_trap(sig, action.clone()),
@@ -1998,7 +2001,7 @@ fn builtin_ulimit(words: &[String]) -> i32 {
     let (res, unit, what) = resource;
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrlimit(res as _, &mut lim) } != 0 {
-        err_line(&format!("meowsh: ulimit: {}: cannot get limit", what));
+        builtin_err("ulimit", &format!("{}: cannot get limit", what));
         return 1;
     }
     match value {
@@ -2027,7 +2030,7 @@ fn builtin_ulimit(words: &[String]) -> i32 {
             }
             if unsafe { libc::setrlimit(res as _, &lim) } != 0 {
                 let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                err_line(&format!("meowsh: ulimit: {}: {}", what, strerror(e)));
+                builtin_err("ulimit", &format!("{}: {}", what, strerror(e)));
                 return 1;
             }
             0
@@ -2082,6 +2085,7 @@ fn builtin_autoload(words: &[String]) -> i32 {
                     FuncDef {
                         body: Arc::new(body),
                         origin: s.argv0.clone(),
+                        line: 0,
                     },
                 )
             });
@@ -2115,7 +2119,7 @@ fn autoload_now(name: &str) -> bool {
                 crate::parser::ParseError::Syntax(m) => m,
                 crate::parser::ParseError::Incomplete => "unexpected end of file".to_string(),
             };
-            err_line(&format!("meowsh: {}: {}", name, msg));
+            builtin_err(name, &msg);
             return false;
         }
     };
@@ -2125,6 +2129,7 @@ fn autoload_now(name: &str) -> bool {
             FuncDef {
                 body: Arc::new(body),
                 origin: s.argv0.clone(),
+                line: 0,
             },
         )
     });
@@ -2172,7 +2177,7 @@ fn builtin_setopt(words: &[String], value: bool) -> i32 {
             match args.get(i + 1) {
                 Some(o) => {
                     if !crate::options::set(o, on) {
-                        err_line(&format!("meowsh: {}: no such option: {}", name, o));
+                        builtin_err(name, &format!("no such option: {}", o));
                         status = 1;
                     }
                 }
@@ -2190,13 +2195,13 @@ fn builtin_setopt(words: &[String], value: bool) -> i32 {
                         crate::options::set(o, if on { v } else { !v });
                     }
                     None => {
-                        err_line(&format!("meowsh: {}: bad option: -{}", name, c));
+                        builtin_err(name, &format!("bad option: -{}", c));
                         status = 1;
                     }
                 }
             }
         } else if !crate::options::set(arg, value) {
-            err_line(&format!("meowsh: {}: no such option: {}", name, arg));
+            builtin_err(name, &format!("no such option: {}", arg));
             status = 1;
         }
         i += 1;
@@ -2357,13 +2362,15 @@ pub fn run_hooks(hook: &str, args: &[String]) {
         })
     };
     for name in names {
-        let Some(body) = with_shell(|s| s.functions.get(&name).map(|f| f.body.clone())) else {
+        let Some((body, line)) =
+            with_shell(|s| s.functions.get(&name).map(|f| (f.body.clone(), f.line)))
+        else {
             continue;
         };
         restore();
         let mut words = vec![name];
         words.extend(args.iter().cloned());
-        call_function(&body, &words);
+        call_function(&body, &words, line);
         if matches!(crate::exec::flow(), Flow::Exit(_)) {
             return;
         }
@@ -2554,7 +2561,7 @@ fn builtin_zparseopts(words: &[String]) -> i32 {
             .max_by_key(|(_, s)| s.name.len());
         let Some((idx, spec)) = found else {
             if fail_unknown {
-                err_line(&format!("meowsh: zparseopts: bad option: {}", p));
+                builtin_err("zparseopts", &format!("bad option: {}", p));
                 return 1;
             }
             kept.push(p.clone());
@@ -2758,8 +2765,8 @@ fn builtin_emulate(words: &[String]) -> i32 {
         with_shell(|s| crate::options::emulate_in(s, mode, reset_all));
         let st = run_string(&cmd);
         with_shell(|s| {
+            crate::options::restore_in(s, &saved.1);
             s.opts = saved.0;
-            s.named_opts = saved.1;
             s.emulation = saved.2;
             if let Some(o) = saved.3 {
                 s.store("options", crate::params::Value::Assoc(o));
@@ -2911,7 +2918,7 @@ fn builtin_print(words: &[String]) -> i32 {
     match crate::sys::write_fd(fd, text.as_bytes()) {
         Ok(()) => 0,
         Err(e) => {
-            err_line(&format!("meowsh: print: write error: {}", e));
+            builtin_err("print", &format!("write error: {}", e));
             1
         }
     }
