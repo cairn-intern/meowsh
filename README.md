@@ -62,7 +62,16 @@ and builtins include:
   `(%)`, `(P)`, `(t)`, `(l:n:)`; modifiers `:h`, `:t`, `:r`, `:e`, `:a`,
   `:A`, `:l`, `:u`, `:q`, `:s/a/b/`; `${a[2,-1]}`, `${^a}`, `${=a}`,
   `${a:#pat}`, `${a:^b}`; `$name[sub]`, `$+name`, `$#name` without braces
+- match flags `(S)`, `(I:n:)`, `(M)`, `(R)`, `(B)`, `(E)`, `(N)` with
+  `#`, `%` and `/`; `${a:/pat/repl}`, `${name::=word}`, `${a:|b}`,
+  `${a:*b}`, `(A)` assignment, `(e)`, `(%)`/`(%%)`, `(V)`, `(g)`,
+  `(qqqq)`, `(c)`/`(w)`/`(W)` counts, `(l)`/`(r)` padding with two strings
 - subscript flags `(i)`, `(I)`, `(r)`, `(R)`, `(e)`, `(w)` and `^pat`
+- `EXTENDED_GLOB`: `x#`, `x##`, `^pat`, `a~b`, `(#i)`
+- namerefs (`typeset -n`), `[key]=value` items in array assignments and
+  slice assignment (`a[2,4]=(x y)`)
+- `whence` (`-v`, `-c`, `-w`, `-a`, `-p`, `-m`, `-s`, `-S`), `which`,
+  `where`, `type`
 - patterns and globs with `(a|b)` groups and `<n-m>` ranges, `**/`, and
   glob qualifiers such as `(N)`, `(.)`, `(/)`, `(@)`, `(m-1)`, `(D)`
 - `[[ x == (a|b)* ]]` and `[[ -v name[key] ]]`

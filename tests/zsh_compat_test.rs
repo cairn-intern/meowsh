@@ -400,3 +400,91 @@ fn precommand_modifiers_and_exec_options() {
     );
     assert_eq!(out, "*\nquiet\nrenamed\n");
 }
+
+// ---- whence, match flags, extended glob, namerefs, array items ------------
+
+#[test]
+fn whence_family_formats() {
+    let (_, out, _) = sh(
+        "alias ll='ls -l'; f() { :; }; whence ll; whence -v ll f echo if; whence -c echo if; \
+         whence -w ll f echo if sh nope-xyz; type -w echo",
+    );
+    assert_eq!(
+        out,
+        "ls -l\nll is an alias for ls -l\nf is a shell function from zsh\necho is a shell builtin\n\
+         if is a reserved word\necho: shell built-in command\nif: shell reserved word\n\
+         ll: alias\nf: function\necho: builtin\nif: reserved\nsh: command\nnope-xyz: none\necho: builtin\n"
+    );
+}
+
+#[test]
+fn substitution_match_flags() {
+    let (_, out, _) = sh(
+        "s='where is the white windmill'; print ${(S)s#h*e}; print ${(S)s%%h*e}; \
+         print ${(BES)s##white}; print ${(NS)s##white}; print ${(MSI:2:)s#w*e}; \
+         a=(arthur boldly claws); print ${a:/[aeiou]*/X}; print ${(S)a/[aeiou]*/Y}; \
+         x=abcabc; print ${x//b/X} ${x#*b} ${x%%b*}; set2=old; print ${set2::=new} $set2; \
+         m=(one two three); n=(two); print ${m:|n} -- ${m:*n}",
+    );
+    assert_eq!(
+        out,
+        "wre is the white windmill\nwhere is the w windmill\n14 19\n5\nwhite\nX boldly claws\n\
+         Yrthur bYldly clYws\naXcaXc cabc a\nnew new\none three -- two\n"
+    );
+}
+
+#[test]
+fn extended_glob_operators() {
+    let (_, out, _) = sh(
+        "setopt extendedglob; [[ aaab == a#b ]] && echo 1; [[ b == a##b ]] || echo 2; \
+         [[ foo == ^bar ]] && echo 3; [[ foo.c == *.c~f* ]] || echo 4; [[ FOO == (#i)foo ]] && echo 5; \
+         [[ abab == (ab)## ]] && echo 6; print \"q~^#\"",
+    );
+    assert_eq!(out, "1\n2\n3\n4\n5\n6\nq~^#\n");
+}
+
+#[test]
+fn padding_and_display_flags() {
+    let (_, out, _) = sh(
+        "foo=(resulting words uproariously); print ${(l.5..X.r.5..Y.)foo}; \
+         print ${(l.6..X..A.r.6..Y..B.)foo}; w=(why in); print ${(r.5..!..?.)w}; \
+         e='$(print a b)'; print -l ${(e)e}; psvar=(dog); print ${(%):-%1v}; \
+         arr=(ab cd e); print ${(c)#arr} ${(w)#arr}; v=$'a\\x7fb'; print ${(V)v}; \
+         q=\"a b'c\"; print -r ${(qqqq)q}",
+    );
+    assert_eq!(
+        out,
+        "Xresulting XXXwordsYY proariousl\nXAresultingB XXXAwordsBYY uproariously\n\
+         why?! in?!!\na\nb\ndog\n7 3\na^?b\n$'a b\\'c'\n"
+    );
+}
+
+#[test]
+fn namerefs() {
+    let (status, out, err) = sh(
+        "var=value; typeset -n ptr=var; echo $ptr ${ptr[2,3]} ${!ptr}; ptr=new; echo $var; \
+         arr=(a b); typeset -n ar=arr; ar+=(c); echo ${ar[@]} $#ar; typeset -p ptr; \
+         typeset -n p2; p2=var; echo $p2; unset ptr; echo ${+var}; \
+         typeset -n l1=l2; typeset -n l2=l1",
+    );
+    assert_eq!(
+        out,
+        "value al var\nnew\na b c 3\ntypeset -n ptr=var\nnew\n0\n"
+    );
+    assert!(err.contains("invalid self reference"), "stderr: {}", err);
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn key_value_array_items_and_slices() {
+    let (_, out, _) = sh(
+        "typeset -A h=([one]=eins [two]=zwei); h+=([three]=drei); for k in ${(ok)h}; print $k $h[$k]; \
+         a=(first [3]=third fourth); print -l \"${a[@]}\"; \
+         c=(one two three four five); c[2,4]=(umm er); print ${#c} $c; c[2,3]=(); print $c; \
+         s=abcdef; s[2,3]=XY; print $s",
+    );
+    assert_eq!(
+        out,
+        "one eins\nthree drei\ntwo zwei\nfirst\n\nthird\nfourth\n4 one umm er five\none five\naXYdef\n"
+    );
+}

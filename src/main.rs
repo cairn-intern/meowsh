@@ -123,6 +123,9 @@ fn main() {
                 .unwrap_or_else(|| "meowsh".to_string())
         });
         s.pos_params = args.positional.clone();
+        if let Some(script) = &args.script {
+            s.script_name = script.clone();
+        }
         for (opt, on) in &args.options {
             options::set_in(s, opt, *on);
         }

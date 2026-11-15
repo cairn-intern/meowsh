@@ -1,6 +1,6 @@
 use crate::params::{
-    Param, Value, DEFAULT_TIES, EXPORT, FLOAT_E, FLOAT_F, INTEGER, LEFT, NAMEREF, READONLY,
-    RIGHT_B, RIGHT_Z, UNIQUE, UNSET,
+    Param, Value, DEFAULT_TIES, EXPORT, FLOAT_E, FLOAT_F, INTEGER, LEFT, READONLY, RIGHT_B,
+    RIGHT_Z, UNIQUE, UNSET,
 };
 use crate::types::{Shell, OPT_ALLEXPORT};
 use std::collections::{BTreeMap, HashSet};
@@ -258,9 +258,42 @@ pub fn seed_random(seed: u64) {
     );
 }
 
+/// The parameter `name` refers to, following namerefs.
+pub fn resolve_ref(name: &str) -> String {
+    with_shell(|s| s.resolve_name(name))
+}
+
+// Resolves a nameref target that carries a subscript: (name, sub).
+fn split_target(t: &str) -> (String, Option<String>) {
+    match t.find('[') {
+        Some(k) if t.ends_with(']') => {
+            (t[..k].to_string(), Some(t[k + 1..t.len() - 1].to_string()))
+        }
+        _ => (t.to_string(), None),
+    }
+}
+
 pub fn var_get(name: &str) -> String {
     if let Some(v) = dynamic_var(name) {
         return v;
+    }
+    let resolved = resolve_ref(name);
+    if resolved != name {
+        let (base, sub) = split_target(&resolved);
+        return match sub {
+            Some(sub) => with_shell(|s| match s.param(&base).map(|p| p.value.clone()) {
+                Some(Value::Assoc(m)) => m.get(&sub).cloned().unwrap_or_default(),
+                Some(Value::Array(a)) => sub
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| a.get(i).cloned())
+                    .unwrap_or_default(),
+                Some(Value::Scalar(v)) => v,
+                None => String::new(),
+            }),
+            None => var_get(&base),
+        };
     }
     let shell = SHELL.shell.lock().unwrap();
     match name {
@@ -295,6 +328,10 @@ pub fn var_get(name: &str) -> String {
 }
 
 pub fn var_exists(name: &str) -> bool {
+    let resolved = resolve_ref(name);
+    if resolved != name {
+        return var_exists(&split_target(&resolved).0);
+    }
     if matches!(
         name,
         "RANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME"
@@ -457,7 +494,66 @@ pub fn justify(v: &str, attrs: u32, width: usize) -> String {
     out
 }
 
+/// Points nameref `name` at `target`, rejecting bad names and loops.
+pub fn set_ref_target(name: &str, target: &str) -> bool {
+    let (base, sub) = split_target(target);
+    let valid = !target.is_empty()
+        && (crate::lexer::is_valid_name(&base) || base.chars().all(|c| c.is_ascii_digit()))
+        && sub
+            .as_ref()
+            .is_none_or(|_| target.ends_with(']') && target.matches('[').count() == 1);
+    if !target.is_empty() && !valid {
+        eprintln!("meowsh: invalid variable name: {}", target);
+        return false;
+    }
+    let looping = with_shell(|s| {
+        let mut cur = base.clone();
+        for _ in 0..64 {
+            if cur == name {
+                return true;
+            }
+            match s.param(&cur) {
+                Some(p) if p.attrs & crate::params::NAMEREF != 0 => match &p.value {
+                    Value::Scalar(t) if !t.is_empty() => cur = split_target(t).0,
+                    _ => return false,
+                },
+                _ => return false,
+            }
+        }
+        true
+    });
+    if looping {
+        eprintln!("meowsh: {}: invalid self reference", name);
+        return false;
+    }
+    with_shell(|s| {
+        if let Some(p) = s.param_mut(name) {
+            p.value = Value::Scalar(target.to_string());
+            p.attrs &= !UNSET;
+        }
+    });
+    true
+}
+
 pub fn var_set(name: &str, value: &str, export: bool) -> bool {
+    // A nameref without a target yet: the value becomes its target.
+    let placeholder = with_shell(|s| {
+        s.param(name).is_some_and(|p| {
+            p.attrs & crate::params::NAMEREF != 0
+                && matches!(&p.value, Value::Scalar(t) if t.is_empty())
+        })
+    });
+    if placeholder {
+        return set_ref_target(name, value);
+    }
+    let resolved = resolve_ref(name);
+    if resolved != name {
+        let (base, sub) = split_target(&resolved);
+        return match sub {
+            Some(sub) => array_set_subscript(&base, &sub, value.to_string(), false),
+            None => var_set(&base, value, export),
+        };
+    }
     if name == "RANDOM" {
         seed_random(value.trim().parse().unwrap_or(0));
     }
@@ -465,12 +561,6 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
     if attrs & READONLY != 0 {
         readonly_error(name);
         return false;
-    }
-    if attrs & NAMEREF != 0 {
-        let target = with_shell(|s| s.scalar(name).map(|t| t.to_string())).unwrap_or_default();
-        if !target.is_empty() && target != name {
-            return var_set(&target, value, export);
-        }
     }
     let value = match convert_for(attrs, value) {
         Ok(v) => v,
@@ -499,6 +589,8 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
 
 /// Stores items into array `name`, honoring -U and readonly.
 pub fn array_set(name: &str, items: Vec<String>) -> bool {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
@@ -513,7 +605,136 @@ pub fn array_set(name: &str, items: Vec<String>) -> bool {
     true
 }
 
+/// An item of an array assignment: a plain value or zsh's `[key]=value`
+/// (the bool: `[key]+=value`).
+#[derive(Clone, Debug)]
+pub enum ArrItem {
+    Plain(String),
+    Key(String, String, bool),
+}
+
+pub fn plain_items(items: &[ArrItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(|i| match i {
+            ArrItem::Plain(v) => v.clone(),
+            ArrItem::Key(k, v, _) => format!("[{}]={}", k, v),
+        })
+        .collect()
+}
+
+/// `name=(items)` / `name+=(items)` with `[key]=value` items: for an
+/// associative array each sets a key (plain items pair up); for a normal
+/// array `[n]=v` sets element n and later plain items follow it.
+pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool {
+    if !items.iter().any(|i| matches!(i, ArrItem::Key(..))) {
+        let plain = plain_items(&items);
+        return if append {
+            array_append(name, plain)
+        } else {
+            array_set(name, plain)
+        };
+    }
+    let target = split_target(&resolve_ref(name)).0;
+    let is_assoc = with_shell(|s| s.assoc(&target).is_some());
+    if is_assoc {
+        if items.iter().any(|i| matches!(i, ArrItem::Plain(_))) {
+            eprintln!(
+                "meowsh: {}: bad [key]=value syntax for associative array",
+                name
+            );
+            return false;
+        }
+        let mut map = if append {
+            with_shell(|s| s.assoc(&target).cloned()).unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        for i in items {
+            if let ArrItem::Key(k, v, add) = i {
+                let v = if add {
+                    format!("{}{}", map.get(&k).cloned().unwrap_or_default(), v)
+                } else {
+                    v
+                };
+                map.insert(k, v);
+            }
+        }
+        with_shell(|s| s.store(&target, Value::Assoc(map)));
+        return true;
+    }
+    let mut arr = if append {
+        array_get(&target).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut idx = arr.len();
+    for i in items {
+        match i {
+            ArrItem::Plain(v) => {
+                if arr.len() <= idx {
+                    arr.resize(idx + 1, String::new());
+                }
+                arr[idx] = v;
+                idx += 1;
+            }
+            ArrItem::Key(k, v, add) => {
+                let n = crate::arith::eval(&k).unwrap_or(0);
+                if n < 1 {
+                    eprintln!("meowsh: {}: assignment to invalid subscript range", name);
+                    return false;
+                }
+                let k = (n - 1) as usize;
+                if arr.len() <= k {
+                    arr.resize(k + 1, String::new());
+                }
+                if add {
+                    arr[k].push_str(&v);
+                } else {
+                    arr[k] = v;
+                }
+                idx = k + 1;
+            }
+        }
+    }
+    array_set(&target, arr)
+}
+
+/// `name[a,b]=(items)`: replaces elements a through b (1-based,
+/// negatives from the end) with `items`. `name[n]=(items)` replaces one.
+pub fn array_splice(name: &str, sub: &str, items: Vec<String>) -> bool {
+    let target = split_target(&resolve_ref(name)).0;
+    let (a, b) = match sub.split_once(',') {
+        Some((a, b)) => (crate::arith::eval(a), crate::arith::eval(b)),
+        None => (crate::arith::eval(sub), crate::arith::eval(sub)),
+    };
+    let (Ok(a), Ok(b)) = (a, b) else {
+        eprintln!("meowsh: {}: bad subscript", name);
+        return false;
+    };
+    let scalar = with_shell(|s| s.scalar(&target).map(|v| v.to_string()));
+    let mut arr: Vec<String> = match &scalar {
+        Some(v) => v.chars().map(|c| c.to_string()).collect(),
+        None => array_get(&target).unwrap_or_default(),
+    };
+    let len = arr.len() as i64;
+    let norm = |x: i64| if x < 0 { (len + x + 1).max(0) } else { x };
+    let start = (norm(a).max(1) - 1) as usize;
+    let end = (norm(b).max(start as i64)) as usize;
+    if arr.len() < start {
+        arr.resize(start, String::new());
+    }
+    let end = end.min(arr.len());
+    arr.splice(start..end, items);
+    match scalar {
+        Some(_) => var_set(&target, &arr.concat(), false),
+        None => array_set(&target, arr),
+    }
+}
+
 pub fn array_append(name: &str, items: Vec<String>) -> bool {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
@@ -536,6 +757,8 @@ pub fn array_append(name: &str, items: Vec<String>) -> bool {
 }
 
 pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: bool) -> bool {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
@@ -599,6 +822,8 @@ pub fn array_make_unique(name: &str) -> bool {
 }
 
 pub fn array_declare(name: &str) -> bool {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
@@ -613,6 +838,8 @@ pub fn array_declare(name: &str) -> bool {
 }
 
 pub fn assoc_declare(name: &str) -> bool {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
@@ -624,6 +851,8 @@ pub fn assoc_declare(name: &str) -> bool {
 }
 
 pub fn assoc_set(name: &str, key: &str, value: &str) {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
     shell
         .assoc_entry(name)
@@ -631,16 +860,22 @@ pub fn assoc_set(name: &str, key: &str, value: &str) {
 }
 
 pub fn assoc_get(name: &str, key: &str) -> Option<String> {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let shell = SHELL.shell.lock().unwrap();
     shell.assoc(name).and_then(|m| m.get(key).cloned())
 }
 
 pub fn assoc_values(name: &str) -> Option<Vec<String>> {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let shell = SHELL.shell.lock().unwrap();
     shell.assoc(name).map(|m| m.values().cloned().collect())
 }
 
 pub fn assoc_keys(name: &str) -> Option<Vec<String>> {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let shell = SHELL.shell.lock().unwrap();
     shell.assoc(name).map(|m| m.keys().cloned().collect())
 }
@@ -683,10 +918,14 @@ fn assoc_from_items(items: Vec<String>) -> BTreeMap<String, String> {
 }
 
 pub fn array_get(name: &str) -> Option<Vec<String>> {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     SHELL.shell.lock().unwrap().array(name).cloned()
 }
 
 pub fn is_array(name: &str) -> bool {
+    let resolved = split_target(&resolve_ref(name)).0;
+    let name = resolved.as_str();
     let shell = SHELL.shell.lock().unwrap();
     shell
         .param(name)
@@ -802,6 +1041,14 @@ pub fn expand_prompt(s: &str) -> String {
             }
             out.push_str(&expand_prompt(after));
             return out;
+        }
+        // %Nv: element N of $psvar.
+        if chars.peek() == Some(&'v') {
+            chars.next();
+            let n: usize = digits.parse().unwrap_or(1).max(1);
+            let v = with_shell(|s| s.array("psvar").and_then(|a| a.get(n - 1).cloned()));
+            out.push_str(&v.unwrap_or_default());
+            continue;
         }
         // Numeric arguments to other escapes (%3~ and so on) are ignored.
         match chars.next() {

@@ -99,7 +99,7 @@ pub fn resolve(name: &str) -> Option<(&'static str, bool)> {
 // parameter's value): a copy behind its own lock, which is never held
 // while taking the shell lock.
 static QUICK: std::sync::RwLock<Vec<&'static str>> = std::sync::RwLock::new(Vec::new());
-const QUICK_NAMES: &[&str] = &["cbases", "octalzeroes"];
+const QUICK_NAMES: &[&str] = &["cbases", "octalzeroes", "extendedglob"];
 
 /// For code that may run with the shell lock held: whether one of a few
 /// display options (cbases, octalzeroes) is on.

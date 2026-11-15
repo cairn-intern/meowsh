@@ -65,6 +65,9 @@ const REGULAR: &[&str] = &[
     "zrecompile",
     "builtin",
     "unfunction",
+    "whence",
+    "which",
+    "where",
     "integer",
     "float",
     "functions",
@@ -137,7 +140,7 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "setopt" => builtin_setopt(words, true),
         "unsetopt" => builtin_setopt(words, false),
         "test" | "[" => crate::testexpr::builtin_test(words),
-        "type" => builtin_type(words),
+        "type" | "whence" | "which" | "where" => builtin_whence(words),
         "ulimit" => builtin_ulimit(words),
         "umask" => builtin_umask(words),
         "zstyle" => builtin_zstyle(&words[1..]),
@@ -307,14 +310,18 @@ pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
     }
     let saved = args.map(|a| with_shell(|s| std::mem::replace(&mut s.pos_params, a.to_vec())));
     // zsh: $0 is the sourced file while it runs.
-    let saved_argv0 = with_shell(|s| {
+    let (saved_argv0, saved_source) = with_shell(|s| {
         s.source_depth += 1;
-        std::mem::replace(&mut s.argv0, path.to_string())
+        (
+            std::mem::replace(&mut s.argv0, path.to_string()),
+            s.source_file.replace(path.to_string()),
+        )
     });
     let mut st = crate::exec::run_string_named(&content, Some(path));
     with_shell(|s| {
         s.source_depth -= 1;
         s.argv0 = saved_argv0;
+        s.source_file = saved_source;
         if let Flow::Return(n) = s.flow {
             st = n;
             s.flow = Flow::None;
@@ -379,6 +386,7 @@ fn list_vars(prefix: &str, flag: u32) {
 
 fn builtin_unset(words: &[String]) -> i32 {
     let mut functions = false;
+    let mut no_deref = false;
     let mut status = 0;
     for a in &words[1..] {
         match a.as_str() {
@@ -390,12 +398,23 @@ fn builtin_unset(words: &[String]) -> i32 {
                 functions = false;
                 continue;
             }
+            // -n: unset a nameref itself, not what it refers to.
+            "-n" => {
+                no_deref = true;
+                continue;
+            }
             _ => {}
         }
         if functions {
             with_shell(|s| s.functions.remove(a.as_str()));
             continue;
         }
+        let target = if no_deref {
+            a.clone()
+        } else {
+            with_shell(|s| s.resolve_name(a))
+        };
+        let a = &target;
         let readonly = with_shell(|s| {
             s.param(a.as_str())
                 .is_some_and(|p| p.attrs & VAR_READONLY != 0)
@@ -1391,19 +1410,259 @@ fn describe_command(name: &str, verbose: bool) -> Option<String> {
     })
 }
 
-fn builtin_type(words: &[String]) -> i32 {
-    let mut status = 0;
-    for name in &words[1..] {
-        match describe_command(name, true) {
-            Some(d) => {
-                out(&format!("{}\n", d));
-            }
-            None => {
-                err_line(&format!("meowsh: type: {}: not found", name));
-                status = 1;
+#[derive(Default)]
+struct Whence {
+    verbose: bool,   // -v
+    csh: bool,       // -c
+    word: bool,      // -w
+    funcs: bool,     // -f
+    all: bool,       // -a
+    path_only: bool, // -p
+    pattern: bool,   // -m
+    symlinks: u8,    // -s 1, -S 2
+    indent: Option<usize>,
+}
+
+// Resolves symlinks for -s (final target) or -S (each step).
+fn whence_links(path: &str, steps: bool) -> String {
+    let mut out = path.to_string();
+    let mut cur = std::path::PathBuf::from(path);
+    let mut seen = std::collections::HashSet::new();
+    while let Ok(target) = std::fs::read_link(&cur) {
+        if !seen.insert(cur.clone()) {
+            return path.to_string();
+        }
+        let next = cur.parent().map(|p| p.join(&target)).unwrap_or(target);
+        let next = std::fs::canonicalize(next.parent().unwrap_or(&next))
+            .map(|p| p.join(next.file_name().unwrap_or_default()))
+            .unwrap_or(next);
+        if steps {
+            out.push_str(&format!(" -> {}", next.display()));
+        }
+        cur = next;
+    }
+    if !steps {
+        if let Ok(real) = std::fs::canonicalize(path) {
+            if real.to_string_lossy() != path {
+                out.push_str(&format!(" -> {}", real.display()));
             }
         }
     }
+    out
+}
+
+fn path_matches(name: &str, all: bool) -> Vec<String> {
+    if name.contains('/') {
+        let p = std::path::Path::new(name);
+        return if p.is_file() {
+            vec![name.to_string()]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut found = Vec::new();
+    for dir in var_get("PATH").split(':') {
+        let dir = if dir.is_empty() { "." } else { dir };
+        let p = std::path::Path::new(dir).join(name);
+        if p.is_file() && crate::shell::find_command(&p.to_string_lossy()).is_some() {
+            found.push(p.to_string_lossy().into_owned());
+            if !all {
+                break;
+            }
+        }
+    }
+    found
+}
+
+// One name for whence and its relatives. Returns false if not found.
+fn whence_one(name: &str, o: &Whence, out_text: &mut String) -> bool {
+    let mut found = false;
+    let mut line = |s: String| {
+        out_text.push_str(&s);
+        out_text.push('\n');
+    };
+    if !o.path_only {
+        if let Some(v) = with_shell(|s| s.alias(name, false).cloned()) {
+            line(if o.word {
+                format!("{}: alias", name)
+            } else if o.csh {
+                format!("{}: aliased to {}", name, v)
+            } else if o.verbose {
+                format!("{} is an alias for {}", name, v)
+            } else {
+                v
+            });
+            found = true;
+            if !o.all {
+                return true;
+            }
+        }
+        if let Some(v) = with_shell(|s| s.alias(name, true).cloned()) {
+            line(if o.word {
+                format!("{}: global alias", name)
+            } else if o.csh {
+                format!("{}: globally aliased to {}", name, v)
+            } else if o.verbose {
+                format!("{} is a global alias for {}", name, v)
+            } else {
+                v
+            });
+            found = true;
+            if !o.all {
+                return true;
+            }
+        }
+        if KEYWORDS.contains(&name) {
+            line(if o.word {
+                format!("{}: reserved", name)
+            } else if o.csh {
+                format!("{}: shell reserved word", name)
+            } else if o.verbose {
+                format!("{} is a reserved word", name)
+            } else {
+                name.to_string()
+            });
+            found = true;
+            if !o.all {
+                return true;
+            }
+        }
+        if let Some(f) = with_shell(|s| s.functions.get(name).cloned()) {
+            let def = || crate::deparse::function_text(name, &f.body, o.indent);
+            line(if o.word {
+                format!("{}: function", name)
+            } else if o.csh || o.funcs {
+                def().trim_end().to_string()
+            } else if o.verbose {
+                format!("{} is a shell function from {}", name, f.origin)
+            } else {
+                name.to_string()
+            });
+            found = true;
+            if !o.all {
+                return true;
+            }
+        }
+        if is_builtin(name) {
+            line(if o.word {
+                format!("{}: builtin", name)
+            } else if o.csh {
+                format!("{}: shell built-in command", name)
+            } else if o.verbose {
+                format!("{} is a shell builtin", name)
+            } else {
+                name.to_string()
+            });
+            found = true;
+            if !o.all {
+                return true;
+            }
+        }
+    }
+    for p in path_matches(name, o.all) {
+        let shown = match o.symlinks {
+            1 => whence_links(&p, false),
+            2 => whence_links(&p, true),
+            _ => p.clone(),
+        };
+        line(if o.word {
+            format!("{}: command", name)
+        } else if o.verbose && !o.csh {
+            format!("{} is {}", name, shown)
+        } else {
+            shown
+        });
+        found = true;
+    }
+    if !found {
+        if o.word {
+            line(format!("{}: none", name));
+        } else if o.verbose || o.csh {
+            line(format!("{} not found", name));
+        }
+    }
+    found
+}
+
+/// whence, and which (-c), where (-ca), type (-v).
+fn builtin_whence(words: &[String]) -> i32 {
+    let cmd = words[0].as_str();
+    let mut o = Whence::default();
+    match cmd {
+        "which" => o.csh = true,
+        "where" => {
+            o.csh = true;
+            o.all = true;
+        }
+        "type" => o.verbose = true,
+        _ => {}
+    }
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            break;
+        };
+        let mut chars = flags.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                'v' => o.verbose = true,
+                'c' => o.csh = true,
+                'w' => o.word = true,
+                'f' => o.funcs = true,
+                'a' => o.all = true,
+                'p' => o.path_only = true,
+                'm' => o.pattern = true,
+                's' => o.symlinks = 1,
+                'S' => o.symlinks = 2,
+                'x' => {
+                    let rest: String = chars.by_ref().collect();
+                    let n = if rest.is_empty() {
+                        i += 1;
+                        words.get(i).cloned().unwrap_or_default()
+                    } else {
+                        rest
+                    };
+                    match n.parse() {
+                        Ok(v) => o.indent = Some(v),
+                        Err(_) => return usage(cmd, &format!("bad argument to -x: {}", n)),
+                    }
+                }
+                _ => return usage(cmd, &format!("bad option: -{}", c)),
+            }
+        }
+        i += 1;
+    }
+    let mut status = 0;
+    let mut text = String::new();
+    for name in &words[i.min(words.len())..] {
+        if o.pattern {
+            let mut names: Vec<String> = crate::shell::all_commands()
+                .into_iter()
+                .chain(with_shell(|s| {
+                    s.functions.keys().cloned().collect::<Vec<_>>()
+                }))
+                .chain(builtin_names().map(|b| b.to_string()))
+                .filter(|n| crate::pattern::matches(name, n))
+                .collect();
+            names.sort();
+            names.dedup();
+            if names.is_empty() {
+                status = 1;
+            }
+            for n in names {
+                whence_one(&n, &o, &mut text);
+            }
+            continue;
+        }
+        if !whence_one(name, &o, &mut text) {
+            status = 1;
+        }
+    }
+    out(&text);
     status
 }
 
@@ -1428,6 +1687,12 @@ fn builtin_command(words: &[String]) -> i32 {
     let Some(verbose) = verbose else {
         return 0;
     };
+    // command -V is whence -v.
+    if verbose {
+        let mut args = vec!["whence".to_string(), "-v".to_string()];
+        args.extend(words[i..].iter().cloned());
+        return builtin_whence(&args);
+    }
     let mut status = 0;
     for name in &words[i..] {
         match describe_command(name, verbose) {
@@ -1816,6 +2081,7 @@ fn builtin_autoload(words: &[String]) -> i32 {
                     arg.clone(),
                     FuncDef {
                         body: Arc::new(body),
+                        origin: s.argv0.clone(),
                     },
                 )
             });
@@ -1858,6 +2124,7 @@ fn autoload_now(name: &str) -> bool {
             name.to_string(),
             FuncDef {
                 body: Arc::new(body),
+                origin: s.argv0.clone(),
             },
         )
     });

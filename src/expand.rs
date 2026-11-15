@@ -154,6 +154,16 @@ fn lookup(name: &str) -> Val {
         "*" => return Val::List(pos_params(), true),
         _ => {}
     }
+    let resolved = crate::shell::resolve_ref(name);
+    if resolved != name {
+        return match resolved.find('[') {
+            Some(k) if resolved.ends_with(']') => {
+                param_value(&resolved[..k], Some(&resolved[k + 1..resolved.len() - 1]))
+                    .unwrap_or(Val::Unset)
+            }
+            _ => lookup(&resolved),
+        };
+    }
     if let Some(items) = with_shell(|s| s.array(name).cloned()) {
         return Val::List(items, true);
     }
@@ -659,15 +669,30 @@ struct PFlags {
     icase: bool,
     unique: bool,
     case: Option<char>,
-    prompt: bool,
+    prompt: u8,
+    visible: bool,
+    count_chars: bool,
+    words: bool,
+    words_empty: bool,
+    gflags: Option<String>,
+    // (A): `=` assigns an array; (AA) an associative array.
+    assign_array: u8,
     backslash: bool,
     eval: bool,
     indirect: bool,
     type_of: bool,
-    pad_left: Option<(usize, String)>,
-    pad_right: Option<(usize, String)>,
+    // (l:n::fill::once:) / (r...): width, repeated fill, one-off string.
+    pad_left: Option<(usize, Option<String>, Option<String>)>,
+    pad_right: Option<(usize, Option<String>, Option<String>)>,
+    escapes: bool,
     tilde_dirs: bool,
     matching: bool,
+    substr: bool,
+    rest_part: bool,
+    bind: bool,
+    eind: bool,
+    mlen: bool,
+    nth: Option<String>,
     any: bool,
 }
 
@@ -726,38 +751,47 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             'i' => f.icase = true,
             'u' => f.unique = true,
             'U' | 'L' | 'C' => f.case = Some(c),
-            '%' => f.prompt = true,
+            '%' => f.prompt += 1,
+            'V' => f.visible = true,
+            'c' => f.count_chars = true,
+            'w' => f.words = true,
+            'W' => f.words_empty = true,
+            'g' => f.gflags = Some(arg(&mut i)?),
             'b' => f.backslash = true,
             'e' => f.eval = true,
             'P' => f.indirect = true,
             't' => f.type_of = true,
             'D' => f.tilde_dirs = true,
             'M' => f.matching = true,
+            'S' => f.substr = true,
+            'R' => f.rest_part = true,
+            'B' => f.bind = true,
+            'E' => f.eind = true,
+            'N' => f.mlen = true,
+            'I' => f.nth = Some(arg(&mut i)?),
+            'p' => f.escapes = true,
             'l' | 'r' => {
-                let n: usize = arg(&mut i)?.trim().parse().ok()?;
-                // Optional fill string: `l:n::fill:`.
-                let fill = if body.get(i).is_some_and(|&d| d != ')') {
-                    let save = i;
-                    match arg(&mut i) {
-                        Some(s) if !s.is_empty() => s,
-                        _ => {
-                            i = save;
-                            " ".into()
-                        }
-                    }
-                } else {
-                    " ".into()
-                };
+                let d = *body.get(i)?;
+                let n_text = arg(&mut i)?;
+                let n = eval_arith_str(n_text.trim()).ok()?.max(0) as usize;
+                // Further strings must use the same delimiter.
+                let mut more = Vec::new();
+                while more.len() < 2 && body.get(i) == Some(&d) {
+                    let s = arg(&mut i)?;
+                    more.push(if f.escapes { decode_escapes(&s) } else { s });
+                }
+                let mut it = more.into_iter();
+                let entry = (n, it.next(), it.next());
                 if c == 'l' {
-                    f.pad_left = Some((n, fill));
+                    f.pad_left = Some(entry);
                 } else {
-                    f.pad_right = Some((n, fill));
+                    f.pad_right = Some(entry);
                 }
             }
             // Accepted without effect: A (assignment), R/B/E/N (match
             // parts), V, w, W, c, X, ~, #, m, S, I, p, g.
-            'A' | 'R' | 'B' | 'E' | 'N' | 'V' | 'w' | 'W' | 'c' | 'X' | '~' | '#' | 'm' | 'S'
-            | 'I' | 'p' | 'g' => {}
+            'A' => f.assign_array += 1,
+            'X' | '~' | '#' | 'm' => {}
             _ => return None,
         }
     }
@@ -964,6 +998,12 @@ fn matcher(word: &str, exact: bool) -> ExpResult<impl Fn(&str) -> bool> {
 fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     let Some(sub) = sub else {
         return Ok(lookup(name));
+    };
+    let resolved = crate::shell::resolve_ref(name);
+    let name = if resolved.contains('[') {
+        name
+    } else {
+        resolved.as_str()
     };
     if name == "commands" && !with_shell(|s| s.assoc("commands").is_some()) {
         let key = expand_string(sub)?;
@@ -1176,6 +1216,66 @@ fn absolute_path(s: &str) -> String {
 
 // zsh `:q` / `(q)`: backslash before the characters special to the
 // shell; `~` only where it would expand (at the start).
+// (V): control characters as ^X, DEL as ^?.
+fn visible(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '\x7f' => out.push_str("^?"),
+            c if (c as u32) < 32 => {
+                out.push('^');
+                out.push(char::from(b'@' + c as u8));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// (qqqq): $'...' quoting.
+fn dollar_quote(s: &str) -> String {
+    let mut out = String::from("$'");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\x1b' => out.push_str("\\e"),
+            c if (c as u32) < 32 || c == '\x7f' => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+// (g:opts:): echo/print-style escapes; `e` adds \e and \M-, `c` ^X.
+fn g_escapes(s: &str, opts: &str) -> String {
+    let mut out = decode_escapes(s);
+    if opts.contains('c') {
+        let chars: Vec<char> = out.chars().collect();
+        let mut r = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '^' && i + 1 < chars.len() {
+                let c = chars[i + 1];
+                r.push(if c == '?' {
+                    '\x7f'
+                } else {
+                    char::from((c.to_ascii_uppercase() as u8) & 0x1f)
+                });
+                i += 2;
+            } else {
+                r.push(chars[i]);
+                i += 1;
+            }
+        }
+        out = r;
+    }
+    out
+}
+
 fn backslash_quote(s: &str) -> String {
     let mut out = String::new();
     for (k, c) in s.chars().enumerate() {
@@ -1299,26 +1399,110 @@ fn type_of(name: &str) -> String {
     })
 }
 
-fn pad(s: &str, n: usize, fill: &str, left: bool) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() >= n {
-        return if left {
-            chars[chars.len() - n..].iter().collect()
-        } else {
-            chars[..n].iter().collect()
-        };
-    }
-    let fill: Vec<char> = if fill.is_empty() {
-        vec![' ']
-    } else {
-        fill.chars().collect()
+// zsh's dopadding (Src/subst.c): pads or truncates `s` to `prenum`
+// characters on the left and/or `postnum` on the right. `*one` strings
+// go next to the text once; `*mul` strings repeat to fill.
+fn dopadding(
+    s: &str,
+    prenum: usize,
+    postnum: usize,
+    preone: Option<&str>,
+    postone: Option<&str>,
+    premul: Option<&str>,
+    postmul: Option<&str>,
+) -> String {
+    let def: Vec<char> = ifs().chars().next().map(|c| vec![c]).unwrap_or_default();
+    let one = |o: Option<&str>| {
+        o.map(|x| {
+            if x.is_empty() {
+                def.clone()
+            } else {
+                x.chars().collect::<Vec<_>>()
+            }
+        })
     };
-    let padding: String = (0..n - chars.len()).map(|k| fill[k % fill.len()]).collect();
-    if left {
-        padding + s
-    } else {
-        s.to_string() + &padding
+    let mul = |m: Option<&str>| match m {
+        Some(x) if !x.is_empty() => x.chars().collect::<Vec<_>>(),
+        _ => def.clone(),
+    };
+    let (preone, postone, premul, postmul) = (one(preone), one(postone), mul(premul), mul(postmul));
+    let s: Vec<char> = s.chars().collect();
+    let ls = s.len();
+    if prenum + postnum == ls {
+        return s.iter().collect();
     }
+    let mut r: Vec<char> = Vec::new();
+    // Left fill of width f before text (f > 0).
+    let left_fill = |r: &mut Vec<char>, f: usize| {
+        let lone = preone.as_ref().map(|p| p.len()).unwrap_or(0);
+        if f <= lone {
+            if let Some(p) = &preone {
+                r.extend(&p[lone - f..]);
+            }
+        } else {
+            let f = f - lone;
+            let lm = premul.len();
+            if let Some(reps) = f.checked_div(lm) {
+                let m = f % lm;
+                if m > 0 {
+                    r.extend(&premul[lm - m..]);
+                }
+                for _ in 0..reps {
+                    r.extend(&premul);
+                }
+            }
+            if let Some(p) = &preone {
+                r.extend(p);
+            }
+        }
+    };
+    let right_fill = |r: &mut Vec<char>, f: usize| {
+        let lone = postone.as_ref().map(|p| p.len()).unwrap_or(0);
+        if f <= lone {
+            if let Some(p) = &postone {
+                r.extend(&p[..f]);
+            }
+        } else {
+            let f = f - lone;
+            if let Some(p) = &postone {
+                r.extend(p);
+            }
+            let lm = postmul.len();
+            if let Some(reps) = f.checked_div(lm) {
+                for _ in 0..reps {
+                    r.extend(&postmul);
+                }
+                r.extend(&postmul[..f % lm]);
+            }
+        }
+    };
+    let mut pos = 0;
+    if prenum > 0 {
+        let first = if postnum > 0 { ls / 2 } else { ls };
+        if prenum <= first {
+            pos = first - prenum;
+            r.extend(&s[pos..pos + prenum]);
+            pos += prenum;
+        } else {
+            left_fill(&mut r, prenum - first);
+            r.extend(&s[..first]);
+            pos = first;
+        }
+        if postnum == 0 {
+            return r.into_iter().collect();
+        }
+    }
+    if postnum > 0 {
+        let rest = &s[pos..];
+        let need = if prenum > 0 { ls - ls / 2 } else { ls };
+        if postnum <= need {
+            r.extend(rest.iter().take(postnum));
+        } else {
+            r.extend(rest);
+            right_fill(&mut r, postnum - need);
+        }
+    }
+    r.into_iter().collect()
 }
 
 fn split_items(items: Vec<String>, sep: &str, keep_empty: bool) -> Vec<String> {
@@ -1351,7 +1535,10 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
     }
     if let Some(sep) = &f.split {
         let items = val_items(&val);
-        val = Val::List(split_items(items, sep, f.at && quoted), false);
+        val = Val::List(
+            split_items(items, sep, (f.at && quoted) || f.words_empty),
+            false,
+        );
     } else if f.zsplit {
         let items = val_items(&val);
         val = Val::List(items.iter().flat_map(|s| shell_words(s)).collect(), false);
@@ -1396,11 +1583,16 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             }
             _ => {}
         }
-        if f.prompt {
+        if f.prompt == 1 {
             *s = crate::shell::expand_prompt(s);
+        } else if f.prompt > 1 {
+            *s = crate::shell::render_prompt(s);
         }
-        if f.eval {
-            *s = expand_string(s)?;
+        if let Some(g) = &f.gflags {
+            *s = g_escapes(s, g);
+        }
+        if f.visible {
+            *s = visible(s);
         }
         if f.unquote {
             *s = unquote(s);
@@ -1412,6 +1604,7 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
                 0 => {}
                 1 => *s = backslash_quote(s),
                 2 => *s = format!("'{}'", s.replace('\'', "'\\''")),
+                4.. => *s = dollar_quote(s),
                 _ => {
                     let mut o = String::from('"');
                     for c in s.chars() {
@@ -1441,16 +1634,39 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
                 *s = format!("~{}", &s[home.len()..]);
             }
         }
-        if let Some((n, fill)) = &f.pad_left {
-            *s = pad(s, *n, fill, true);
-        }
-        if let Some((n, fill)) = &f.pad_right {
-            *s = pad(s, *n, fill, false);
+        if f.pad_left.is_some() || f.pad_right.is_some() {
+            let (pre, premul, preone) = f.pad_left.clone().unwrap_or((0, None, None));
+            let (post, postmul, postone) = f.pad_right.clone().unwrap_or((0, None, None));
+            *s = dopadding(
+                s,
+                pre,
+                post,
+                preone.as_deref(),
+                postone.as_deref(),
+                premul.as_deref(),
+                postmul.as_deref(),
+            );
         }
     }
     if let Some(sep) = &f.join {
         list = false;
         items = vec![items.join(sep)];
+    }
+    if f.eval {
+        // (e): expand each value again, as if it appeared here; the
+        // results split and glob like any expansion.
+        let mut fields: Vec<Vec<(char, u8)>> = Vec::new();
+        for it in &items {
+            let chars: Vec<char> = it.chars().collect();
+            let mut tmp = Ctx::new(true, false);
+            walk(
+                &chars,
+                if quoted { Mode::Dq } else { Mode::Unquoted },
+                &mut tmp,
+            )?;
+            fields.extend(tmp.fields);
+        }
+        return Ok(Val::Tagged(fields));
     }
     let mut out = wrap(items, list);
     if f.at {
@@ -1533,6 +1749,16 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
         name = n;
         sub = s;
         i += end;
+        // ${!ref} on a nameref: the name it refers to.
+        let is_ref = with_shell(|s| {
+            s.param(&name)
+                .is_some_and(|p| p.attrs & crate::params::NAMEREF != 0)
+        });
+        if indirect && is_ref {
+            return Ok(Val::Str(with_shell(|s| {
+                s.scalar(&name).unwrap_or("").to_string()
+            })));
+        }
         if indirect {
             let target = var_get(&name);
             let tchars: Vec<char> = target.chars().collect();
@@ -1669,7 +1895,7 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     {
         v
     } else {
-        apply_operator(val, &name, sub.as_deref(), rest, mode, &text)?
+        apply_operator(val, &name, sub.as_deref(), rest, mode, &text, &flags)?
     };
 
     if flags.any {
@@ -1691,10 +1917,27 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     }
     if length {
         let v = plain(val);
-        let n = match &v {
-            Val::Unset => 0,
-            Val::Str(s) => s.chars().count(),
-            other => val_items(other).len(),
+        let n = if flags.count_chars {
+            val_items(&v).join(" ").chars().count()
+        } else if (flags.words || flags.words_empty) && flags.split.is_none() {
+            let ifs = ifs();
+            val_items(&v)
+                .iter()
+                .map(|s| {
+                    let parts = s.split(|c| ifs.contains(c));
+                    if flags.words_empty {
+                        parts.count()
+                    } else {
+                        parts.filter(|w| !w.is_empty()).count()
+                    }
+                })
+                .sum()
+        } else {
+            match &v {
+                Val::Unset => 0,
+                Val::Str(s) => s.chars().count(),
+                other => val_items(other).len(),
+            }
         };
         return Ok(Val::Str(n.to_string()));
     }
@@ -1714,6 +1957,37 @@ fn plain_clone(v: &Val) -> Val {
     }
 }
 
+// The assignment of `${name=word}`; with (A) the word's fields become an
+// array, with (AA) key/value pairs.
+fn assign_word(name: &str, word: &[char], mode: Mode, pf: &PFlags) -> ExpResult<Val> {
+    if pf.assign_array > 0 {
+        let items = match word_val(word, mode)? {
+            Val::Tagged(fields) => {
+                let mut out = Vec::new();
+                for f in fields {
+                    for piece in split_field(&f, &ifs()) {
+                        out.push(tagged_text(&piece));
+                    }
+                }
+                out
+            }
+            other => val_items(&other),
+        };
+        if pf.assign_array > 1 {
+            crate::shell::assoc_declare(name);
+        }
+        if !crate::shell::array_set(name, items.clone()) {
+            return Err(ExpError { status: 1 });
+        }
+        return Ok(Val::List(items, false));
+    }
+    let v = word_string(word, mode)?;
+    if !var_set(name, &v, false) {
+        return Err(ExpError { status: 1 });
+    }
+    Ok(Val::Str(v))
+}
+
 // The POSIX/bash operators after the name: - = ? + # % / : ^ ,
 fn apply_operator(
     val: Val,
@@ -1722,6 +1996,7 @@ fn apply_operator(
     rest: &[char],
     mode: Mode,
     text: &str,
+    pf: &PFlags,
 ) -> ExpResult<Val> {
     let bad = || fail::<Val>(&format!("${{{}}}: bad substitution", text));
     let is_set = !matches!(val, Val::Unset);
@@ -1731,8 +2006,35 @@ fn apply_operator(
         Val::List(items, _) | Val::Rc(items) => items.iter().all(|s| s.is_empty()),
         Val::Tagged(f) => f.iter().all(|x| tagged_text(x).is_empty()),
     };
+    // ${name::=word}: assign unconditionally.
+    if rest.starts_with(&[':', ':', '=']) {
+        if !crate::lexer::is_valid_name(name) || sub.is_some() {
+            return fail(&format!("${{{}}}: cannot assign in this way", text));
+        }
+        return assign_word(name, &rest[3..], mode, pf);
+    }
+    // ${a:|b} removes b's elements from a; ${a:*b} keeps only those.
+    if rest.len() > 1 && rest[0] == ':' && matches!(rest[1], '|' | '*') {
+        let other: String = rest[2..].iter().collect();
+        let others = val_items(&lookup(&other));
+        let keep = rest[1] == '*';
+        let was_list = is_list(&val);
+        let items: Vec<String> = val_items(&plain(val))
+            .into_iter()
+            .filter(|x| others.contains(x) == keep)
+            .collect();
+        return Ok(if was_list {
+            Val::List(items, false)
+        } else {
+            items
+                .into_iter()
+                .next()
+                .map(Val::Str)
+                .unwrap_or(Val::Str(String::new()))
+        });
+    }
     let (colon, op, word) =
-        if rest[0] == ':' && rest.len() > 1 && matches!(rest[1], '-' | '=' | '?' | '+') {
+        if rest[0] == ':' && rest.len() > 1 && matches!(rest[1], '-' | '=' | '?' | '+' | '/') {
             (true, rest[1], &rest[2..])
         } else {
             (false, rest[0], &rest[1..])
@@ -1760,11 +2062,7 @@ fn apply_operator(
             if !crate::lexer::is_valid_name(name) || sub.is_some() {
                 return fail(&format!("${{{}}}: cannot assign in this way", text));
             }
-            let v = word_string(word, mode)?;
-            if !var_set(name, &v, false) {
-                return Err(ExpError { status: 1 });
-            }
-            Ok(Val::Str(v))
+            assign_word(name, word, mode, pf)
         }
         '?' => {
             if !missing {
@@ -1778,47 +2076,58 @@ fn apply_operator(
             };
             fail(&format!("{}: {}", name, msg))
         }
-        '#' | '%' => {
+        '#' | '%' | '/' => {
             check_set(name, &val)?;
-            let longest = word.first() == Some(&op);
-            let pat_chars = if longest { &word[1..] } else { word };
-            let pat = pattern_of(pat_chars)?;
-            Ok(map_items(val, |s| {
-                if op == '#' {
-                    crate::pattern::strip_prefix(s, &pat, longest)
-                } else {
-                    crate::pattern::strip_suffix(s, &pat, longest)
-                }
-            }))
-        }
-        '/' => {
-            check_set(name, &val)?;
-            let (mut global, mut anchor_start, mut anchor_end) = (false, false, false);
-            let mut w = word;
-            match w.first() {
-                Some('/') => {
-                    global = true;
-                    w = &w[1..];
-                }
-                Some('#') => {
-                    anchor_start = true;
-                    w = &w[1..];
-                }
-                Some('%') => {
-                    anchor_end = true;
-                    w = &w[1..];
-                }
-                _ => {}
-            }
-            let (pat_part, repl_part) = match find_unquoted(w, '/') {
-                Some(k) => (&w[..k], &w[k + 1..]),
-                None => (w, &w[w.len()..]),
+            let mut fl = crate::pattern::SubFlags {
+                substr: pf.substr,
+                matched: pf.matching,
+                rest: pf.rest_part,
+                bind: pf.bind,
+                eind: pf.eind,
+                len: pf.mlen,
+                ..Default::default()
             };
-            let pat = pattern_of(pat_part)?;
-            let repl = word_string(repl_part, mode)?;
-            Ok(map_items(val, |s| {
-                crate::pattern::substitute(s, &pat, &repl, global, anchor_start, anchor_end)
-            }))
+            let mut w = word;
+            let mut repl = None;
+            if op == '/' {
+                fl.long = !pf.substr;
+                fl.substr = false;
+                if w.first() == Some(&'/') {
+                    fl.global = true;
+                    w = &w[1..];
+                }
+                if w.first() == Some(&'#') {
+                    fl.start = true;
+                    w = &w[1..];
+                }
+                if w.first() == Some(&'%') {
+                    fl.end = true;
+                    w = &w[1..];
+                }
+                if !(fl.start || fl.end) {
+                    fl.substr = true;
+                }
+                fl.all = colon;
+                let (pat_part, repl_part) = match find_unquoted(w, '/') {
+                    Some(k) => (&w[..k], &w[k + 1..]),
+                    None => (w, &w[w.len()..]),
+                };
+                w = pat_part;
+                repl = Some(word_string(repl_part, mode)?);
+            } else {
+                fl.end = op == '%';
+                if w.first() == Some(&op) {
+                    fl.long = true;
+                    w = &w[1..];
+                }
+            }
+            let n = match &pf.nth {
+                Some(e) => eval_arith_str(e)?.max(1) as usize,
+                None => 1,
+            };
+            let pat = crate::pattern::Pattern::new(&pattern_of(w)?);
+            let repl = repl.as_deref();
+            Ok(map_items(val, |s| pat.getmatch(s, fl, n, repl)))
         }
         ':' => {
             check_set(name, &val)?;
@@ -2259,7 +2568,7 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
         if f & MARK != 0 {
             continue;
         }
-        if (f & (Q | NG) != 0 && "*?[]()|<>\\".contains(c)) || (c == '\\' && f & (Q | NG) == 0) {
+        if (f & (Q | NG) != 0 && "*?[]()|<>^#~\\".contains(c)) || (c == '\\' && f & (Q | NG) == 0) {
             pat.push('\\');
         }
         pat.push(c);

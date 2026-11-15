@@ -589,7 +589,7 @@ impl Parser {
             // Declaration commands take array values: `typeset a=(x y)`.
             if cmd.words.first().is_some_and(|w| is_decl_word(w)) {
                 if let Tok::Word(w) = self.peek()?.clone() {
-                    if let Some((_, None, _, value)) = assignment_split(&w) {
+                    if let Some((_, _, _, value)) = assignment_split(&w) {
                         if value.is_empty() {
                             self.next()?;
                             if self.peek_is_op("(")? {
@@ -623,7 +623,7 @@ impl Parser {
                 if let Some((name, subscript, append, value)) = assignment_split(&word) {
                     self.next()?;
                     // `name=(...)` array literal.
-                    if value.is_empty() && subscript.is_none() && self.peek_is_op("(")? {
+                    if value.is_empty() && self.peek_is_op("(")? {
                         self.next()?;
                         let mut items = Vec::new();
                         loop {
@@ -637,7 +637,7 @@ impl Parser {
                         }
                         cmd.assigns.push(Assign {
                             name,
-                            subscript: None,
+                            subscript,
                             append,
                             value: AssignValue::Array(items),
                         });

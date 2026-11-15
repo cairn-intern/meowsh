@@ -61,6 +61,8 @@ pub struct Process {
 #[derive(Clone)]
 pub struct FuncDef {
     pub body: Arc<Node>,
+    // Where it was defined (file or shell name), for `whence -v`.
+    pub origin: String,
 }
 
 /// Pending non-local control flow. Set by `break`, `continue`, `return`,
@@ -135,6 +137,10 @@ pub struct Shell {
     pub dir_stack: Vec<String>,
     // Coprocess pipes: (write end to its input, read end of its output).
     pub coproc: Option<(i32, i32)>,
+    // The file `.`/`source` is reading, and the script's name ($0 at
+    // startup).
+    pub source_file: Option<String>,
+    pub script_name: String,
 }
 
 impl Shell {
@@ -185,11 +191,21 @@ impl Shell {
             zstyles: Vec::new(),
             dir_stack: Vec::new(),
             coproc: None,
+            source_file: None,
+            script_name: "zsh".to_string(),
         }
     }
 
     /// The alias table (`global`: zsh `alias -g`). As in zsh, aliases
     /// live in the associative arrays `$aliases` and `$galiases`.
+    /// Name to report as a function's origin: the file being sourced or
+    /// run, else the shell's name.
+    pub fn function_origin(&self) -> String {
+        self.source_file
+            .clone()
+            .unwrap_or_else(|| self.script_name.clone())
+    }
+
     pub fn alias_map(&mut self, global: bool) -> &mut BTreeMap<String, String> {
         self.assoc_entry(if global { GALIASES } else { ALIASES })
     }

@@ -13,6 +13,16 @@ enum Item {
     Group(Vec<Vec<Item>>),
     // zsh `<lo-hi>`: a run of digits whose value is in range.
     Range(Option<u64>, Option<u64>),
+    // EXTENDED_GLOB `x#` (min 0) and `x##` (min 1).
+    Repeat(Box<Item>, usize),
+    // EXTENDED_GLOB `^pat`: anything the rest does not match.
+    Not(Vec<Item>),
+}
+
+// Compile-time state: EXTENDED_GLOB and (#i) case folding.
+struct Ctx {
+    ext: bool,
+    icase: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -22,10 +32,32 @@ enum ClassItem {
     Named(String),
 }
 
-fn compile(pattern: &str) -> Vec<Item> {
-    let p: Vec<char> = pattern.chars().collect();
+// Splits an EXTENDED_GLOB `a~b` at the top-level `~`.
+fn split_exclusion(p: &[char]) -> Option<usize> {
+    let mut depth = 0;
     let mut i = 0;
-    let mut alts = compile_seq(&p, &mut i, false);
+    while i < p.len() {
+        match p[i] {
+            '\\' => i += 1,
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '[' => {
+                if let Some((_, next)) = parse_class(p, i) {
+                    i = next;
+                    continue;
+                }
+            }
+            '~' if depth == 0 && i > 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn compile(p: &[char], cx: &mut Ctx) -> Vec<Item> {
+    let mut i = 0;
+    let mut alts = compile_seq(p, &mut i, false, cx);
     alts.pop().unwrap_or_default()
 }
 
@@ -52,9 +84,17 @@ fn group_end(p: &[char], open: usize) -> Option<usize> {
 
 // Compiles items up to the end, or inside a group up to its `)`, split
 // into alternatives at `|`. A `(` without a matching `)` is literal.
-fn compile_seq(p: &[char], i: &mut usize, nested: bool) -> Vec<Vec<Item>> {
+fn compile_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Vec<Vec<Item>> {
     let mut alts = Vec::new();
     let mut items = Vec::new();
+    let mut negate = false;
+    let finish = |items: Vec<Item>, negate: bool| {
+        if negate {
+            vec![Item::Not(items)]
+        } else {
+            items
+        }
+    };
     while *i < p.len() {
         let i0 = *i;
         match p[i0] {
@@ -63,8 +103,37 @@ fn compile_seq(p: &[char], i: &mut usize, nested: bool) -> Vec<Vec<Item>> {
                 break;
             }
             '|' if nested => {
-                alts.push(std::mem::take(&mut items));
+                alts.push(finish(std::mem::take(&mut items), negate));
+                negate = false;
                 *i += 1;
+            }
+            '^' if cx.ext && items.is_empty() && !negate => {
+                negate = true;
+                *i += 1;
+            }
+            '#' if cx.ext && !items.is_empty() => {
+                let last = items.pop().unwrap();
+                let min = if p.get(i0 + 1) == Some(&'#') {
+                    *i += 1;
+                    1
+                } else {
+                    0
+                };
+                *i += 1;
+                items.push(Item::Repeat(Box::new(last), min));
+            }
+            // (#i), (#I) and other globbing flags.
+            '(' if cx.ext && p.get(i0 + 1) == Some(&'#') => {
+                let mut j = i0 + 2;
+                while j < p.len() && p[j] != ')' {
+                    match p[j] {
+                        'i' | 'l' => cx.icase = true,
+                        'I' => cx.icase = false,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                *i = (j + 1).min(p.len());
             }
             '<' if crate::lexer::numeric_range_len(p, i0).is_some() => {
                 let len = crate::lexer::numeric_range_len(p, i0).unwrap();
@@ -75,7 +144,7 @@ fn compile_seq(p: &[char], i: &mut usize, nested: bool) -> Vec<Vec<Item>> {
             }
             '(' if group_end(p, i0).is_some() => {
                 *i += 1;
-                items.push(Item::Group(compile_seq(p, i, true)));
+                items.push(Item::Group(compile_seq(p, i, true, cx)));
             }
             _ => {
                 let one = compile_one(p, i);
@@ -85,7 +154,7 @@ fn compile_seq(p: &[char], i: &mut usize, nested: bool) -> Vec<Vec<Item>> {
             }
         }
     }
-    alts.push(items);
+    alts.push(finish(items, negate));
     alts
 }
 
@@ -198,14 +267,38 @@ fn item_matches(item: &Item, c: char) -> bool {
         Item::Any => true,
         Item::Class { negated, set } => class_matches(set, c) != *negated,
         Item::Star => true,
-        Item::Group(_) | Item::Range(..) => false,
+        Item::Group(_) | Item::Range(..) | Item::Repeat(..) | Item::Not(_) => false,
     }
 }
 
 fn has_group(items: &[Item]) -> bool {
-    items
-        .iter()
-        .any(|i| matches!(i, Item::Group(_) | Item::Range(..)))
+    items.iter().any(|i| {
+        matches!(
+            i,
+            Item::Group(_) | Item::Range(..) | Item::Repeat(..) | Item::Not(_)
+        )
+    })
+}
+
+// Whether `item` matches exactly `chunk`.
+fn match_one(item: &Item, chunk: &[char]) -> bool {
+    match item {
+        Item::Star => true,
+        Item::Group(alts) => alts.iter().any(|alt| match_items(alt, chunk)),
+        Item::Range(..) | Item::Repeat(..) | Item::Not(_) => {
+            match_rec(std::slice::from_ref(item), chunk)
+        }
+        it => chunk.len() == 1 && item_matches(it, chunk[0]),
+    }
+}
+
+fn match_repeat(item: &Item, min: usize, s: &[char], rest: &[Item]) -> bool {
+    if min == 0 && match_rec(rest, s) {
+        return true;
+    }
+    (1..=s.len()).any(|k| {
+        match_one(item, &s[..k]) && match_repeat(item, min.saturating_sub(1), &s[k..], rest)
+    })
 }
 
 // Backtracking matcher for patterns containing groups.
@@ -226,6 +319,10 @@ fn match_rec(items: &[Item], s: &[char]) -> bool {
                     .is_ok_and(|v| lo.is_none_or(|lo| v >= lo) && hi.is_none_or(|hi| v <= hi));
                 in_range && match_rec(rest, &s[k..])
             })
+        }
+        Item::Repeat(item, min) => match_repeat(item, *min, s, rest),
+        Item::Not(inner) => {
+            (0..=s.len()).any(|k| !match_items(inner, &s[..k]) && match_rec(rest, &s[k..]))
         }
         item => !s.is_empty() && item_matches(item, s[0]) && match_rec(rest, &s[1..]),
     }
@@ -268,22 +365,75 @@ fn match_items(items: &[Item], s: &[char]) -> bool {
 
 pub struct Pattern {
     items: Vec<Item>,
+    // EXTENDED_GLOB `a~b`: what must not match.
+    exclude: Option<Vec<Item>>,
+    icase: bool,
 }
 
 impl Pattern {
     pub fn new(pattern: &str) -> Self {
+        let p: Vec<char> = pattern.chars().collect();
+        let mut cx = Ctx {
+            ext: crate::options::quick("extendedglob"),
+            icase: false,
+        };
+        let (main, excl) = match split_exclusion(&p).filter(|_| cx.ext) {
+            Some(k) => (&p[..k], Some(&p[k + 1..])),
+            None => (&p[..], None),
+        };
+        let mut items = compile(main, &mut cx);
+        let mut exclude = excl.map(|e| compile(e, &mut cx));
+        if cx.icase {
+            fold_items(&mut items);
+            if let Some(e) = exclude.as_mut() {
+                fold_items(e);
+            }
+        }
         Pattern {
-            items: compile(pattern),
+            items,
+            exclude,
+            icase: cx.icase,
         }
     }
 
     pub fn matches_chars(&self, s: &[char]) -> bool {
-        match_items(&self.items, s)
+        let folded: Vec<char>;
+        let s = if self.icase {
+            folded = s.iter().flat_map(|c| c.to_lowercase()).collect();
+            &folded[..]
+        } else {
+            s
+        };
+        match_items(&self.items, s) && !self.exclude.as_ref().is_some_and(|e| match_items(e, s))
     }
 
     pub fn matches(&self, s: &str) -> bool {
         let chars: Vec<char> = s.chars().collect();
         self.matches_chars(&chars)
+    }
+}
+
+fn fold_items(items: &mut [Item]) {
+    for it in items.iter_mut() {
+        match it {
+            Item::Char(c) => *c = c.to_lowercase().next().unwrap_or(*c),
+            Item::Group(alts) => alts.iter_mut().for_each(|a| fold_items(a)),
+            Item::Repeat(inner, _) => fold_items(std::slice::from_mut(inner.as_mut())),
+            Item::Not(inner) => fold_items(inner),
+            Item::Class { set, .. } => {
+                for c in set.iter_mut() {
+                    match c {
+                        ClassItem::Char(x) => *x = x.to_lowercase().next().unwrap_or(*x),
+                        ClassItem::Range(a, b) => {
+                            *a = a.to_lowercase().next().unwrap_or(*a);
+                            *b = b.to_lowercase().next().unwrap_or(*b);
+                        }
+                        ClassItem::Named(_) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -303,6 +453,7 @@ pub fn has_meta(pattern: &str) -> bool {
             '[' if parse_class(&p, i).is_some() => return true,
             '(' if group_end(&p, i).is_some() => return true,
             '<' if crate::lexer::numeric_range_len(&p, i).is_some() => return true,
+            '#' | '^' | '~' if crate::options::quick("extendedglob") => return true,
             _ => {}
         }
         i += 1;
@@ -326,88 +477,189 @@ pub fn unescape(pattern: &str) -> String {
     out
 }
 
-/// `${v#p}` / `${v##p}`: removes the shortest/longest matching prefix.
-pub fn strip_prefix(value: &str, pattern: &str, longest: bool) -> String {
-    let pat = Pattern::new(pattern);
-    let chars: Vec<char> = value.chars().collect();
-    let range: Box<dyn Iterator<Item = usize>> = if longest {
-        Box::new((0..=chars.len()).rev())
-    } else {
-        Box::new(0..=chars.len())
-    };
-    for i in range {
-        if pat.matches_chars(&chars[..i]) {
-            return chars[i..].iter().collect();
-        }
-    }
-    value.to_string()
+/// Flags for `Pattern::getmatch`, as zsh's SUB_* (Src/glob.c).
+#[derive(Default, Clone, Copy, Debug)]
+pub struct SubFlags {
+    pub end: bool,     // match at the end (`%`)
+    pub long: bool,    // longest match (`##`, `%%`, `/`)
+    pub substr: bool,  // match substrings, not just at an end ((S), `/`)
+    pub start: bool,   // anchored at the start (`/#`)
+    pub global: bool,  // all matches (`//`)
+    pub all: bool,     // the whole string must match (`:/`)
+    pub matched: bool, // (M): the matched part
+    pub rest: bool,    // (R): the rest (the default)
+    pub bind: bool,    // (B): start index
+    pub eind: bool,    // (E): end index
+    pub len: bool,     // (N): match length
 }
 
-/// `${v%p}` / `${v%%p}`: removes the shortest/longest matching suffix.
-pub fn strip_suffix(value: &str, pattern: &str, longest: bool) -> String {
-    let pat = Pattern::new(pattern);
-    let chars: Vec<char> = value.chars().collect();
-    let range: Box<dyn Iterator<Item = usize>> = if longest {
-        Box::new(0..=chars.len())
-    } else {
-        Box::new((0..=chars.len()).rev())
-    };
-    for i in range {
-        if pat.matches_chars(&chars[i..]) {
-            return chars[..i].iter().collect();
-        }
+impl Pattern {
+    fn longest_at(&self, s: &[char], t: usize) -> Option<usize> {
+        (t..=s.len()).rev().find(|&e| self.matches_chars(&s[t..e]))
     }
-    value.to_string()
-}
 
-/// `${v/p/r}` and friends: replaces the longest match at the leftmost
-/// matching position (or every match when `global`).
-pub fn substitute(
-    value: &str,
-    pattern: &str,
-    repl: &str,
-    global: bool,
-    anchor_start: bool,
-    anchor_end: bool,
-) -> String {
-    let pat = Pattern::new(pattern);
-    let chars: Vec<char> = value.chars().collect();
-    let n = chars.len();
-    if anchor_start {
-        for end in (0..=n).rev() {
-            if pat.matches_chars(&chars[..end]) {
-                return format!("{}{}", repl, chars[end..].iter().collect::<String>());
+    fn shortest_at(&self, s: &[char], t: usize) -> Option<usize> {
+        (t..=s.len()).find(|&e| self.matches_chars(&s[t..e]))
+    }
+
+    // Builds the result for a match of s[b..e] (zsh's get_match_ret).
+    fn match_ret(s: &[char], b: usize, e: usize, fl: &SubFlags, repl: Option<&str>) -> String {
+        let mut out = String::new();
+        if fl.matched {
+            out.extend(&s[b..e]);
+        }
+        if fl.rest {
+            if fl.matched {
+                out.push(' ');
+            }
+            out.extend(&s[..b]);
+            if let Some(r) = repl {
+                out.push_str(r);
+            }
+            out.extend(&s[e..]);
+        }
+        let mut nums = Vec::new();
+        if fl.bind {
+            nums.push((b + 1).to_string());
+        }
+        if fl.eind {
+            nums.push((e + 1).to_string());
+        }
+        if fl.len {
+            nums.push((e - b).to_string());
+        }
+        if !nums.is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&nums.join(" "));
+        }
+        out
+    }
+
+    /// zsh's igetmatch: finds the `n`th match (1-based) of the pattern in
+    /// `value` as `fl` describes and returns the requested parts, with
+    /// `repl` substituted for the match in the rest. No match gives the
+    /// whole value (or the empty match's parts).
+    pub fn getmatch(&self, value: &str, mut fl: SubFlags, n: usize, repl: Option<&str>) -> String {
+        let s: Vec<char> = value.chars().collect();
+        let len = s.len();
+        let mut n = n.max(1) as isize;
+        if !(fl.matched || fl.rest || fl.bind || fl.eind || fl.len) {
+            fl.rest = true;
+        }
+        if fl.start && fl.end {
+            fl.long = true;
+        }
+        let ret = |b, e| Self::match_ret(&s, b, e, &fl, repl);
+        if fl.all {
+            return if self.matches_chars(&s) {
+                ret(0, len)
+            } else {
+                Self::match_ret(&s, 0, 0, &fl, None)
+            };
+        }
+        let empty_ok = || self.matches_chars(&[]);
+        match (fl.end, fl.long, fl.substr) {
+            (false, _, false) => {
+                if let Some(mut e) = self.longest_at(&s, 0) {
+                    if !fl.long {
+                        e = self.shortest_at(&s, 0).unwrap_or(e);
+                    }
+                    return ret(0, e);
+                }
+            }
+            (true, false, false) => {
+                for t in (0..=len).rev() {
+                    if self.matches_chars(&s[t..]) {
+                        return ret(t, len);
+                    }
+                }
+            }
+            (true, true, false) => {
+                for t in 0..=len {
+                    if self.matches_chars(&s[t..]) {
+                        return ret(t, len);
+                    }
+                    if fl.start {
+                        break;
+                    }
+                }
+            }
+            (false, long, true) => {
+                if !long && !fl.global && empty_ok() {
+                    n -= 1;
+                    if n == 0 {
+                        return ret(0, 0);
+                    }
+                }
+                let mut chunks: Vec<(usize, usize)> = Vec::new();
+                let mut t = 0;
+                while t <= len {
+                    if let Some(mut mpos) = self.longest_at(&s, t) {
+                        if !long {
+                            mpos = self.shortest_at(&s, t).unwrap_or(mpos);
+                        }
+                        n -= 1;
+                        if fl.global {
+                            if mpos > t || chunks.last().is_none_or(|c| c.1 != t) {
+                                chunks.push((t, mpos));
+                            }
+                            t = if mpos > t { mpos } else { t + 1 };
+                            continue;
+                        }
+                        if n == 0 {
+                            return ret(t, mpos);
+                        }
+                    }
+                    t += 1;
+                }
+                if fl.global && !chunks.is_empty() {
+                    let mut out = String::new();
+                    let mut i = 0;
+                    for (b, e) in chunks {
+                        out.extend(&s[i..b]);
+                        out.push_str(repl.unwrap_or(""));
+                        i = e;
+                    }
+                    out.extend(&s[i..]);
+                    return out;
+                }
+                if long && !fl.global && empty_ok() {
+                    n -= 1;
+                    if n == 0 {
+                        return ret(0, 0);
+                    }
+                }
+            }
+            (true, long, true) => {
+                if empty_ok() {
+                    n -= 1;
+                    if n == 0 {
+                        return ret(len, len);
+                    }
+                }
+                for t in (0..len).rev() {
+                    if let Some(mut mpos) = self.longest_at(&s, t) {
+                        n -= 1;
+                        if n == 0 {
+                            if !long {
+                                mpos = self.shortest_at(&s, t).unwrap_or(mpos);
+                            }
+                            return ret(t, mpos);
+                        }
+                    }
+                }
+                if long && empty_ok() {
+                    n -= 1;
+                    if n == 0 {
+                        return ret(len, len);
+                    }
+                }
             }
         }
-        return value.to_string();
+        Self::match_ret(&s, 0, 0, &fl, None)
     }
-    if anchor_end {
-        for start in 0..=n {
-            if pat.matches_chars(&chars[start..]) {
-                return format!("{}{}", chars[..start].iter().collect::<String>(), repl);
-            }
-        }
-        return value.to_string();
-    }
-    if pattern.is_empty() {
-        return value.to_string();
-    }
-    let mut out = String::new();
-    let mut i = 0;
-    let mut replaced = false;
-    while i < n {
-        if !(replaced && !global) {
-            if let Some(end) = (i + 1..=n).rev().find(|&e| pat.matches_chars(&chars[i..e])) {
-                out.push_str(repl);
-                i = end;
-                replaced = true;
-                continue;
-            }
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -444,21 +696,57 @@ mod tests {
         assert!(matches("\\(x\\)", "(x)"));
     }
 
+    fn gm(v: &str, p: &str, fl: SubFlags, repl: Option<&str>) -> String {
+        Pattern::new(p).getmatch(v, fl, 1, repl)
+    }
+
     #[test]
     fn prefix_suffix() {
-        assert_eq!(strip_prefix("a/b/c", "*/", false), "b/c");
-        assert_eq!(strip_prefix("a/b/c", "*/", true), "c");
-        assert_eq!(strip_suffix("a.tar.gz", ".*", false), "a.tar");
-        assert_eq!(strip_suffix("a.tar.gz", ".*", true), "a");
-        assert_eq!(strip_suffix("héllo", "l*", true), "hé");
+        let long = SubFlags {
+            long: true,
+            ..Default::default()
+        };
+        let end = SubFlags {
+            end: true,
+            ..Default::default()
+        };
+        let end_long = SubFlags {
+            end: true,
+            long: true,
+            ..Default::default()
+        };
+        assert_eq!(gm("a/b/c", "*/", SubFlags::default(), None), "b/c");
+        assert_eq!(gm("a/b/c", "*/", long, None), "c");
+        assert_eq!(gm("a.tar.gz", ".*", end, None), "a.tar");
+        assert_eq!(gm("a.tar.gz", ".*", end_long, None), "a");
+        assert_eq!(gm("héllo", "l*", end_long, None), "hé");
     }
 
     #[test]
     fn substitution() {
-        assert_eq!(substitute("a-b-c", "-", "+", false, false, false), "a+b-c");
-        assert_eq!(substitute("a-b-c", "-", "+", true, false, false), "a+b+c");
-        assert_eq!(substitute("abc", "a", "X", false, true, false), "Xbc");
-        assert_eq!(substitute("abc", "c", "X", false, false, true), "abX");
-        assert_eq!(substitute("aXbXc", "X*", "_", false, false, false), "a_");
+        let sub = SubFlags {
+            long: true,
+            substr: true,
+            ..Default::default()
+        };
+        let all = SubFlags {
+            global: true,
+            ..sub
+        };
+        let start = SubFlags {
+            long: true,
+            start: true,
+            ..Default::default()
+        };
+        let end = SubFlags {
+            long: true,
+            end: true,
+            ..Default::default()
+        };
+        assert_eq!(gm("a-b-c", "-", sub, Some("+")), "a+b-c");
+        assert_eq!(gm("a-b-c", "-", all, Some("+")), "a+b+c");
+        assert_eq!(gm("abc", "a", start, Some("X")), "Xbc");
+        assert_eq!(gm("abc", "c", end, Some("X")), "abX");
+        assert_eq!(gm("aXbXc", "X*", sub, Some("_")), "a_");
     }
 }

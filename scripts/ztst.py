@@ -207,38 +207,38 @@ def build_driver(work, testdir, prep, tests, clean):
         # From Test/ztst.zsh: prints a UTF-8 locale, if there is one.
         "ZTST_find_UTF8() { print -r -- " + sq(utf8_locale()) + "; }",
         "cd " + sq(testdir),
-        "W=" + sq(work),
+        "ZTST_work=" + sq(work),
     ]
     for k, (code, _) in enumerate(prep):
         w(f"prep.{k}", code)
-        lines.append(f'() {{ eval "$(<$W/prep.{k})" }} >/dev/null; print -r -- $? >$W/prepst.{k}')
-    lines.append('print -r -- "$ZTST_unimplemented" >$W/unimpl')
+        lines.append(f'() {{ eval "$(<$ZTST_work/prep.{k})" }} >/dev/null; print -r -- $? >$ZTST_work/prepst.{k}')
+    lines.append('print -r -- "$ZTST_unimplemented" >$ZTST_work/unimpl')
     lines.append('if [[ -z $ZTST_unimplemented ]]; then')
     for k, t in enumerate(tests):
         w(f"code.{k}", t.code)
         q = "q" in t.flags
         w(f"inraw.{k}", t.stdin)
         if q and t.stdin:
-            lines.append(f'print -rn -- "${{(e)$(<$W/inraw.{k})}}" >$W/in.{k}; print >>$W/in.{k}')
+            lines.append(f'print -rn -- "${{(e)$(<$ZTST_work/inraw.{k})}}" >$ZTST_work/in.{k}; print >>$ZTST_work/in.{k}')
         else:
-            lines.append(f"cat $W/inraw.{k} >$W/in.{k}")
+            lines.append(f"cat $ZTST_work/inraw.{k} >$ZTST_work/in.{k}")
         lines.append("ZTST_skip=")
         lines.append(
-            f'() {{ eval "$(<$W/code.{k})" }} <$W/in.{k} >$W/out.{k} 2>$W/err.{k}; '
-            f"print -r -- $? >$W/st.{k}; "
-            f'print -r -- "$ZTST_skip" >$W/skip.{k}'
+            f'() {{ eval "$(<$ZTST_work/code.{k})" }} <$ZTST_work/in.{k} >$ZTST_work/out.{k} 2>$ZTST_work/err.{k}; '
+            f"print -r -- $? >$ZTST_work/st.{k}; "
+            f'print -r -- "$ZTST_skip" >$ZTST_work/skip.{k}'
         )
         if q:
             for kind, text in (("out", t.out), ("err", t.err)):
                 if text:
                     w(f"exp{kind}raw.{k}", text)
                     lines.append(
-                        f'print -r -- "${{(e)$(<$W/exp{kind}raw.{k})}}" >$W/exp{kind}.{k} 2>/dev/null'
+                        f'print -r -- "${{(e)$(<$ZTST_work/exp{kind}raw.{k})}}" >$ZTST_work/exp{kind}.{k} 2>/dev/null'
                     )
     lines.append("fi")
     for k, (code, _) in enumerate(clean):
         w(f"clean.{k}", code)
-        lines.append(f'() {{ eval "$(<$W/clean.{k})" }} >/dev/null 2>&1')
+        lines.append(f'() {{ eval "$(<$ZTST_work/clean.{k})" }} >/dev/null 2>&1')
     w("driver.zsh", "\n".join(lines) + "\n")
 
 
@@ -384,7 +384,10 @@ def main():
             print(f"\npassed {total.get('pass', 0)}/{run} ({100 * total.get('pass', 0) / run:.1f}%), "
                   f"stdout and status right in {total.get('pass', 0) + total.get('stdout-only', 0)}/{run}")
     finally:
-        shutil.rmtree(root, ignore_errors=True)
+        if os.environ.get("ZTST_KEEP"):
+            print(f"kept {root}")
+        else:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

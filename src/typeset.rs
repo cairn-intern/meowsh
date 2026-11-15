@@ -20,7 +20,7 @@ pub enum DeclArg {
     Array {
         name: String,
         append: bool,
-        items: Vec<String>,
+        items: Vec<crate::shell::ArrItem>,
     },
 }
 
@@ -415,6 +415,19 @@ fn typeset_single(
         return false;
     }
     let level = locallevel();
+    // A nameref stands for what it refers to, unless -n/+n is given or a
+    // new local is being made.
+    let resolved;
+    let base_name = if (on | off) & NAMEREF == 0
+        && with_shell(|s| {
+            s.param(base_name)
+                .is_some_and(|p| p.attrs & NAMEREF != 0 && (p.level == level || on & LOCAL == 0))
+        }) {
+        resolved = with_shell(|s| s.resolve_name(base_name));
+        resolved.as_str()
+    } else {
+        base_name
+    };
     let existing = with_shell(|s| s.param(base_name).cloned());
 
     // Array elements: `typeset a[2]=x`.
@@ -674,6 +687,13 @@ fn set_width_base(p: &mut Param, on: u32, ops: &Opts) {
 }
 
 fn assign_value(name: &str, asg: &DeclArg) -> bool {
+    // A nameref's own value is the name it refers to.
+    let is_ref = with_shell(|s| s.param(name).is_some_and(|p| p.attrs & NAMEREF != 0));
+    if is_ref {
+        if let DeclArg::Assign { value: Some(v), .. } = asg {
+            return crate::shell::set_ref_target(name, v);
+        }
+    }
     match asg {
         DeclArg::Assign { value: None, .. } | DeclArg::Word(_) => true,
         DeclArg::Assign {
@@ -698,11 +718,7 @@ fn assign_value(name: &str, asg: &DeclArg) -> bool {
             crate::shell::var_set(name, &v, false)
         }
         DeclArg::Array { items, append, .. } => {
-            if *append {
-                crate::shell::array_append(name, items.clone())
-            } else {
-                crate::shell::array_set(name, items.clone())
-            }
+            crate::shell::array_assign_items(name, items.clone(), *append)
         }
     }
 }
@@ -821,7 +837,7 @@ fn typeset_tied(cmd: &str, on: u32, off: u32, roff: u32, ops: &Opts, rest: &[Dec
     }
     match a_asg {
         DeclArg::Array { items, .. } => {
-            crate::shell::array_set(&aname, items.clone());
+            crate::shell::array_assign_items(&aname, items.clone(), false);
         }
         _ => {
             if let Some(v) = old_value {

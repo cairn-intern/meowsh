@@ -192,6 +192,27 @@ impl Shell {
         }
     }
 
+    /// Follows namerefs (`typeset -n`) from `name` to the parameter they
+    /// finally refer to. The result may carry a subscript (`arr[2]`).
+    pub fn resolve_name(&self, name: &str) -> String {
+        let mut cur = name.to_string();
+        for _ in 0..64 {
+            match self.params.get(&cur) {
+                Some(p) if p.attrs & NAMEREF != 0 && p.attrs & UNSET == 0 => {
+                    let Value::Scalar(target) = &p.value else {
+                        return cur;
+                    };
+                    if target.is_empty() || *target == cur {
+                        return cur;
+                    }
+                    cur = target.clone();
+                }
+                _ => return cur,
+            }
+        }
+        cur
+    }
+
     pub fn has_param(&self, name: &str) -> bool {
         self.params.contains_key(name)
     }

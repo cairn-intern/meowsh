@@ -475,7 +475,13 @@ impl Lexer {
                 }
                 continue;
             }
-            if self.pos < self.chars.len() && self.chars[self.pos] == '#' {
+            // `#` starts a comment at the start of a word, but not right
+            // after `(` or `)`, where zsh reads glob syntax such as `(#i)`
+            // and `(ab)##`.
+            if self.pos < self.chars.len()
+                && self.chars[self.pos] == '#'
+                && !(self.pos > 0 && matches!(self.chars[self.pos - 1], '(' | ')'))
+            {
                 while self.pos < self.chars.len() && self.chars[self.pos] != '\n' {
                     self.pos += 1;
                 }

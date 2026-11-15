@@ -8,8 +8,8 @@ use crate::jobs::{add_job, reap_jobs, status_to_exit, wait_foreground, TTY_FD};
 use crate::lexer::assignment_split;
 use crate::parser::{ParseError, Parser};
 use crate::shell::{
-    array_append, array_set, array_set_subscript, build_env, find_command, is_array, opt_set,
-    pop_scope, push_scope, var_get, var_get_opt, var_set, with_shell,
+    array_append, array_set_subscript, build_env, find_command, is_array, opt_set, pop_scope,
+    push_scope, var_get, var_get_opt, var_set, with_shell,
 };
 use crate::sys::{close, dup_high, err_line, pipe_cloexec, read_all, temp_file_with};
 use crate::types::{
@@ -400,7 +400,57 @@ pub fn restore_redirs(saved: SavedFds) {
 
 enum Value {
     Scalar(String),
-    Array(Vec<String>),
+    Array(Vec<crate::shell::ArrItem>),
+}
+
+// Expands the items of an array assignment. zsh's `[key]=value` items
+// (recognized before expansion) set one element or key.
+fn expand_array_items(items: &[String]) -> ExpResult<Vec<crate::shell::ArrItem>> {
+    use crate::shell::ArrItem;
+    let mut out = Vec::new();
+    for raw in items {
+        if let Some(rest) = raw.strip_prefix('[') {
+            let chars: Vec<char> = rest.chars().collect();
+            let mut depth = 1;
+            let mut k = 0;
+            while k < chars.len() {
+                match chars[k] {
+                    '\\' => k += 1,
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            let after: String = chars
+                .get(k + 1..)
+                .map(|c| c.iter().collect())
+                .unwrap_or_default();
+            let (append, value) = match (after.strip_prefix("+="), after.strip_prefix('=')) {
+                (Some(v), _) => (true, Some(v.to_string())),
+                (_, Some(v)) => (false, Some(v.to_string())),
+                _ => (false, None),
+            };
+            if let (true, Some(value)) = (k < chars.len(), value) {
+                let key: String = chars[..k].iter().collect();
+                out.push(ArrItem::Key(
+                    expand_string(&key)?,
+                    expand_assign_value(&value)?,
+                    append,
+                ));
+                continue;
+            }
+        }
+        for w in expand_words(std::slice::from_ref(raw))? {
+            out.push(ArrItem::Plain(w));
+        }
+    }
+    Ok(out)
 }
 
 struct Expanded {
@@ -415,7 +465,7 @@ fn expand_assigns(assigns: &[Assign]) -> ExpResult<Vec<Expanded>> {
     for a in assigns {
         let value = match &a.value {
             AssignValue::Scalar(v) => Value::Scalar(expand_assign_value(v)?),
-            AssignValue::Array(items) => Value::Array(expand_words(items)?),
+            AssignValue::Array(items) => Value::Array(expand_array_items(items)?),
         };
         out.push(Expanded {
             name: a.name.clone(),
@@ -437,6 +487,12 @@ fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
         return Err(1);
     }
     let ok = match (&a.subscript, &a.value) {
+        (Some(sub), Value::Scalar(v))
+            if sub.contains(',') && !with_shell(|s| s.assoc(&a.name).is_some()) =>
+        {
+            let sub = expand_string(sub).map_err(|e| e.status)?;
+            crate::shell::array_splice(&a.name, &sub, vec![v.clone()])
+        }
         (Some(sub), Value::Scalar(v)) => {
             let is_assoc = with_shell(|s| s.assoc(&a.name).is_some());
             let key = if is_assoc {
@@ -453,19 +509,12 @@ fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
             };
             array_set_subscript(&a.name, &key, v.clone(), a.append)
         }
-        (Some(_), Value::Array(_)) => {
-            err_line(&format!(
-                "meowsh: {}: cannot assign list to array member",
-                a.name
-            ));
-            false
+        (Some(sub), Value::Array(items)) => {
+            let sub = expand_string(sub).map_err(|e| e.status)?;
+            crate::shell::array_splice(&a.name, &sub, crate::shell::plain_items(items))
         }
         (None, Value::Array(items)) => {
-            if a.append {
-                array_append(&a.name, items.clone())
-            } else {
-                array_set(&a.name, items.clone())
-            }
+            crate::shell::array_assign_items(&a.name, items.clone(), a.append)
         }
         (None, Value::Scalar(v)) => {
             if a.append && is_array(&a.name) {
@@ -494,7 +543,13 @@ fn assign_text(a: &Expanded) -> String {
     let op = if a.append { "+=" } else { "=" };
     match &a.value {
         Value::Scalar(v) => format!("{}{}{}{}", a.name, sub, op, v),
-        Value::Array(items) => format!("{}{}{}({})", a.name, sub, op, items.join(" ")),
+        Value::Array(items) => format!(
+            "{}{}{}({})",
+            a.name,
+            sub,
+            op,
+            crate::shell::plain_items(items).join(" ")
+        ),
     }
 }
 
@@ -567,9 +622,17 @@ fn expand_command_words(
     let mut decl: Vec<DeclArg> = out.iter().cloned().map(DeclArg::Word).collect();
     for (k, w) in raw.iter().enumerate().skip(1) {
         if let Some((_, items)) = arrays.iter().find(|(i, _)| *i == k) {
-            let (name, _, append, _) = assignment_split(w).unwrap_or_default();
-            let items = expand_words(items)?;
-            out.push(format!("{}=({})", name, items.join(" ")));
+            let (name, sub, append, _) = assignment_split(w).unwrap_or_default();
+            let name = match sub {
+                Some(s) => format!("{}[{}]", name, expand_string(&s)?),
+                None => name,
+            };
+            let items = expand_array_items(items)?;
+            out.push(format!(
+                "{}=({})",
+                name,
+                crate::shell::plain_items(&items).join(" ")
+            ));
             decl.push(DeclArg::Array {
                 name,
                 append,
@@ -682,6 +745,7 @@ fn exec_node_inner(node: &Node) -> i32 {
                     name.clone(),
                     FuncDef {
                         body: Arc::new((**body).clone()),
+                        origin: s.function_origin(),
                     },
                 )
             });
