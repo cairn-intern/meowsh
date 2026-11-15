@@ -30,6 +30,7 @@ fn fail<T>(msg: &str) -> ExpResult<T> {
 const Q: u8 = 1; // quoted: never split or globbed
 const S: u8 = 2; // result of an unquoted expansion: subject to field splitting
 const MARK: u8 = 4; // zero-width marker: the field exists even if empty
+const NG: u8 = 8; // expansion result that pathname expansion leaves literal
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
@@ -53,6 +54,12 @@ struct Ctx {
     unquoted_lit: u8,
     // After `${^arr}`: later text is appended to every field from here.
     rc_from: Option<usize>,
+    // Tags for unquoted parameter and command substitution results, from
+    // SH_WORD_SPLIT and GLOB_SUBST: zsh splits parameters only with
+    // SH_WORD_SPLIT, always splits command substitution, and globs
+    // neither unless GLOB_SUBST.
+    param_tag: u8,
+    subst_tag: u8,
 }
 
 impl Ctx {
@@ -65,7 +72,23 @@ impl Ctx {
             at_lists: 0,
             unquoted_lit: 0,
             rc_from: None,
+            param_tag: 0,
+            subst_tag: 0,
         }
+        .with_option_tags()
+    }
+
+    fn with_option_tags(mut self) -> Self {
+        let (split, glob) = with_shell(|s| {
+            (
+                crate::options::is_set_in(s, "shwordsplit"),
+                crate::options::is_set_in(s, "globsubst"),
+            )
+        });
+        let no_glob = if glob { 0 } else { NG };
+        self.param_tag = if split { S } else { 0 } | no_glob;
+        self.subst_tag = S | no_glob;
+        self
     }
 
     fn push(&mut self, c: char, flag: u8) {
@@ -131,7 +154,7 @@ fn lookup(name: &str) -> Val {
         "*" => return Val::List(pos_params(), true),
         _ => {}
     }
-    if let Some(items) = with_shell(|s| s.arrays.get(name).cloned()) {
+    if let Some(items) = with_shell(|s| s.array(name).cloned()) {
         return Val::List(items, true);
     }
     if let Some(items) = assoc_values(name) {
@@ -151,7 +174,17 @@ fn check_set(name: &str, val: &Val) -> ExpResult<()> {
 }
 
 fn emit_str(ctx: &mut Ctx, s: &str, quoted: bool) {
-    let flag = if quoted { Q } else { S };
+    let flag = if quoted { Q } else { ctx.param_tag };
+    emit_tagged(ctx, s, flag);
+}
+
+// Command substitution output.
+fn emit_subst(ctx: &mut Ctx, s: &str, quoted: bool) {
+    let flag = if quoted { Q } else { ctx.subst_tag };
+    emit_tagged(ctx, s, flag);
+}
+
+fn emit_tagged(ctx: &mut Ctx, s: &str, flag: u8) {
     for c in s.chars() {
         ctx.push(c, flag);
     }
@@ -180,8 +213,9 @@ fn emit_list(ctx: &mut Ctx, items: &[String], star: bool, quoted: bool) {
             if k > 0 {
                 ctx.new_field();
             }
+            let tag = ctx.param_tag;
             for c in item.chars() {
-                ctx.push(c, S);
+                ctx.push(c, tag);
             }
         }
     }
@@ -210,12 +244,13 @@ fn emit_val(ctx: &mut Ctx, val: &Val, quoted: bool) {
             }
             let prefix = ctx.fields.last().cloned().unwrap_or_default();
             let start = ctx.fields.len() - 1;
+            let tag = ctx.param_tag;
             for (k, item) in items.iter().enumerate() {
                 if k > 0 {
                     ctx.fields.push(prefix.clone());
                 }
                 for c in item.chars() {
-                    ctx.fields.last_mut().unwrap().push((c, S));
+                    ctx.fields.last_mut().unwrap().push((c, tag));
                 }
             }
             ctx.rc_from = Some(start);
@@ -286,7 +321,7 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                 let (ie, next) = bounds(scan_bquote(chars, i), n);
                 let src = unescape_bquote(&chars[i + 1..ie.max(i + 1)], mode == Mode::Dq);
                 let out = command_subst(&src)?;
-                emit_str(ctx, &out, mode != Mode::Unquoted);
+                emit_subst(ctx, &out, mode != Mode::Unquoted);
                 i = next;
             }
             '$' => i = expand_dollar(chars, i, mode, ctx)?,
@@ -469,7 +504,7 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
             } else {
                 let src: String = chars[i + 2..end - 1].iter().collect();
                 let out = command_subst(&src)?;
-                emit_str(ctx, &out, quoted);
+                emit_subst(ctx, &out, quoted);
             }
             Ok(end)
         }
@@ -777,7 +812,7 @@ fn map_items(v: Val, f: impl Fn(&str) -> String) -> Val {
 fn word_val(word: &[char], mode: Mode) -> ExpResult<Val> {
     let mut tmp = Ctx::new(true, false);
     if mode == Mode::Unquoted {
-        tmp.unquoted_lit = S;
+        tmp.unquoted_lit = tmp.param_tag;
     }
     let m = if mode == Mode::Heredoc {
         Mode::Dq
@@ -930,14 +965,14 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     let Some(sub) = sub else {
         return Ok(lookup(name));
     };
-    if name == "commands" && !with_shell(|s| s.assoc_arrays.contains_key("commands")) {
+    if name == "commands" && !with_shell(|s| s.assoc("commands").is_some()) {
         let key = expand_string(sub)?;
         return Ok(match crate::shell::find_command(&key) {
             Some(p) => Val::Str(p),
             None => Val::Unset,
         });
     }
-    let is_assoc = with_shell(|s| s.assoc_arrays.contains_key(name));
+    let is_assoc = with_shell(|s| s.assoc(name).is_some());
     if !is_assoc {
         return apply_subscript(lookup(name), sub);
     }
@@ -1214,23 +1249,51 @@ fn shell_words(s: &str) -> Vec<String> {
     out
 }
 
+// `${(t)name}`, in zsh's format: the type, then -local and attributes.
 fn type_of(name: &str) -> String {
+    use crate::params::*;
     with_shell(|s| {
-        let (base, flags) = if s.assoc_arrays.contains_key(name) {
-            ("association", 0)
-        } else if s.arrays.contains_key(name) {
-            ("array", 0)
-        } else if let Some(v) = s.vars.get(name) {
-            ("scalar", v.flags)
-        } else {
+        let Some(p) = s.param(name) else {
             return String::new();
         };
-        let mut t = base.to_string();
-        if flags & crate::types::VAR_READONLY != 0 {
-            t.push_str("-readonly");
+        let a = p.attrs;
+        let mut t = String::from(match &p.value {
+            Value::Array(_) => "array",
+            Value::Assoc(_) => "association",
+            Value::Scalar(_) if a & NAMEREF != 0 => "nameref",
+            Value::Scalar(_) if a & INTEGER != 0 => "integer",
+            Value::Scalar(_) if a & (FLOAT_E | FLOAT_F) != 0 => "float",
+            Value::Scalar(_) => "scalar",
+        });
+        if p.level > 0 {
+            t.push_str("-local");
         }
-        if flags & crate::types::VAR_EXPORT != 0 {
-            t.push_str("-export");
+        for (bit, word) in [
+            (LEFT, "-left"),
+            (RIGHT_B, "-right_blanks"),
+            (RIGHT_Z, "-right_zeros"),
+            (LOWER, "-lower"),
+            (UPPER, "-upper"),
+            (READONLY, "-readonly"),
+            (TAG, "-tag"),
+        ] {
+            if a & bit != 0 {
+                t.push_str(word);
+            }
+        }
+        if p.tie.is_some() {
+            t.push_str("-tied");
+        }
+        for (bit, word) in [
+            (EXPORT, "-export"),
+            (UNIQUE, "-unique"),
+            (HIDE, "-hide"),
+            (HIDEVAL, "-hideval"),
+            (SPECIAL, "-special"),
+        ] {
+            if a & bit != 0 {
+                t.push_str(word);
+            }
         }
         t
     })
@@ -1884,7 +1947,7 @@ fn pattern_text(ctx: &Ctx) -> String {
         if f & MARK != 0 {
             continue;
         }
-        if f & Q != 0 && matches!(c, '*' | '?' | '[' | ']' | '\\') {
+        if f & (Q | NG) != 0 && "*?[]()|<>^#~\\".contains(c) {
             out.push('\\');
         }
         out.push(c);
@@ -2173,14 +2236,22 @@ fn split_field(field: &[(char, u8)], ifs: &str) -> Vec<Vec<(char, u8)>> {
     out
 }
 
-fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Vec<String> {
+enum Globbed {
+    // Not a pattern, or globbing is off.
+    Word(String),
+    Matches(Vec<String>),
+    // A pattern that matched nothing, with its literal text.
+    NoMatch(String),
+}
+
+fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
     let literal: String = piece
         .iter()
         .filter(|(_, f)| f & MARK == 0)
         .map(|(c, _)| *c)
         .collect();
     if !do_glob {
-        return vec![literal];
+        return Globbed::Word(literal);
     }
     // Quoted characters are escaped so they match literally.
     let mut pat = String::new();
@@ -2188,35 +2259,75 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Vec<String> {
         if f & MARK != 0 {
             continue;
         }
-        if (f & Q != 0 && "*?[]()|<>\\".contains(c)) || (c == '\\' && f & Q == 0) {
+        if (f & (Q | NG) != 0 && "*?[]()|<>\\".contains(c)) || (c == '\\' && f & (Q | NG) == 0) {
             pat.push('\\');
         }
         pat.push(c);
     }
     let (base, quals) = crate::globber::split_qualifiers(&pat);
     if quals.is_none() && !crate::pattern::has_meta(base) {
-        return vec![literal];
+        return Globbed::Word(literal);
     }
-    let matches = crate::globber::glob(base, quals.as_ref());
+    let mut quals = quals.unwrap_or_default();
+    let explicit_null = quals.null;
+    if crate::options::is_set("globdots") {
+        quals.dots = true;
+    }
+    let mut matches = crate::globber::glob(base, Some(&quals));
     if matches.is_empty() {
-        return if quals.is_some_and(|q| q.null) {
-            Vec::new()
+        return if explicit_null {
+            Globbed::Matches(Vec::new())
         } else {
-            vec![literal]
+            Globbed::NoMatch(literal)
         };
     }
-    matches
-}
-
-fn finish(ctx: Ctx, do_glob: bool) -> Vec<String> {
-    let ifs = ifs();
-    let mut out = Vec::new();
-    for field in &ctx.fields {
-        for piece in split_field(field, &ifs) {
-            out.extend(glob_piece(&piece, do_glob));
+    if crate::options::is_set("markdirs") {
+        for m in matches.iter_mut() {
+            if !m.ends_with('/') && std::path::Path::new(m).is_dir() {
+                m.push('/');
+            }
         }
     }
-    out
+    Globbed::Matches(matches)
+}
+
+// Globs every word of a command and applies NULL_GLOB, CSH_NULL_GLOB and
+// NOMATCH to patterns that matched nothing.
+fn finish_all(ctxs: Vec<Ctx>, do_glob: bool) -> ExpResult<Vec<String>> {
+    let ifs = ifs();
+    let (null, csh_null, nomatch) = with_shell(|s| {
+        let on = |o| crate::options::is_set_in(s, o);
+        (on("nullglob"), on("cshnullglob"), on("nomatch"))
+    });
+    let mut out = Vec::new();
+    let (mut any_match, mut failed) = (false, None::<String>);
+    for ctx in &ctxs {
+        for field in &ctx.fields {
+            for piece in split_field(field, &ifs) {
+                match glob_piece(&piece, do_glob) {
+                    Globbed::Word(w) => out.push(w),
+                    Globbed::Matches(m) => {
+                        any_match = true;
+                        out.extend(m);
+                    }
+                    Globbed::NoMatch(lit) => {
+                        if null {
+                        } else if csh_null {
+                            failed.get_or_insert(lit);
+                        } else if nomatch {
+                            return fail(&format!("no matches found: {}", lit));
+                        } else {
+                            out.push(lit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if csh_null && !any_match && failed.is_some() {
+        return fail("no match");
+    }
+    Ok(out)
 }
 
 // ---- public entry points --------------------------------------------------
@@ -2224,16 +2335,16 @@ fn finish(ctx: Ctx, do_glob: bool) -> Vec<String> {
 /// Fully expands command words into fields.
 pub fn expand_words(words: &[String]) -> ExpResult<Vec<String>> {
     let do_glob = !opt_set(OPT_NOGLOB);
-    let mut out = Vec::new();
+    let mut ctxs = Vec::new();
     for word in words {
         for w in brace_expand(word) {
             let chars: Vec<char> = w.chars().collect();
             let mut ctx = Ctx::new(true, false);
             walk(&chars, Mode::Unquoted, &mut ctx)?;
-            out.extend(finish(ctx, do_glob));
+            ctxs.push(ctx);
         }
     }
-    Ok(out)
+    finish_all(ctxs, do_glob)
 }
 
 /// Expands a word to one string without field splitting or globbing
@@ -2278,10 +2389,26 @@ mod tests {
     use crate::shell::{shell_init, var_set};
     use crate::TEST_LOCK;
 
+    // These tests check POSIX expansion, so they run in sh emulation.
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         shell_init();
+        with_shell(|s| crate::options::init(s, crate::options::Emulation::Sh));
         lock
+    }
+
+    #[test]
+    fn zsh_defaults_neither_split_nor_glob_parameters() {
+        let _g = setup();
+        with_shell(|s| crate::options::init(s, crate::options::Emulation::Zsh));
+        var_set("x", "a b *", false);
+        assert_eq!(words(&["$x"]), vec!["a b *"]);
+        assert_eq!(words(&["$(echo c d)"]), vec!["c", "d"]);
+        assert_eq!(words(&["${=x}"]), vec!["a", "b", "*"]);
+        assert_eq!(words(&["${unset_v:-a b}"]), vec!["a b"]);
+        assert!(expand_words(&["/nonexistent-dir/*".to_string()]).is_err());
+        crate::options::set("nullglob", true);
+        assert!(words(&["/nonexistent-dir/*"]).is_empty());
     }
 
     fn words(s: &[&str]) -> Vec<String> {

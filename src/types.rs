@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 pub const OPT_ALLEXPORT: u32 = 1 << 0;
@@ -14,9 +14,8 @@ pub const OPT_XTRACE: u32 = 1 << 9;
 pub const OPT_NOCLOBBER: u32 = 1 << 10;
 pub const OPT_PIPEFAIL: u32 = 1 << 11;
 
-pub const VAR_EXPORT: u32 = 1 << 0;
-pub const VAR_READONLY: u32 = 1 << 1;
-pub const VAR_SPECIAL: u32 = 1 << 2;
+pub const VAR_EXPORT: u32 = crate::params::EXPORT;
+pub const VAR_READONLY: u32 = crate::params::READONLY;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum JobState {
@@ -30,12 +29,6 @@ pub enum ProcState {
     Running,
     Stopped,
     Done,
-}
-
-#[derive(Clone, Debug)]
-pub struct Var {
-    pub value: String,
-    pub flags: u32,
 }
 
 #[derive(Clone)]
@@ -85,6 +78,7 @@ pub enum Flow {
 
 pub struct Shell {
     pub opts: u32,
+    pub emulation: crate::options::Emulation,
     pub last_status: i32,
     pub shell_pid: i32,
     pub shell_pgid: i32,
@@ -97,7 +91,8 @@ pub struct Shell {
     pub job_control: bool,
     // True in forked subshells (command substitution, pipelines, `( )`).
     pub in_subshell: bool,
-    pub vars: HashMap<String, Var>,
+    // All parameters: scalars, arrays and associative arrays.
+    pub params: HashMap<String, crate::params::Param>,
     pub pos_params: Vec<String>,
     pub jobs: Mutex<Vec<Job>>,
     pub history: Mutex<Vec<String>>,
@@ -125,10 +120,10 @@ pub struct Shell {
     pub last_cmdsub_status: Option<i32>,
     // Character offset inside the current `getopts` argument.
     pub getopts_pos: usize,
-    // Stack of local-variable scopes. Each entry maps a variable name to
-    // its prior global value (None = the variable was unset before being
-    // declared local). Pushed on function entry, popped on return.
-    pub local_scopes: Vec<HashMap<String, Option<Var>>>,
+    // Stack of local scopes. Each maps a parameter name to its state
+    // before it was made local (None = unset). Pushed on function entry,
+    // popped on return.
+    pub local_scopes: Vec<HashMap<String, Option<crate::params::Param>>>,
     // Zsh-style named options (setopt/unsetopt). Keys are normalized to
     // lowercase with underscores stripped. Most are stubs for Phase 1;
     // the subset that maps to a legacy OPT_* flag also toggles that flag.
@@ -136,15 +131,10 @@ pub struct Shell {
     // zstyle entries in declaration order. Later matching entries override
     // earlier ones for query operations.
     pub zstyles: Vec<ZStyle>,
-    // Indexed arrays (zsh-style, 1-based at the user level). Stored 0-based.
-    // A name that exists in `arrays` shadows any same-named scalar in `vars`.
-    pub arrays: HashMap<String, Vec<String>>,
-    // Associative arrays declared with `typeset -A`.
-    pub assoc_arrays: HashMap<String, BTreeMap<String, String>>,
-    // Arrays declared with `typeset -U` keep first occurrences only.
-    pub unique_arrays: HashSet<String>,
     // Directory stack used by pushd/popd/dirs.
     pub dir_stack: Vec<String>,
+    // Coprocess pipes: (write end to its input, read end of its output).
+    pub coproc: Option<(i32, i32)>,
 }
 
 impl Shell {
@@ -160,7 +150,16 @@ impl Shell {
             login_shell: false,
             job_control: false,
             in_subshell: false,
-            vars: HashMap::new(),
+            params: HashMap::from([
+                (
+                    ALIASES.to_string(),
+                    crate::params::Param::with(crate::params::Value::Assoc(BTreeMap::new())),
+                ),
+                (
+                    GALIASES.to_string(),
+                    crate::params::Param::with(crate::params::Value::Assoc(BTreeMap::new())),
+                ),
+            ]),
             pos_params: Vec::new(),
             jobs: Mutex::new(Vec::new()),
             history: Mutex::new(Vec::new()),
@@ -178,32 +177,25 @@ impl Shell {
             errexit_suppressed: 0,
             flow: Flow::None,
             error_exit: false,
+            emulation: crate::options::Emulation::Zsh,
             last_cmdsub_status: None,
             getopts_pos: 0,
             local_scopes: Vec::new(),
             named_opts: HashMap::new(),
             zstyles: Vec::new(),
-            arrays: HashMap::new(),
-            assoc_arrays: HashMap::from([
-                (ALIASES.to_string(), BTreeMap::new()),
-                (GALIASES.to_string(), BTreeMap::new()),
-            ]),
-            unique_arrays: HashSet::new(),
             dir_stack: Vec::new(),
+            coproc: None,
         }
     }
 
     /// The alias table (`global`: zsh `alias -g`). As in zsh, aliases
     /// live in the associative arrays `$aliases` and `$galiases`.
     pub fn alias_map(&mut self, global: bool) -> &mut BTreeMap<String, String> {
-        self.assoc_arrays
-            .entry(if global { GALIASES } else { ALIASES }.to_string())
-            .or_default()
+        self.assoc_entry(if global { GALIASES } else { ALIASES })
     }
 
     pub fn alias(&self, name: &str, global: bool) -> Option<&String> {
-        self.assoc_arrays
-            .get(if global { GALIASES } else { ALIASES })
+        self.assoc(if global { GALIASES } else { ALIASES })
             .and_then(|m| m.get(name))
     }
 }
@@ -268,6 +260,9 @@ pub struct SimpleCmd {
     pub assigns: Vec<Assign>,
     pub words: Vec<String>,
     pub redirs: Vec<Redir>,
+    // Array values given to declaration commands, `typeset a=(x y)`: the
+    // index of the `a=` word in `words` and the raw items.
+    pub decl_arrays: Vec<(usize, Vec<String>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -276,6 +271,8 @@ pub struct CaseItem {
     pub body: Option<Node>,
     // Terminated by `;&` instead of `;;`.
     pub fallthrough: bool,
+    // Terminated by `;|`: keep testing the following patterns.
+    pub cont: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -315,6 +312,19 @@ pub enum Node {
     },
     // `(( expr ))`
     Arith(String),
+    // `repeat count body`
+    Repeat {
+        count: String,
+        body: Box<Node>,
+    },
+    // `select var [in words]; do body; done`
+    Select {
+        var: String,
+        words: Option<Vec<String>>,
+        body: Box<Node>,
+    },
+    // `coproc cmd`
+    Coproc(Box<Node>),
     // Run in the background with `&|` / `&!`: no job entry, no notice.
     Disowned(Box<Node>),
     // zsh `{ try } always { cleanup }`

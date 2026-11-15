@@ -444,7 +444,12 @@ fn test_brace_expansion_advanced() {
 
 #[test]
 fn test_glob_no_match() {
-    let (status, stdout, _) = run_script("echo non_existent_file_*.txt");
+    // zsh (NOMATCH): an error, and the command does not run.
+    let (_, stdout, stderr) = run_script("echo non_existent_file_*.txt");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("no matches found: non_existent_file_*.txt"));
+    // sh: the pattern is left as it is.
+    let (status, stdout, _) = run_script("emulate sh; echo non_existent_file_*.txt");
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "non_existent_file_*.txt");
 }
@@ -920,7 +925,7 @@ fn test_posix_readonly_rejects_reassignment() {
         run_script(r#"readonly answer=42; answer=99; echo "status=$? answer=$answer""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "status=1 answer=42");
-    assert!(stderr.contains("readonly variable"));
+    assert!(stderr.contains("read-only variable"));
 }
 
 #[test]
@@ -929,7 +934,7 @@ fn test_posix_readonly_rejects_second_readonly_assignment() {
         run_script(r#"readonly answer=42; readonly answer=99; echo "status=$? answer=$answer""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "status=1 answer=42");
-    assert!(stderr.contains("readonly variable"));
+    assert!(stderr.contains("read-only variable"));
 }
 
 #[test]
@@ -938,7 +943,7 @@ fn test_readonly_rejects_array_assignment() {
         run_script(r#"readonly answer=42; answer=(99); echo "status=$? answer=$answer""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "status=1 answer=42");
-    assert!(stderr.contains("readonly variable"));
+    assert!(stderr.contains("read-only variable"));
 }
 
 #[test]
@@ -947,7 +952,7 @@ fn test_readonly_rejects_subscript_assignment() {
         run_script(r#"readonly answer=42; answer[1]=99; echo "status=$? answer=$answer""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "status=1 answer=42");
-    assert!(stderr.contains("readonly variable"));
+    assert!(stderr.contains("read-only variable"));
 }
 
 #[test]

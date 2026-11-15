@@ -50,8 +50,7 @@ impl MeowshHelper {
             let current = parts.last().unwrap_or(&"");
 
             let aliases: Vec<String> = shell
-                .assoc_arrays
-                .get(crate::types::ALIASES)
+                .assoc(crate::types::ALIASES)
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default();
             for name in &aliases {
@@ -82,11 +81,7 @@ impl MeowshHelper {
                 }
             }
 
-            let path = shell
-                .vars
-                .get("PATH")
-                .map(|v| v.value.as_str())
-                .unwrap_or("");
+            let path = shell.scalar("PATH").unwrap_or("");
             for dir in path.split(':') {
                 if dir.is_empty() {
                     continue;

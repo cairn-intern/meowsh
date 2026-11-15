@@ -1,9 +1,10 @@
-use meowsh::builtins::{option_letter, source_file, NAMED_OPTIONS};
+use meowsh::builtins::source_file;
 use meowsh::exec::{exit_shell, flow, run_string, set_flow, strerror};
 use meowsh::jobs::TTY_FD;
 use meowsh::lineedit::{run_fd, run_interactive};
+use meowsh::options::{self, Emulation};
 use meowsh::shell::{shell_init, with_shell};
-use meowsh::types::{Flow, OPT_INTERACTIVE, OPT_MONITOR};
+use meowsh::types::Flow;
 use std::env;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -16,8 +17,8 @@ struct Args {
     positional: Vec<String>,
     interactive: Option<bool>,
     login: bool,
-    // (flag, on) pairs from -e, +x, -o name, ...
-    options: Vec<(u32, bool)>,
+    // (option, value) pairs from -e, +x, -o name, ...
+    options: Vec<(&'static str, bool)>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -28,6 +29,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut command_mode = false;
     let mut stdin_mode = false;
     let mut i = 1;
+    // `--emulate mode` is handled before parsing (it decides the letters).
+    if args.get(1).map(|a| a.as_str()) == Some("--emulate") {
+        i = 3;
+    }
     while i < args.len() {
         let a = &args[i];
         if a == "--" {
@@ -52,15 +57,12 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 'o' => {
                     i += 1;
                     let name = args.get(i).ok_or("-o: option name required")?;
-                    let flag = NAMED_OPTIONS
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .map(|(_, f)| *f)
-                        .ok_or_else(|| format!("{}: invalid option name", name))?;
-                    out.options.push((flag, on));
+                    let (opt, v) = options::resolve(name)
+                        .ok_or_else(|| format!("no such option: {}", name))?;
+                    out.options.push((opt, if on { v } else { !v }));
                 }
-                _ => match option_letter(c) {
-                    Some(f) => out.options.push((f, on)),
+                _ => match options::letter(c) {
+                    Some((opt, v)) => out.options.push((opt, if on { v } else { !v })),
                     None => return Err(format!("-{}: invalid option", c)),
                 },
             }
@@ -87,6 +89,17 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 fn main() {
     shell_init();
     let argv: Vec<String> = env::args().collect();
+    // As zsh does: emulate the shell named by argv[0] (sh, ksh, ...) or
+    // by `--emulate mode`; otherwise zsh.
+    let emu = match (argv.get(1).map(|a| a.as_str()), argv.get(2)) {
+        (Some("--emulate"), Some(m)) => Emulation::from_name(m).unwrap_or(Emulation::Zsh),
+        _ => argv
+            .first()
+            .and_then(|a0| Emulation::from_name(a0))
+            .filter(|e| *e != Emulation::Csh)
+            .unwrap_or(Emulation::Zsh),
+    };
+    with_shell(|s| options::init(s, emu));
     let args = match parse_args(&argv) {
         Ok(a) => a,
         Err(e) => {
@@ -110,16 +123,16 @@ fn main() {
                 .unwrap_or_else(|| "meowsh".to_string())
         });
         s.pos_params = args.positional.clone();
-        for (flag, on) in &args.options {
-            if *on {
-                s.opts |= flag;
-            } else {
-                s.opts &= !flag;
-            }
+        for (opt, on) in &args.options {
+            options::set_in(s, opt, *on);
         }
-        if interactive {
-            s.opts |= OPT_INTERACTIVE;
-        }
+        options::set_in(s, "interactive", interactive);
+        options::set_in(s, "login", args.login);
+        options::set_in(
+            s,
+            "shinstdin",
+            args.command.is_none() && args.script.is_none(),
+        );
     });
 
     if interactive && tty_in {
@@ -127,7 +140,9 @@ fn main() {
     }
     meowsh::trap::init_shell_signals();
 
-    source_startup_files(args.login, interactive);
+    if options::is_set("rcs") {
+        source_startup_files(args.login, interactive);
+    }
 
     let status = if let Some(cmd) = &args.command {
         run_string(cmd)
@@ -196,7 +211,7 @@ fn init_job_control() {
         with_shell(|s| {
             s.job_control = true;
             s.shell_pgid = pgid;
-            s.opts |= OPT_MONITOR;
+            options::set_in(s, "monitor", true);
         });
     }
 }
@@ -269,7 +284,7 @@ mod tests {
         let a = parse_args(&v(&["meowsh", "-e", "script.sh", "x", "y"])).unwrap();
         assert_eq!(a.script.as_deref(), Some("script.sh"));
         assert_eq!(a.positional, v(&["x", "y"]));
-        assert_eq!(a.options, vec![(meowsh::types::OPT_ERREXIT, true)]);
+        assert_eq!(a.options, vec![("errexit", true)]);
     }
 
     #[test]
@@ -286,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_parse_args_rejects_unknown_option() {
-        assert!(parse_args(&v(&["meowsh", "-Z"])).is_err());
+        assert!(parse_args(&v(&["meowsh", "-j"])).is_err());
         assert!(parse_args(&v(&["meowsh", "-c"])).is_err());
     }
 }

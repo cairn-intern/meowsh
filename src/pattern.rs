@@ -299,7 +299,8 @@ pub fn has_meta(pattern: &str) -> bool {
     while i < p.len() {
         match p[i] {
             '\\' => i += 1,
-            '*' | '?' | '[' => return true,
+            '*' | '?' => return true,
+            '[' if parse_class(&p, i).is_some() => return true,
             '(' if group_end(&p, i).is_some() => return true,
             '<' if crate::lexer::numeric_range_len(&p, i).is_some() => return true,
             _ => {}

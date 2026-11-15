@@ -6,16 +6,11 @@ use crate::exec::{call_function, last_status, run_string, set_flow, strerror};
 use crate::jobs::{builtin_bg, builtin_fg, builtin_jobs, builtin_wait, kill_targets};
 use crate::lexer::is_valid_name;
 use crate::shell::{
-    array_declare, array_make_unique, array_set, assoc_declare, declare_local, find_command,
-    in_function_scope, var_get, var_get_opt, var_set, with_shell,
+    array_set, assoc_declare, find_command, var_get, var_get_opt, var_set, with_shell,
 };
 use crate::sys::{err_line, out, read_byte};
 use crate::trap::{set_trap, signal_name, signal_number, SIGNALS};
-use crate::types::{
-    Flow, FuncDef, Node, Var, ZStyle, OPT_ALLEXPORT, OPT_ERREXIT, OPT_HASHALL, OPT_MONITOR,
-    OPT_NOCLOBBER, OPT_NOEXEC, OPT_NOGLOB, OPT_NOUNSET, OPT_PIPEFAIL, OPT_VERBOSE, OPT_XTRACE,
-    VAR_EXPORT, VAR_READONLY,
-};
+use crate::types::{Flow, FuncDef, Node, ZStyle, VAR_READONLY};
 use std::sync::Arc;
 
 const SPECIAL: &[&str] = &[
@@ -70,6 +65,9 @@ const REGULAR: &[&str] = &[
     "zrecompile",
     "builtin",
     "unfunction",
+    "integer",
+    "float",
+    "functions",
     "is-at-least",
     "zparseopts",
     "fc",
@@ -105,8 +103,7 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "." | "source" => builtin_source(words),
         "eval" => builtin_eval(words),
         "exit" => builtin_exit(words),
-        "export" => builtin_export(words),
-        "readonly" => builtin_readonly(words),
+        "export" | "readonly" => decl_from_words(words),
         "return" => builtin_return(words),
         "set" => builtin_set(words),
         "shift" => builtin_shift(words),
@@ -133,8 +130,8 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "hash" => builtin_hash(words),
         "history" => builtin_history(),
         "kill" => builtin_kill(words),
-        "local" => builtin_local(words),
-        "typeset" | "declare" => builtin_typeset(words),
+        "local" | "typeset" | "declare" | "integer" | "float" => decl_from_words(words),
+        "functions" => builtin_functions(words),
         "pwd" => builtin_pwd(words),
         "read" => builtin_read(words),
         "setopt" => builtin_setopt(words, true),
@@ -362,10 +359,10 @@ fn split_assignment(arg: &str) -> (&str, Option<&str>, bool) {
 
 fn list_vars(prefix: &str, flag: u32) {
     let mut vars: Vec<(String, String)> = with_shell(|s| {
-        s.vars
+        s.params
             .iter()
-            .filter(|(_, v)| flag == 0 || v.flags & flag != 0)
-            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .filter(|(_, p)| (flag == 0 || p.attrs & flag != 0) && !p.is_array() && !p.is_assoc())
+            .map(|(k, p)| (k.clone(), p.text()))
             .collect()
     });
     vars.sort();
@@ -378,91 +375,6 @@ fn list_vars(prefix: &str, flag: u32) {
         }
     }
     out(&text);
-}
-
-fn set_flag(name: &str, flag: u32, on: bool) {
-    with_shell(|s| {
-        if on {
-            s.vars
-                .entry(name.to_string())
-                .or_insert(Var {
-                    value: String::new(),
-                    flags: 0,
-                })
-                .flags |= flag;
-        } else if let Some(v) = s.vars.get_mut(name) {
-            v.flags &= !flag;
-        }
-    });
-}
-
-fn builtin_export(words: &[String]) -> i32 {
-    let mut unexport = false;
-    let mut names = Vec::new();
-    for a in &words[1..] {
-        match a.as_str() {
-            "-p" | "--" => {}
-            "-n" => unexport = true,
-            _ => names.push(a),
-        }
-    }
-    if names.is_empty() {
-        list_vars("export", VAR_EXPORT);
-        return 0;
-    }
-    let mut status = 0;
-    for a in names {
-        let (name, value, append) = split_assignment(a);
-        if !is_valid_name(name) {
-            err_line(&format!("meowsh: export: `{}': not a valid identifier", a));
-            status = 1;
-            continue;
-        }
-        if let Some(v) = value {
-            let v = if append {
-                format!("{}{}", var_get(name), v)
-            } else {
-                v.to_string()
-            };
-            if !var_set(name, &v, !unexport) {
-                status = 1;
-                continue;
-            }
-        }
-        set_flag(name, VAR_EXPORT, !unexport);
-    }
-    status
-}
-
-fn builtin_readonly(words: &[String]) -> i32 {
-    let names: Vec<&String> = words[1..]
-        .iter()
-        .filter(|a| a.as_str() != "-p" && a.as_str() != "--")
-        .collect();
-    if names.is_empty() {
-        list_vars("readonly", VAR_READONLY);
-        return 0;
-    }
-    let mut status = 0;
-    for a in names {
-        let (name, value, _) = split_assignment(a);
-        if !is_valid_name(name) {
-            err_line(&format!(
-                "meowsh: readonly: `{}': not a valid identifier",
-                a
-            ));
-            status = 1;
-            continue;
-        }
-        if let Some(v) = value {
-            if !var_set(name, v, false) {
-                status = 1;
-                continue;
-            }
-        }
-        set_flag(name, VAR_READONLY, true);
-    }
-    status
 }
 
 fn builtin_unset(words: &[String]) -> i32 {
@@ -485,66 +397,31 @@ fn builtin_unset(words: &[String]) -> i32 {
             continue;
         }
         let readonly = with_shell(|s| {
-            s.vars
-                .get(a.as_str())
-                .map(|v| v.flags & VAR_READONLY != 0)
-                .unwrap_or(false)
+            s.param(a.as_str())
+                .is_some_and(|p| p.attrs & VAR_READONLY != 0)
         });
         if readonly {
-            err_line(&format!(
-                "meowsh: unset: {}: cannot unset: readonly variable",
-                a
-            ));
+            err_line(&format!("meowsh: unset: read-only variable: {}", a));
             status = 1;
             continue;
         }
-        with_shell(|s| {
-            s.vars.remove(a.as_str());
-            s.arrays.remove(a.as_str());
-            s.assoc_arrays.remove(a.as_str());
-        });
+        with_shell(|s| s.remove_param(a.as_str()));
     }
     status
 }
 
-pub fn option_letter(c: char) -> Option<u32> {
-    Some(match c {
-        'a' => OPT_ALLEXPORT,
-        'e' => OPT_ERREXIT,
-        'f' => OPT_NOGLOB,
-        'h' => OPT_HASHALL,
-        'm' => OPT_MONITOR,
-        'n' => OPT_NOEXEC,
-        'u' => OPT_NOUNSET,
-        'v' => OPT_VERBOSE,
-        'x' => OPT_XTRACE,
-        'C' => OPT_NOCLOBBER,
-        _ => return None,
-    })
-}
-
-pub const NAMED_OPTIONS: &[(&str, u32)] = &[
-    ("allexport", OPT_ALLEXPORT),
-    ("errexit", OPT_ERREXIT),
-    ("hashall", OPT_HASHALL),
-    ("monitor", OPT_MONITOR),
-    ("noclobber", OPT_NOCLOBBER),
-    ("noexec", OPT_NOEXEC),
-    ("noglob", OPT_NOGLOB),
-    ("nounset", OPT_NOUNSET),
-    ("pipefail", OPT_PIPEFAIL),
-    ("verbose", OPT_VERBOSE),
-    ("xtrace", OPT_XTRACE),
-];
-
-fn set_opt(flag: u32, on: bool) {
-    with_shell(|s| {
-        if on {
-            s.opts |= flag;
+// `set -o` / `set +o` listings.
+fn list_options(as_commands: bool) {
+    let mut text = String::new();
+    for name in crate::options::names() {
+        let on = crate::options::is_set(name);
+        if as_commands {
+            text.push_str(&format!("set {}o {}\n", if on { '-' } else { '+' }, name));
         } else {
-            s.opts &= !flag;
+            text.push_str(&format!("{:<22}{}\n", name, if on { "on" } else { "off" }));
         }
-    });
+    }
+    out(&text);
 }
 
 fn builtin_set(words: &[String]) -> i32 {
@@ -554,66 +431,85 @@ fn builtin_set(words: &[String]) -> i32 {
         return 0;
     }
     let mut i = 0;
+    let mut array: Option<(String, bool)> = None;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--" {
-            with_shell(|s| s.pos_params = args[i + 1..].to_vec());
-            return 0;
+            i += 1;
+            break;
         }
         if a == "-" {
-            set_opt(OPT_XTRACE | OPT_VERBOSE, false);
-            if i + 1 < args.len() {
-                with_shell(|s| s.pos_params = args[i + 1..].to_vec());
-            }
-            return 0;
+            crate::options::set("xtrace", false);
+            crate::options::set("verbose", false);
+            i += 1;
+            break;
         }
-        if (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 {
-            let on = a.starts_with('-');
-            for c in a[1..].chars() {
-                if c == 'o' {
-                    match args.get(i + 1) {
-                        Some(name) => {
-                            i += 1;
-                            match NAMED_OPTIONS.iter().find(|(n, _)| n == name) {
-                                Some((_, f)) => set_opt(*f, on),
-                                None if matches!(name.as_str(), "vi" | "emacs" | "ignoreeof") => {}
-                                None => {
-                                    return usage("set", &format!("{}: invalid option name", name))
-                                }
-                            }
-                        }
-                        None => {
-                            let opts = with_shell(|s| s.opts);
-                            let mut text = String::new();
-                            for (n, f) in NAMED_OPTIONS {
-                                if on {
-                                    let state = if opts & f != 0 { "on" } else { "off" };
-                                    text.push_str(&format!("{:<15} {}\n", n, state));
-                                } else {
-                                    let sign = if opts & f != 0 { '-' } else { '+' };
-                                    text.push_str(&format!("set {}o {}\n", sign, n));
-                                }
-                            }
-                            out(&text);
+        if !((a.starts_with('-') || a.starts_with('+')) && a.len() > 1) {
+            break;
+        }
+        let on = a.starts_with('-');
+        for c in a[1..].chars() {
+            match c {
+                'o' => match args.get(i + 1) {
+                    Some(name) => {
+                        i += 1;
+                        if !crate::options::set(name, on) {
+                            return usage("set", &format!("no such option: {}", name));
                         }
                     }
-                    continue;
+                    None => list_options(!on),
+                },
+                // zsh: set -A name values (replace) / +A (overwrite start).
+                'A' => {
+                    i += 1;
+                    match args.get(i) {
+                        Some(name) => array = Some((name.clone(), on)),
+                        None => {
+                            list_vars("", 0);
+                            return 0;
+                        }
+                    }
                 }
-                match option_letter(c) {
-                    Some(f) => set_opt(f, on),
+                's' if crate::options::letter('s').is_none() => {}
+                c => match crate::options::letter(c) {
+                    Some((name, v)) => {
+                        crate::options::set(name, if on { v } else { !v });
+                    }
                     None => {
                         return usage(
                             "set",
                             &format!("{}{}: invalid option", if on { '-' } else { '+' }, c),
                         )
                     }
-                }
+                },
             }
-            i += 1;
-            continue;
         }
-        with_shell(|s| s.pos_params = args[i..].to_vec());
-        return 0;
+        i += 1;
+    }
+    let rest = args[i.min(args.len())..].to_vec();
+    match array {
+        Some((name, replace)) => {
+            let items = if replace {
+                rest
+            } else {
+                let mut old = with_shell(|s| s.array(&name).cloned()).unwrap_or_default();
+                for (k, v) in rest.into_iter().enumerate() {
+                    if k < old.len() {
+                        old[k] = v;
+                    } else {
+                        old.push(v);
+                    }
+                }
+                old
+            };
+            if !array_set(&name, items) {
+                return 1;
+            }
+        }
+        None if i < args.len() || args.last().map(|a| a == "--").unwrap_or(false) => {
+            with_shell(|s| s.pos_params = rest);
+        }
+        None => {}
     }
     0
 }
@@ -639,152 +535,138 @@ fn builtin_shift(words: &[String]) -> i32 {
     })
 }
 
-fn builtin_local(words: &[String]) -> i32 {
-    // zsh accepts `local` outside a function; it then acts like typeset.
-    if !in_function_scope() {
-        return builtin_typeset(words);
-    }
-    for arg in &words[1..] {
-        if arg.starts_with('-') {
+// Declaration commands called with plain words (through `builtin`,
+// `command` or `eval`): assignments become typed arguments.
+fn decl_from_words(words: &[String]) -> i32 {
+    let mut args = vec![crate::typeset::DeclArg::Word(words[0].clone())];
+    let mut options_done = false;
+    for w in &words[1..] {
+        if !options_done && (w.starts_with('-') || w.starts_with('+')) {
+            if w == "--" {
+                options_done = true;
+            }
+            args.push(crate::typeset::DeclArg::Word(w.clone()));
             continue;
         }
-        let (name, value, _) = split_assignment(arg);
-        if !is_valid_name(name) {
-            err_line(&format!("meowsh: local: `{}': not a valid identifier", arg));
-            return 1;
-        }
-        declare_local(name);
-        // Bare `local foo` masks any global with an empty value for the
-        // duration of the function.
-        if !var_set(name, value.unwrap_or(""), false) {
-            return 1;
+        options_done = true;
+        let (name, value, append) = split_assignment(w);
+        match value {
+            Some(v) => args.push(crate::typeset::DeclArg::Assign {
+                name: name.to_string(),
+                append,
+                value: Some(v.to_string()),
+            }),
+            None => args.push(crate::typeset::DeclArg::Word(w.clone())),
         }
     }
-    0
+    crate::typeset::typeset(&words[0], &args)
 }
 
-fn builtin_typeset(words: &[String]) -> i32 {
-    let mut export = false;
-    let mut readonly = false;
-    let mut unique = false;
-    let mut array = false;
-    let mut associative = false;
-    let mut print = false;
-    let mut names = Vec::new();
-
-    for arg in &words[1..] {
-        if arg == "--" {
-            continue;
-        }
-        if arg.starts_with('-') && arg.len() > 1 && !arg.contains('=') {
-            for flag in arg.chars().skip(1) {
-                match flag {
-                    'a' => array = true,
-                    'A' => associative = true,
-                    'r' => readonly = true,
-                    'U' => unique = true,
-                    'x' => export = true,
-                    'p' => print = true,
-                    // Other zsh modifiers do not affect storage here.
-                    _ => {}
-                }
-            }
-            continue;
-        }
-        if arg.starts_with('+') && arg.len() > 1 && !arg.contains('=') {
-            for flag in arg.chars().skip(1) {
-                match flag {
-                    'x' => export = false,
-                    'r' => readonly = false,
-                    'U' => unique = false,
-                    _ => {}
-                }
-            }
-            continue;
-        }
-        names.push(arg.clone());
-    }
-
-    if print || names.is_empty() {
-        print_typeset_state(&names);
-        return 0;
-    }
-
-    let local = in_function_scope();
-    for spec in names {
-        let (name, value, _) = split_assignment(&spec);
-        if !is_valid_name(name) {
-            err_line(&format!(
-                "meowsh: typeset: `{}': not a valid identifier",
-                spec
-            ));
-            return 1;
-        }
-        if local && !array && !associative && !unique {
-            declare_local(name);
-        }
-        if array && !array_declare(name) {
-            return 1;
-        }
-        if associative && !assoc_declare(name) {
-            return 1;
-        }
-        if unique && !array_make_unique(name) {
-            return 1;
-        }
-        if let Some(value) = value {
-            if !var_set(name, value, export) {
-                return 1;
-            }
-        } else if export {
-            set_flag(name, VAR_EXPORT, true);
-        }
-        if readonly {
-            set_flag(name, VAR_READONLY, true);
-        }
-    }
-    0
+/// `functions` and `typeset -f`: print function definitions (all, or the
+/// named ones; names only with `+`; patterns with -m; -x N indents with
+/// N spaces).
+pub fn functions_cmd(
+    _cmd: &str,
+    minus: &[char],
+    plus: &[char],
+    rest: &[crate::typeset::DeclArg],
+) -> i32 {
+    let names: Vec<String> = rest
+        .iter()
+        .map(|a| match a {
+            crate::typeset::DeclArg::Word(w) => w.clone(),
+            crate::typeset::DeclArg::Assign { name, .. }
+            | crate::typeset::DeclArg::Array { name, .. } => name.clone(),
+        })
+        .collect();
+    functions_listing(&names, minus.contains(&'m'), !plus.is_empty(), None)
 }
 
-fn print_typeset_state(names: &[String]) {
-    let mut text = String::new();
-    with_shell(|shell| {
-        let fmt_assoc = |items: &std::collections::BTreeMap<String, String>| {
-            items
-                .iter()
-                .flat_map(|(k, v)| [k.clone(), v.clone()])
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        if names.is_empty() {
-            let mut vars: Vec<_> = shell.vars.iter().collect();
-            vars.sort_by(|a, b| a.0.cmp(b.0));
-            for (name, var) in vars {
-                text.push_str(&format!("typeset {}={}\n", name, shell_quote(&var.value)));
-            }
-            let mut arrays: Vec<_> = shell.arrays.iter().collect();
-            arrays.sort_by(|a, b| a.0.cmp(b.0));
-            for (name, items) in arrays {
-                text.push_str(&format!("typeset -a {}=({})\n", name, items.join(" ")));
-            }
-            let mut assoc: Vec<_> = shell.assoc_arrays.iter().collect();
-            assoc.sort_by(|a, b| a.0.cmp(b.0));
-            for (name, items) in assoc {
-                text.push_str(&format!("typeset -A {}=({})\n", name, fmt_assoc(items)));
-            }
-            return;
-        }
-        for name in names {
-            if let Some(items) = shell.arrays.get(name) {
-                text.push_str(&format!("typeset -a {}=({})\n", name, items.join(" ")));
-            } else if let Some(items) = shell.assoc_arrays.get(name) {
-                text.push_str(&format!("typeset -A {}=({})\n", name, fmt_assoc(items)));
-            } else if let Some(var) = shell.vars.get(name) {
-                text.push_str(&format!("typeset {}={}\n", name, shell_quote(&var.value)));
-            }
-        }
+fn functions_listing(
+    names: &[String],
+    patterns: bool,
+    names_only: bool,
+    spaces: Option<usize>,
+) -> i32 {
+    let mut all: Vec<(String, Arc<Node>)> = with_shell(|s| {
+        s.functions
+            .iter()
+            .map(|(k, f)| (k.clone(), f.body.clone()))
+            .collect()
     });
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut status = 0;
+    let mut text = String::new();
+    let mut emit = |name: &str, body: &Node| {
+        if names_only {
+            text.push_str(name);
+            text.push('\n');
+        } else {
+            text.push_str(&crate::deparse::function_text(name, body, spaces));
+        }
+    };
+    if names.is_empty() {
+        for (n, b) in &all {
+            emit(n, b);
+        }
+    } else {
+        for want in names {
+            let mut found = false;
+            for (n, b) in &all {
+                if (patterns && crate::pattern::matches(want, n)) || (!patterns && n == want) {
+                    emit(n, b);
+                    found = true;
+                }
+            }
+            if !found && !patterns {
+                status = 1;
+            }
+        }
+    }
     out(&text);
+    status
+}
+
+fn builtin_functions(words: &[String]) -> i32 {
+    let (mut patterns, mut names_only, mut spaces) = (false, false, None);
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        if a == "+" {
+            names_only = true;
+        } else if a == "--" {
+            i += 1;
+            break;
+        } else if let Some(f) = a.strip_prefix('-').filter(|f| !f.is_empty()) {
+            let mut chars = f.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    'm' => patterns = true,
+                    'x' => {
+                        let rest: String = chars.by_ref().collect();
+                        let n = if rest.is_empty() {
+                            i += 1;
+                            words.get(i).cloned().unwrap_or_default()
+                        } else {
+                            rest
+                        };
+                        match n.parse() {
+                            Ok(v) => spaces = Some(v),
+                            Err(_) => {
+                                return usage("functions", &format!("invalid indentation: {}", n))
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if a.starts_with('+') && a.len() > 1 {
+            names_only = true;
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    functions_listing(&words[i.min(words.len())..], patterns, names_only, spaces)
 }
 
 // ---- read -----------------------------------------------------------------
@@ -831,6 +713,7 @@ fn read_split(chars: &[(char, bool)], ifs: &str, n: usize) -> Vec<String> {
 }
 
 fn builtin_read(words: &[String]) -> i32 {
+    let mut fd = 0;
     let mut keys: Option<usize> = None;
     let mut yes_no = false;
     let mut raw = false;
@@ -858,7 +741,6 @@ fn builtin_read(words: &[String]) -> i32 {
             match c {
                 'r' => raw = true,
                 's' => {}
-                'p' => prompt = take_arg(),
                 'd' => delim = take_arg().and_then(|d| d.bytes().next()).unwrap_or(0),
                 'a' | 'A' => array = take_arg(),
                 // zsh: -k [n] reads n characters, -q one y/n answer.
@@ -877,6 +759,14 @@ fn builtin_read(words: &[String]) -> i32 {
                     keys = Some(1);
                     yes_no = true;
                 }
+                'u' => match take_arg().and_then(|n| n.parse().ok()) {
+                    Some(n) => fd = n,
+                    None => return usage("read", "-u: bad file descriptor"),
+                },
+                'p' => match with_shell(|s| s.coproc) {
+                    Some((_, r)) => fd = r,
+                    None => return usage("read", "-p: no coprocess"),
+                },
                 // zsh: -E echo the line, -t timeout; accepted and ignored.
                 'E' => {}
                 't' => {
@@ -887,7 +777,14 @@ fn builtin_read(words: &[String]) -> i32 {
         }
         i += 1;
     }
-    let names: Vec<String> = words[i..].to_vec();
+    let mut names: Vec<String> = words[i..].to_vec();
+    // zsh: `read 'name?prompt'` prompts on a terminal.
+    if let Some(first) = names.first_mut() {
+        if let Some((n, p)) = first.split_once('?') {
+            prompt = Some(p.to_string());
+            *first = n.to_string();
+        }
+    }
     for n in &names {
         if !is_valid_name(n) {
             err_line(&format!("meowsh: read: `{}': not a valid identifier", n));
@@ -901,7 +798,7 @@ fn builtin_read(words: &[String]) -> i32 {
     }
 
     if let Some(n) = keys {
-        let text = match read_chars(n) {
+        let text = match read_chars(fd, n) {
             Some(t) => t,
             None => return 1,
         };
@@ -922,7 +819,7 @@ fn builtin_read(words: &[String]) -> i32 {
     let mut got_delim = false;
     let mut pending_backslash = false;
     loop {
-        match read_byte(0) {
+        match read_byte(fd) {
             Ok(Some(b)) => {
                 if pending_backslash {
                     pending_backslash = false;
@@ -990,20 +887,20 @@ fn builtin_read(words: &[String]) -> i32 {
 
 // Reads `n` characters from standard input, from a terminal without
 // waiting for Enter. None at end of input.
-fn read_chars(n: usize) -> Option<String> {
-    let tty = unsafe { libc::isatty(0) } == 1;
+fn read_chars(fd: i32, n: usize) -> Option<String> {
+    let tty = unsafe { libc::isatty(fd) } == 1;
     let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    if tty && unsafe { libc::tcgetattr(0, &mut saved) } == 0 {
+    if tty && unsafe { libc::tcgetattr(fd, &mut saved) } == 0 {
         let mut raw = saved;
         raw.c_lflag &= !(libc::ICANON | libc::ECHO);
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) };
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
     }
     let mut bytes = Vec::new();
     let mut count = 0;
     while count < n {
-        match read_byte(0) {
+        match read_byte(fd) {
             Ok(Some(b)) => {
                 bytes.push(b);
                 // Count a character once its UTF-8 sequence is complete.
@@ -1015,7 +912,7 @@ fn read_chars(n: usize) -> Option<String> {
         }
     }
     if tty {
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
     }
     if bytes.is_empty() {
         return None;
@@ -1075,7 +972,7 @@ fn builtin_getopts(words: &[String]) -> i32 {
                 var_set("OPTARG", &c.to_string(), false);
             } else {
                 err_line(&format!("meowsh: illegal option -- {}", c));
-                with_shell(|s| s.vars.remove("OPTARG"));
+                with_shell(|s| s.remove_param("OPTARG"));
             }
             var_set(name, "?", false);
         }
@@ -1104,7 +1001,7 @@ fn builtin_getopts(words: &[String]) -> i32 {
                         var_set(name, ":", false);
                     } else {
                         err_line(&format!("meowsh: option requires an argument -- {}", c));
-                        with_shell(|s| s.vars.remove("OPTARG"));
+                        with_shell(|s| s.remove_param("OPTARG"));
                         var_set(name, "?", false);
                     }
                     optind += 1;
@@ -1115,7 +1012,7 @@ fn builtin_getopts(words: &[String]) -> i32 {
             return 0;
         }
         Some(_) => {
-            with_shell(|s| s.vars.remove("OPTARG"));
+            with_shell(|s| s.remove_param("OPTARG"));
             var_set(name, &c.to_string(), false);
         }
     }
@@ -1928,7 +1825,7 @@ fn builtin_autoload(words: &[String]) -> i32 {
 }
 
 fn autoload_now(name: &str) -> bool {
-    let fpath = with_shell(|s| s.arrays.get("fpath").cloned()).unwrap_or_default();
+    let fpath = with_shell(|s| s.array("fpath").cloned()).unwrap_or_default();
     let Some(content) = fpath
         .iter()
         .map(|d| std::path::Path::new(d).join(name))
@@ -1970,59 +1867,78 @@ fn autoload_now(name: &str) -> bool {
 fn builtin_setopt(words: &[String], value: bool) -> i32 {
     let name = &words[0];
     let args = &words[1..];
-    if args.is_empty() && value {
-        let mut keys: Vec<String> = with_shell(|s| {
-            s.named_opts
-                .iter()
-                .filter(|(_, v)| **v)
-                .map(|(k, _)| k.clone())
-                .collect()
-        });
-        keys.sort();
-        out(&keys.iter().map(|k| format!("{}\n", k)).collect::<String>());
+    if args.is_empty() {
+        // Options that differ from the defaults, as zsh lists them: the
+        // name for setopt; with a `no` prefix for unsetopt.
+        let emu = with_shell(|s| s.emulation);
+        let mut text = String::new();
+        // setopt lists options changed from their defaults, unsetopt the
+        // rest; either way an option that is off shows as `noname` when it
+        // is on by default.
+        for o in crate::options::names() {
+            let on = crate::options::is_set(o);
+            let default = crate::options::default_in(o, emu);
+            if (on != default) != value {
+                continue;
+            }
+            if on != default {
+                if on {
+                    text.push_str(&format!("{}\n", o));
+                } else {
+                    text.push_str(&format!("no{}\n", o));
+                }
+            } else if on {
+                text.push_str(&format!("no{}\n", o));
+            } else {
+                text.push_str(&format!("{}\n", o));
+            }
+        }
+        out(&text);
         return 0;
     }
+    let mut status = 0;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "-o" {
+        if arg == "-o" || arg == "+o" {
+            let on = if arg == "-o" { value } else { !value };
             match args.get(i + 1) {
-                Some(o) => toggle_named_opt(o, value),
+                Some(o) => {
+                    if !crate::options::set(o, on) {
+                        err_line(&format!("meowsh: {}: no such option: {}", name, o));
+                        status = 1;
+                    }
+                }
                 None => return usage(name, "-o requires an argument"),
             }
             i += 2;
             continue;
         }
-        if arg.starts_with('-') || arg.starts_with('+') {
-            err_line(&format!("meowsh: {}: unsupported option: {}", name, arg));
-        } else {
-            toggle_named_opt(arg, value);
+        if (arg.starts_with('-') || arg.starts_with('+')) && arg.len() > 1 {
+            // Letters: -X sets the option, +X unsets it (inverted for unsetopt).
+            let on = arg.starts_with('-') == value;
+            for c in arg[1..].chars() {
+                match crate::options::letter(c) {
+                    Some((o, v)) => {
+                        crate::options::set(o, if on { v } else { !v });
+                    }
+                    None => {
+                        err_line(&format!("meowsh: {}: bad option: -{}", name, c));
+                        status = 1;
+                    }
+                }
+            }
+        } else if !crate::options::set(arg, value) {
+            err_line(&format!("meowsh: {}: no such option: {}", name, arg));
+            status = 1;
         }
         i += 1;
     }
-    0
+    status
 }
 
 fn toggle_named_opt(name: &str, value: bool) {
-    let normalized: String = name
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| *c != '_')
-        .collect();
-    let flag = NAMED_OPTIONS
-        .iter()
-        .find(|(n, _)| *n == normalized)
-        .map(|(_, f)| *f);
-    with_shell(|s| {
-        s.named_opts.insert(normalized.clone(), value);
-        if let Some(f) = flag {
-            if value {
-                s.opts |= f;
-            } else {
-                s.opts &= !f;
-            }
-        }
-    });
+    crate::options::set(name, value);
 }
 
 fn builtin_zstyle(args: &[String]) -> i32 {
@@ -2160,14 +2076,16 @@ const HOOKS: &[&str] = &[
 pub fn run_hooks(hook: &str, args: &[String]) {
     let mut names = vec![hook.to_string()];
     let list = format!("{}_functions", hook);
-    names.extend(with_shell(|s| s.arrays.get(&list).cloned()).unwrap_or_default());
-    let saved = with_shell(|s| (s.last_status, s.arrays.get("pipestatus").cloned()));
+    names.extend(with_shell(|s| s.array(&list).cloned()).unwrap_or_default());
+    let saved = with_shell(|s| (s.last_status, s.array("pipestatus").cloned()));
     let restore = || {
         with_shell(|s| {
             s.last_status = saved.0;
             match &saved.1 {
-                Some(p) => s.arrays.insert("pipestatus".to_string(), p.clone()),
-                None => s.arrays.remove("pipestatus"),
+                Some(p) => s.store("pipestatus", crate::params::Value::Array(p.clone())),
+                None => {
+                    s.remove_param("pipestatus");
+                }
             };
         })
     };
@@ -2522,23 +2440,73 @@ fn builtin_colors() -> i32 {
 
 // emulate: meowsh always behaves as zsh here. With no arguments it
 // reports the mode; `-c cmd` runs cmd; option changes are ignored.
+// emulate [-lLR] [zsh|sh|ksh|csh [-c arg]]: with no mode, prints the
+// current one. -R resets every option, -L makes the change local to the
+// calling function, -c runs `arg` under the emulation and then restores
+// the options.
 fn builtin_emulate(words: &[String]) -> i32 {
-    if words.len() == 1 {
-        out("zsh\n");
-        return 0;
+    let (mut reset_all, mut local) = (false, false);
+    let mut mode = None;
+    let mut cmd = None;
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        match a.as_str() {
+            "-c" => {
+                i += 1;
+                cmd = words.get(i).cloned();
+                if cmd.is_none() {
+                    return usage("emulate", "-c requires an argument");
+                }
+            }
+            a if a.starts_with('-') && a.len() > 1 => {
+                for c in a[1..].chars() {
+                    match c {
+                        'R' => reset_all = true,
+                        'L' => local = true,
+                        'l' => {}
+                        _ => return usage("emulate", &format!("bad option: -{}", c)),
+                    }
+                }
+            }
+            m => match crate::options::Emulation::from_name(m) {
+                Some(e) if mode.is_none() => mode = Some(e),
+                _ => return usage("emulate", &format!("unknown emulation: {}", m)),
+            },
+        }
+        i += 1;
     }
-    if words.iter().any(|w| w == "-L") {
+    let Some(mode) = mode else {
+        out(&format!("{}\n", with_shell(|s| s.emulation.name())));
+        return 0;
+    };
+    if let Some(cmd) = cmd {
+        let saved = with_shell(|s| {
+            (
+                s.opts,
+                s.named_opts.clone(),
+                s.emulation,
+                s.assoc("options").cloned(),
+            )
+        });
+        with_shell(|s| crate::options::emulate_in(s, mode, reset_all));
+        let st = run_string(&cmd);
+        with_shell(|s| {
+            s.opts = saved.0;
+            s.named_opts = saved.1;
+            s.emulation = saved.2;
+            if let Some(o) = saved.3 {
+                s.store("options", crate::params::Value::Assoc(o));
+            }
+        });
+        return st;
+    }
+    with_shell(|s| crate::options::emulate_in(s, mode, reset_all));
+    if local {
         for o in ["localoptions", "localtraps", "localpatterns"] {
             toggle_named_opt(o, true);
         }
     }
-    match words.iter().position(|w| w == "-c") {
-        Some(k) => match words.get(k + 1) {
-            Some(cmd) => run_string(cmd),
-            None => usage("emulate", "-c requires an argument"),
-        },
-        None => 0,
-    }
+    0
 }
 
 // add-zsh-hook [-d] hook function
@@ -2561,11 +2529,12 @@ fn builtin_add_zsh_hook(words: &[String]) -> i32 {
     }
     let list = format!("{}_functions", hook);
     with_shell(|s| {
-        let fns = s.arrays.entry(list).or_default();
+        let mut fns = s.array(&list).cloned().unwrap_or_default();
         fns.retain(|f| f != func);
         if !delete {
             fns.push(func.to_string());
         }
+        s.store(&list, crate::params::Value::Array(fns));
     });
     0
 }
@@ -2575,6 +2544,7 @@ fn builtin_add_zsh_hook(words: &[String]) -> i32 {
 fn builtin_print(words: &[String]) -> i32 {
     let mut i = 1;
     let (mut raw, mut newline, mut lines, mut nul, mut prompt) = (false, true, false, false, false);
+    let (mut sort, mut icase) = (None::<bool>, false);
     let mut fd = 1;
     while let Some(a) = words.get(i) {
         if a == "-" || a == "--" {
@@ -2584,7 +2554,10 @@ fn builtin_print(words: &[String]) -> i32 {
         let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
             break;
         };
-        if !flags.chars().all(|c| "rRnlNPeEu0123456789".contains(c)) {
+        if !flags
+            .chars()
+            .all(|c| "rRnlNPeEupoOisz0123456789".contains(c))
+        {
             break;
         }
         let mut chars = flags.chars().peekable();
@@ -2597,6 +2570,14 @@ fn builtin_print(words: &[String]) -> i32 {
                 'l' => lines = true,
                 'N' => nul = true,
                 'P' => prompt = true,
+                // -p: to the coprocess.
+                'p' => match with_shell(|s| s.coproc) {
+                    Some((w, _)) => fd = w,
+                    None => return usage("print", "-p: no coprocess"),
+                },
+                'o' => sort = Some(false),
+                'O' => sort = Some(true),
+                'i' => icase = true,
                 'u' => {
                     let rest: String = chars.by_ref().collect();
                     let spec = if rest.is_empty() {
@@ -2644,6 +2625,16 @@ fn builtin_print(words: &[String]) -> i32 {
         parts.push(t);
         if cut {
             break;
+        }
+    }
+    if let Some(desc) = sort {
+        if icase {
+            parts.sort_by_key(|p| p.to_lowercase());
+        } else {
+            parts.sort();
+        }
+        if desc {
+            parts.reverse();
         }
     }
     let mut text = parts.join(sep);

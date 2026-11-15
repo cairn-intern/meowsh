@@ -22,7 +22,9 @@ impl From<LexError> for ParseError {
 
 type PResult<T> = Result<T, ParseError>;
 
-const LIST_TERMINATORS: &[&str] = &["then", "else", "elif", "fi", "do", "done", "esac", "}"];
+const LIST_TERMINATORS: &[&str] = &[
+    "then", "else", "elif", "fi", "do", "done", "esac", "}", "end",
+];
 
 type AliasLookup = Box<dyn Fn(&str) -> Option<String>>;
 
@@ -237,7 +239,7 @@ impl Parser {
     fn at_list_end(&mut self) -> PResult<bool> {
         Ok(match self.peek()? {
             Tok::Eof => true,
-            Tok::Op(")") | Tok::Op(";;") | Tok::Op(";&") => true,
+            Tok::Op(")") | Tok::Op(";;") | Tok::Op(";&") | Tok::Op(";|") => true,
             Tok::Word(w) => LIST_TERMINATORS.contains(&w.as_str()),
             _ => false,
         })
@@ -273,9 +275,36 @@ impl Parser {
             self.next()?;
             bang = !bang;
         }
+        // zsh: `!` alone (before a separator) negates an empty command.
+        if bang && self.at_command_end()? {
+            return Ok(Node::Pipeline {
+                cmds: Vec::new(),
+                bang,
+            });
+        }
         let mut cmds = vec![self.parse_command()?];
-        while self.peek_is_op("|")? {
+        loop {
+            let both = if self.peek_is_op("|")? {
+                false
+            } else if self.peek_is_op("|&")? {
+                true
+            } else {
+                break;
+            };
             self.next()?;
+            // `a |& b` also sends a's standard error down the pipe.
+            if both {
+                let last = cmds.pop().unwrap();
+                cmds.push(with_redir(
+                    last,
+                    Redir {
+                        fd: 2,
+                        op: RedirOp::DupOut,
+                        target: "1".to_string(),
+                        heredoc: None,
+                    },
+                ));
+            }
             self.skip_newlines()?;
             cmds.push(self.parse_command()?);
         }
@@ -283,6 +312,18 @@ impl Parser {
             return Ok(cmds.pop().unwrap());
         }
         Ok(Node::Pipeline { cmds, bang })
+    }
+
+    fn at_command_end(&mut self) -> PResult<bool> {
+        Ok(match self.peek()? {
+            Tok::Eof | Tok::Newline => true,
+            Tok::Op(op) => matches!(
+                *op,
+                ";" | "&" | "&&" | "||" | ")" | ";;" | ";&" | ";|" | "&|" | "&!"
+            ),
+            Tok::Word(w) => w == "}",
+            _ => false,
+        })
     }
 
     fn alias_blocked(&self, name: &str) -> bool {
@@ -340,6 +381,14 @@ impl Parser {
                 "while" => self.parse_loop(false)?,
                 "until" => self.parse_loop(true)?,
                 "for" => self.parse_for()?,
+                "foreach" => self.parse_foreach()?,
+                "repeat" => self.parse_repeat()?,
+                "select" => self.parse_select()?,
+                "coproc" => {
+                    self.next()?;
+                    let body = self.parse_command()?;
+                    return Ok(Node::Coproc(Box::new(body)));
+                }
                 "case" => self.parse_case()?,
                 "{" => {
                     self.next()?;
@@ -366,7 +415,7 @@ impl Parser {
                 }
                 "[[" => self.parse_dbracket()?,
                 "function" => return self.parse_function_keyword(),
-                "then" | "else" | "elif" | "fi" | "do" | "done" | "esac" | "}" | "in" => {
+                "then" | "else" | "elif" | "fi" | "do" | "done" | "esac" | "}" | "in" | "end" => {
                     return Err(self.unexpected(&tok));
                 }
                 _ => return self.parse_simple_or_funcdef(),
@@ -537,6 +586,32 @@ impl Parser {
             if !cmd.words.is_empty() && self.try_alias_in(true)? {
                 continue;
             }
+            // Declaration commands take array values: `typeset a=(x y)`.
+            if cmd.words.first().is_some_and(|w| is_decl_word(w)) {
+                if let Tok::Word(w) = self.peek()?.clone() {
+                    if let Some((_, None, _, value)) = assignment_split(&w) {
+                        if value.is_empty() {
+                            self.next()?;
+                            if self.peek_is_op("(")? {
+                                self.next()?;
+                                let mut items = Vec::new();
+                                loop {
+                                    match self.next()? {
+                                        Tok::Op(")") => break,
+                                        Tok::Newline => continue,
+                                        Tok::Word(x) => items.push(x),
+                                        Tok::Eof => return Err(self.eof_error("`)'")),
+                                        t => return Err(self.unexpected(&t)),
+                                    }
+                                }
+                                cmd.decl_arrays.push((cmd.words.len(), items));
+                            }
+                            cmd.words.push(w);
+                            continue;
+                        }
+                    }
+                }
+            }
             let word = match self.peek()? {
                 Tok::Word(w) => w.clone(),
                 _ => break,
@@ -578,6 +653,32 @@ impl Parser {
                 }
             }
             self.next()?;
+            // zsh: name1 name2 () body defines both.
+            if !cmd.words.is_empty()
+                && cmd.assigns.is_empty()
+                && cmd.redirs.is_empty()
+                && cmd.words.iter().all(|w| is_func_name(w))
+                && is_func_name(&word)
+                && self.peek_is_op("(")?
+            {
+                self.next()?;
+                self.expect_op(")")?;
+                self.skip_newlines()?;
+                let body = self.parse_command()?;
+                let mut names = std::mem::take(&mut cmd.words);
+                names.push(word);
+                let defs = names
+                    .into_iter()
+                    .map(|name| ListItem {
+                        node: Node::FuncDef {
+                            name,
+                            body: Box::new(body.clone()),
+                        },
+                        background: false,
+                    })
+                    .collect();
+                return Ok(Node::List(defs));
+            }
             // name ( ) compound-command
             if cmd.words.is_empty()
                 && cmd.assigns.is_empty()
@@ -651,32 +752,75 @@ impl Parser {
         Ok(Node::List(defs))
     }
 
+    // if list then list [elif list then list]... [else list] fi
+    // zsh also: if list { list } [elif list { list }]... [else { list }]
+    // and, with SHORT_LOOPS, if list sublist.
     fn parse_if(&mut self) -> PResult<Node> {
         self.next()?; // if
         let mut branches = Vec::new();
-        let cond = self.parse_list(false)?;
-        self.expect_word("then")?;
-        let body = self.parse_list(false)?;
-        branches.push((cond, body));
         let mut else_body = None;
         loop {
-            self.skip_newlines()?;
-            match self.next()? {
-                Tok::Word(w) if w == "elif" => {
-                    let cond = self.parse_list(false)?;
-                    self.expect_word("then")?;
-                    let body = self.parse_list(false)?;
-                    branches.push((cond, body));
-                }
-                Tok::Word(w) if w == "else" => {
-                    else_body = Some(Box::new(self.parse_list(false)?));
-                    self.expect_word("fi")?;
-                    break;
-                }
-                Tok::Word(w) if w == "fi" => break,
-                Tok::Eof => return Err(self.eof_error("`fi'")),
-                t => return Err(self.unexpected(&t)),
+            let cond = self.parse_list(false)?;
+            if matches!(cond, Node::Empty) {
+                let t = self.peek()?.clone();
+                return Err(if t == Tok::Eof {
+                    self.eof_error("`then'")
+                } else {
+                    self.unexpected(&t)
+                });
             }
+            if self.peek_is_word("then")? {
+                self.next()?;
+                let body = self.parse_list(false)?;
+                branches.push((cond, body));
+                loop {
+                    self.skip_newlines()?;
+                    match self.next()? {
+                        Tok::Word(w) if w == "elif" => {
+                            let cond = self.parse_list(false)?;
+                            self.expect_word("then")?;
+                            let body = self.parse_list(false)?;
+                            branches.push((cond, body));
+                        }
+                        Tok::Word(w) if w == "else" => {
+                            else_body = Some(Box::new(self.parse_list(false)?));
+                            self.expect_word("fi")?;
+                            break;
+                        }
+                        Tok::Word(w) if w == "fi" => break,
+                        Tok::Eof => return Err(self.eof_error("`fi'")),
+                        t => return Err(self.unexpected(&t)),
+                    }
+                }
+                break;
+            }
+            if self.peek_is_word("{")? {
+                let body = self.parse_command()?;
+                branches.push((cond, body));
+                self.skip_newlines_if_followed(&["elif", "else"])?;
+                if self.peek_is_word("elif")? {
+                    self.next()?;
+                    continue;
+                }
+                if self.peek_is_word("else")? {
+                    self.next()?;
+                    self.skip_newlines()?;
+                    else_body = Some(Box::new(self.parse_command()?));
+                }
+                break;
+            }
+            // Short form: the body is one sublist.
+            if self.at_command_end()? {
+                let t = self.peek()?.clone();
+                return Err(if t == Tok::Eof {
+                    self.eof_error("`then'")
+                } else {
+                    self.unexpected(&t)
+                });
+            }
+            let body = self.parse_and_or()?;
+            branches.push((cond, body));
+            break;
         }
         Ok(Node::If {
             branches,
@@ -684,12 +828,145 @@ impl Parser {
         })
     }
 
+    // Skips newlines only when one of `words` follows them, so a brace
+    // form `if c { } <newline> elif` continues while a following command
+    // is left alone.
+    fn skip_newlines_if_followed(&mut self, words: &[&str]) -> PResult<()> {
+        if !matches!(self.peek()?, Tok::Newline) {
+            return Ok(());
+        }
+        // Look past the newlines without consuming the next command.
+        let rest: String = self.lex.rest();
+        let trimmed = rest.trim_start_matches(['\n', ' ', '\t']);
+        if words.iter().any(|w| {
+            trimmed.starts_with(w)
+                && !trimmed[w.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+        }) {
+            self.skip_newlines()?;
+        }
+        Ok(())
+    }
+
+    // The body of a loop: `do list done`, `{ list }`, or a sublist (short
+    // form).
+    fn parse_loop_body(&mut self) -> PResult<Node> {
+        self.skip_newlines()?;
+        if self.peek_is_word("do")? {
+            self.next()?;
+            let body = self.parse_list(false)?;
+            self.expect_word("done")?;
+            return Ok(body);
+        }
+        if self.peek_is_word("{")? {
+            return self.parse_command();
+        }
+        if self.at_command_end()? {
+            let t = self.peek()?.clone();
+            return Err(if t == Tok::Eof {
+                self.eof_error("`do'")
+            } else {
+                self.unexpected(&t)
+            });
+        }
+        self.parse_and_or()
+    }
+
+    // repeat word body
+    fn parse_repeat(&mut self) -> PResult<Node> {
+        self.next()?;
+        let count = match self.next()? {
+            Tok::Word(w) => w,
+            Tok::Arith(e) => format!("(({}))", e),
+            Tok::Eof => return Err(self.eof_error("a count")),
+            t => return Err(self.unexpected(&t)),
+        };
+        if self.peek_is_op(";")? {
+            self.next()?;
+        }
+        let body = self.parse_loop_body()?;
+        Ok(Node::Repeat {
+            count,
+            body: Box::new(body),
+        })
+    }
+
+    // foreach name... ( words ) list end
+    fn parse_foreach(&mut self) -> PResult<Node> {
+        self.next()?;
+        let mut vars = Vec::new();
+        while let Tok::Word(w) = self.peek()?.clone() {
+            self.next()?;
+            vars.push(w);
+        }
+        self.expect_op("(")?;
+        let mut words = Vec::new();
+        loop {
+            match self.next()? {
+                Tok::Word(w) => words.push(w),
+                Tok::Newline => {}
+                Tok::Op(")") => break,
+                Tok::Eof => return Err(self.eof_error("`)'")),
+                t => return Err(self.unexpected(&t)),
+            }
+        }
+        let body = self.parse_list(false)?;
+        self.expect_word("end")?;
+        Ok(Node::For {
+            vars,
+            words: Some(words),
+            body: Box::new(body),
+        })
+    }
+
+    // select name [in words]; body
+    fn parse_select(&mut self) -> PResult<Node> {
+        self.next()?;
+        let var = match self.next()? {
+            Tok::Word(w) if is_valid_name(&w) => w,
+            Tok::Eof => return Err(self.eof_error("a variable name")),
+            t => return Err(self.unexpected(&t)),
+        };
+        self.skip_newlines()?;
+        let mut words = None;
+        if self.peek_is_word("in")? {
+            self.next()?;
+            let mut list = Vec::new();
+            loop {
+                match self.peek()?.clone() {
+                    Tok::Word(w) => {
+                        self.next()?;
+                        list.push(w);
+                    }
+                    Tok::Op(";") | Tok::Newline => {
+                        self.next()?;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            words = Some(list);
+        } else if self.peek_is_op(";")? {
+            self.next()?;
+        }
+        let body = self.parse_loop_body()?;
+        Ok(Node::Select {
+            var,
+            words,
+            body: Box::new(body),
+        })
+    }
+
     fn parse_loop(&mut self, until: bool) -> PResult<Node> {
         self.next()?;
         let cond = self.parse_list(false)?;
-        self.expect_word("do")?;
-        let body = self.parse_list(false)?;
-        self.expect_word("done")?;
+        let body = if self.peek_is_word("{")? {
+            self.parse_command()?
+        } else {
+            self.expect_word("do")?;
+            let body = self.parse_list(false)?;
+            self.expect_word("done")?;
+            body
+        };
         Ok(Node::Loop {
             cond: Box::new(cond),
             body: Box::new(body),
@@ -711,15 +988,7 @@ impl Parser {
             if self.peek_is_op(";")? {
                 self.next()?;
             }
-            self.skip_newlines()?;
-            let body = if self.peek_is_word("{")? {
-                self.parse_command()?
-            } else {
-                self.expect_word("do")?;
-                let body = self.parse_list(false)?;
-                self.expect_word("done")?;
-                body
-            };
+            let body = self.parse_loop_body()?;
             let mut it = parts.into_iter();
             return Ok(Node::ForArith {
                 init: it.next().unwrap(),
@@ -758,15 +1027,7 @@ impl Parser {
             if self.peek_is_op(";")? {
                 self.next()?;
             }
-            self.skip_newlines()?;
-            let body = if self.peek_is_word("do")? {
-                self.next()?;
-                let body = self.parse_list(false)?;
-                self.expect_word("done")?;
-                body
-            } else {
-                self.parse_command()?
-            };
+            let body = self.parse_loop_body()?;
             return Ok(Node::For {
                 vars,
                 words: Some(list),
@@ -790,9 +1051,7 @@ impl Parser {
         } else if self.peek_is_op(";")? {
             self.next()?;
         }
-        self.expect_word("do")?;
-        let body = self.parse_list(false)?;
-        self.expect_word("done")?;
+        let body = self.parse_loop_body()?;
         Ok(Node::For {
             vars,
             words,
@@ -807,11 +1066,19 @@ impl Parser {
             Tok::Eof => return Err(self.eof_error("a word")),
             t => return Err(self.unexpected(&t)),
         };
-        self.expect_word("in")?;
+        self.skip_newlines()?;
+        // zsh: `case word { ... }` as well as `case word in ... esac`.
+        let close = if self.peek_is_word("{")? {
+            self.next()?;
+            "}"
+        } else {
+            self.expect_word("in")?;
+            "esac"
+        };
         let mut items = Vec::new();
         loop {
             self.skip_newlines()?;
-            if self.peek_is_word("esac")? {
+            if self.peek_is_word(close)? {
                 self.next()?;
                 break;
             }
@@ -859,7 +1126,7 @@ impl Parser {
                 b => Some(b),
             };
             self.skip_newlines()?;
-            let mut fallthrough = false;
+            let (mut fallthrough, mut cont) = (false, false);
             match self.peek()?.clone() {
                 Tok::Op(";;") => {
                     self.next()?;
@@ -868,14 +1135,19 @@ impl Parser {
                     self.next()?;
                     fallthrough = true;
                 }
-                Tok::Word(w) if w == "esac" => {}
-                Tok::Eof => return Err(self.eof_error("`esac'")),
+                Tok::Op(";|") => {
+                    self.next()?;
+                    cont = true;
+                }
+                Tok::Word(w) if w == close => {}
+                Tok::Eof => return Err(self.eof_error(&format!("`{}'", close))),
                 t => return Err(self.unexpected(&t)),
             }
             items.push(CaseItem {
                 patterns,
                 body,
                 fallthrough,
+                cont,
             });
         }
         Ok(Node::Case { word, items })
@@ -937,10 +1209,35 @@ impl Parser {
     }
 }
 
+/// Commands whose arguments may be array assignments.
+pub fn is_decl_word(w: &str) -> bool {
+    matches!(
+        w,
+        "typeset" | "declare" | "local" | "export" | "readonly" | "integer" | "float" | "private"
+    )
+}
+
 fn is_func_name(s: &str) -> bool {
     !s.is_empty()
         && !s.contains(['\'', '"', '\\', '$', '`', '=', '/'])
         && !LIST_TERMINATORS.contains(&s)
+}
+
+fn with_redir(node: Node, r: Redir) -> Node {
+    match node {
+        Node::Simple(mut c) => {
+            c.redirs.push(r);
+            Node::Simple(c)
+        }
+        Node::Redirected { node, mut redirs } => {
+            redirs.push(r);
+            Node::Redirected { node, redirs }
+        }
+        n => Node::Redirected {
+            node: Box::new(n),
+            redirs: vec![r],
+        },
+    }
 }
 
 fn tok_text(t: &Tok) -> String {
@@ -999,7 +1296,11 @@ fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
             fill_heredocs(cond, bodies);
             fill_heredocs(body, bodies);
         }
-        Node::For { body, .. } | Node::ForArith { body, .. } => fill_heredocs(body, bodies),
+        Node::For { body, .. }
+        | Node::ForArith { body, .. }
+        | Node::Repeat { body, .. }
+        | Node::Select { body, .. }
+        | Node::Coproc(body) => fill_heredocs(body, bodies),
         Node::Case { items, .. } => {
             for item in items {
                 if let Some(b) = item.body.as_mut() {

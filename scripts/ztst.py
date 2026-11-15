@@ -195,11 +195,17 @@ def sq(s):
 
 def build_driver(work, testdir, prep, tests, clean):
     w = lambda name, data: open(os.path.join(work, name), "w", encoding="utf-8", errors="surrogateescape").write(data)
+    tmp = os.path.join(work, "tmp")
+    os.makedirs(tmp, exist_ok=True)
     lines = [
         "ZTST_testdir=" + sq(testdir),
         "ZTST_srcdir=" + sq(testdir),
+        "ZTST_exe=" + sq(os.path.join(os.path.dirname(testdir), "Src", "zsh")),
+        "ZTST_tmp=" + sq(tmp),
         "ZTST_fd=8",
         "exec 8>/dev/null",
+        # From Test/ztst.zsh: prints a UTF-8 locale, if there is one.
+        "ZTST_find_UTF8() { print -r -- " + sq(utf8_locale()) + "; }",
         "cd " + sq(testdir),
         "W=" + sq(work),
     ]
@@ -234,6 +240,17 @@ def build_driver(work, testdir, prep, tests, clean):
         w(f"clean.{k}", code)
         lines.append(f'() {{ eval "$(<$W/clean.{k})" }} >/dev/null 2>&1')
     w("driver.zsh", "\n".join(lines) + "\n")
+
+
+def utf8_locale():
+    try:
+        out = subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout.split()
+    except OSError:
+        return ""
+    for want in ("en_US.UTF-8", "en_US.utf8", "C.UTF-8", "C.utf8"):
+        if want in out:
+            return want
+    return next((l for l in out if l.lower().endswith(("utf-8", "utf8"))), "")
 
 
 def read(path):
@@ -341,6 +358,9 @@ def main():
         shutil.copytree(src_test, testdir, symlinks=True)
         os.makedirs(os.path.join(root, "Src"), exist_ok=True)
         os.symlink(meowsh, os.path.join(root, "Src", "zsh"))
+        # Build features some tests check before running.
+        with open(os.path.join(root, "config.h"), "w") as f:
+            f.write("#define PATH_DEV_FD 1\n#define HAVE_FIFOS 1\n#define MULTIBYTE_SUPPORT 1\n")
         total = {}
         print(f"{'file':24} {'pass':>5} {'out-ok':>6} {'fail':>5} {'abort':>5} {'skip':>5}")
         for name in names:

@@ -63,12 +63,9 @@ fn test_command_exists_path() {
     {
         let mut shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
         // Set PATH to include the temp dir
-        shell.vars.insert(
-            "PATH".to_string(),
-            meowsh::types::Var {
-                value: temp.path().to_str().unwrap().to_string(),
-                flags: meowsh::types::VAR_EXPORT,
-            },
+        shell.store(
+            "PATH",
+            meowsh::params::Value::Scalar(temp.path().to_str().unwrap().to_string()),
         );
     }
 
@@ -81,12 +78,9 @@ fn test_command_exists_path() {
     // Test empty PATH entry (should mean current directory)
     {
         let mut shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
-        shell.vars.insert(
-            "PATH".to_string(),
-            meowsh::types::Var {
-                value: format!(":{}", temp.path().to_str().unwrap()),
-                flags: meowsh::types::VAR_EXPORT,
-            },
+        shell.store(
+            "PATH",
+            meowsh::params::Value::Scalar(format!(":{}", temp.path().to_str().unwrap())),
         );
     }
 

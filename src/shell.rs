@@ -1,8 +1,9 @@
-use crate::types::{
-    Shell, Var, OPT_ALLEXPORT, OPT_ERREXIT, OPT_HASHALL, OPT_INTERACTIVE, OPT_MONITOR, OPT_NOEXEC,
-    OPT_NOGLOB, OPT_NOUNSET, OPT_VERBOSE, OPT_XTRACE, VAR_EXPORT,
+use crate::params::{
+    Param, Value, DEFAULT_TIES, EXPORT, FLOAT_E, FLOAT_F, INTEGER, LEFT, NAMEREF, READONLY,
+    RIGHT_B, RIGHT_Z, UNIQUE, UNSET,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::types::{Shell, OPT_ALLEXPORT};
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -49,93 +50,69 @@ pub fn shell_init() {
             continue;
         };
         if crate::lexer::is_valid_name(key) {
-            shell.vars.insert(
-                key.to_string(),
-                Var {
-                    value: value.to_string(),
-                    flags: VAR_EXPORT,
-                },
-            );
+            let mut p = Param::scalar(value);
+            p.attrs = EXPORT;
+            shell.params.insert(key.to_string(), p);
         }
     }
 
-    let set_default = |shell: &mut Shell, name: &str, value: String, flags: u32| {
-        shell
-            .vars
-            .entry(name.to_string())
-            .or_insert(Var { value, flags });
+    let set_default = |shell: &mut Shell, name: &str, value: String, attrs: u32| {
+        shell.params.entry(name.to_string()).or_insert_with(|| {
+            let mut p = Param::scalar(value);
+            p.attrs = attrs;
+            p
+        });
+    };
+    let set = |shell: &mut Shell, name: &str, value: String, attrs: u32| {
+        let mut p = Param::scalar(value);
+        p.attrs = attrs;
+        shell.params.insert(name.to_string(), p);
     };
     set_default(
         &mut shell,
         "PATH",
         "/usr/local/bin:/usr/bin:/bin".to_string(),
-        VAR_EXPORT,
+        EXPORT,
     );
     set_default(&mut shell, "PS2", "> ".to_string(), 0);
     set_default(&mut shell, "HISTSIZE", "1000".to_string(), 0);
     set_default(&mut shell, "SAVEHIST", "1000".to_string(), 0);
+    set_default(&mut shell, "PS4", "+ ".to_string(), 0);
     // zsh frameworks such as oh-my-zsh refuse to load without
     // ZSH_VERSION. The suffix keeps per-version files (for example
     // ~/.zcompdump-host-$ZSH_VERSION) apart from real zsh's.
-    for (name, value) in [
-        ("ZSH_VERSION", "5.9-meowsh".to_string()),
-        ("MEOWSH_VERSION", env!("CARGO_PKG_VERSION").to_string()),
-        ("HOST", hostname_full()),
-    ] {
-        shell.vars.insert(name.to_string(), Var { value, flags: 0 });
-    }
-    set_default(&mut shell, "PS4", "+ ".to_string(), 0);
+    set(&mut shell, "ZSH_VERSION", "5.9-meowsh".to_string(), 0);
+    set(
+        &mut shell,
+        "MEOWSH_VERSION",
+        env!("CARGO_PKG_VERSION").to_string(),
+        0,
+    );
+    set(&mut shell, "HOST", hostname_full(), 0);
     // POSIX: IFS is reset at startup rather than inherited.
-    shell.vars.insert(
-        "IFS".to_string(),
-        Var {
-            value: " \t\n".to_string(),
-            flags: 0,
-        },
-    );
+    set(&mut shell, "IFS", " \t\n".to_string(), 0);
     let ppid = unsafe { libc::getppid() };
-    shell.vars.insert(
-        "PPID".to_string(),
-        Var {
-            value: ppid.to_string(),
-            flags: 0,
-        },
-    );
+    set(&mut shell, "PPID", ppid.to_string(), 0);
     let shlvl = shell
-        .vars
-        .get("SHLVL")
-        .and_then(|v| v.value.trim().parse::<i64>().ok())
+        .scalar("SHLVL")
+        .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(0)
         .max(0)
         + 1;
-    shell.vars.insert(
-        "SHLVL".to_string(),
-        Var {
-            value: shlvl.to_string(),
-            flags: VAR_EXPORT,
-        },
-    );
-    let pwd = initial_pwd(shell.vars.get("PWD").map(|v| v.value.as_str()));
-    if let Some(pwd) = pwd {
-        shell.vars.insert(
-            "PWD".to_string(),
-            Var {
-                value: pwd,
-                flags: VAR_EXPORT,
-            },
-        );
+    set(&mut shell, "SHLVL", shlvl.to_string(), EXPORT);
+    if let Some(pwd) = initial_pwd(shell.scalar("PWD")) {
+        set(&mut shell, "PWD", pwd, EXPORT);
     }
 
-    if let Some(home) = shell.vars.get("HOME") {
-        if !home.value.is_empty() {
-            shell.history_file = PathBuf::from(&home.value)
-                .join(".meowsh_history")
-                .to_string_lossy()
-                .to_string();
-        }
+    if let Some(home) = shell.scalar("HOME").filter(|h| !h.is_empty()) {
+        shell.history_file = PathBuf::from(home)
+            .join(".meowsh_history")
+            .to_string_lossy()
+            .to_string();
     }
 
     START.get_or_init(std::time::Instant::now);
+    crate::options::init(&mut shell, crate::options::Emulation::Zsh);
     // zsh/langinfo: the character set of the locale.
     let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
@@ -148,12 +125,13 @@ pub fn shell_init() {
         "US-ASCII"
     };
     shell
-        .assoc_arrays
-        .entry("langinfo".to_string())
-        .or_default()
+        .assoc_entry("langinfo")
         .insert("CODESET".to_string(), codeset.to_string());
-    seed_tied_array(&mut shell, "path", "PATH");
-    seed_tied_array(&mut shell, "fpath", "FPATH");
+    for (scalar, array) in DEFAULT_TIES {
+        if shell.has_param(scalar) || matches!(*scalar, "PATH" | "FPATH") {
+            shell.tie(scalar, array, ":");
+        }
+    }
 }
 
 // Keeps an inherited $PWD only if it is absolute and names the current
@@ -197,10 +175,13 @@ pub fn var_get_opt(name: &str) -> Option<String> {
 /// Exported variables for a child process, with `overrides` applied.
 pub fn build_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
     let mut map: BTreeMap<String, String> = with_shell(|s| {
-        s.vars
+        s.params
             .iter()
-            .filter(|(_, v)| v.flags & VAR_EXPORT != 0)
-            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .filter(|(_, p)| p.attrs & EXPORT != 0)
+            .filter_map(|(k, p)| match &p.value {
+                Value::Scalar(v) => Some((k.clone(), v.clone())),
+                _ => None,
+            })
             .collect()
     });
     for (k, v) in overrides {
@@ -289,44 +270,12 @@ pub fn var_get(name: &str) -> String {
         "0" => return shell.argv0.clone(),
         "#" => return format!("{}", shell.pos_params.len()),
         "@" | "*" => return shell.pos_params.join(" "),
-        "-" => {
-            let mut flags = String::new();
-            if shell.opts & OPT_ALLEXPORT != 0 {
-                flags.push('a');
-            }
-            if shell.opts & OPT_ERREXIT != 0 {
-                flags.push('e');
-            }
-            if shell.opts & OPT_NOGLOB != 0 {
-                flags.push('f');
-            }
-            if shell.opts & OPT_HASHALL != 0 {
-                flags.push('h');
-            }
-            if shell.opts & OPT_INTERACTIVE != 0 {
-                flags.push('i');
-            }
-            if shell.opts & OPT_MONITOR != 0 {
-                flags.push('m');
-            }
-            if shell.opts & OPT_NOEXEC != 0 {
-                flags.push('n');
-            }
-            if shell.opts & OPT_NOUNSET != 0 {
-                flags.push('u');
-            }
-            if shell.opts & OPT_VERBOSE != 0 {
-                flags.push('v');
-            }
-            if shell.opts & OPT_XTRACE != 0 {
-                flags.push('x');
-            }
-            return flags;
-        }
+        "-" => return crate::options::flags_string(&shell),
         _ => {}
     }
 
     if name.len() > 1 && name.starts_with('-') {
+        drop(shell);
         return var_get(&name[1..]);
     }
 
@@ -342,17 +291,7 @@ pub fn var_get(name: &str) -> String {
             return String::new();
         }
     }
-
-    if let Some(arr) = shell.arrays.get(name) {
-        return arr.join(" ");
-    }
-    if let Some(assoc) = shell.assoc_arrays.get(name) {
-        return assoc.values().cloned().collect::<Vec<_>>().join(" ");
-    }
-    if let Some(v) = shell.vars.get(name) {
-        return v.value.clone();
-    }
-    String::new()
+    shell.param(name).map(|p| p.text()).unwrap_or_default()
 }
 
 pub fn var_exists(name: &str) -> bool {
@@ -372,71 +311,205 @@ pub fn var_exists(name: &str) -> bool {
             return idx == 0 || idx <= shell.pos_params.len();
         }
     }
-    shell.vars.contains_key(name)
-        || shell.arrays.contains_key(name)
-        || shell.assoc_arrays.contains_key(name)
+    shell.param(name).is_some_and(|p| p.is_set())
 }
 
 pub fn var_get_if_exists(name: &str) -> Option<i64> {
     let shell = SHELL.shell.lock().unwrap();
-    if let Some(v) = shell.vars.get(name) {
-        if let Ok(n) = v.value.parse::<i64>() {
-            return Some(n);
+    shell.scalar(name).and_then(|v| v.parse::<i64>().ok())
+}
+
+fn readonly_error(name: &str) {
+    eprintln!("meowsh: read-only variable: {}", name);
+}
+
+/// Converts a value for a numeric parameter at assignment: integers
+/// and floats evaluate it arithmetically and keep the number. Other
+/// attributes (case, justification, base) apply when the value is read.
+/// Done without the shell lock held, since arithmetic reads variables.
+fn convert_for(attrs: u32, value: &str) -> Result<String, String> {
+    if attrs & INTEGER != 0 {
+        return Ok(crate::arith::eval(value)?.to_string());
+    }
+    if attrs & (FLOAT_E | FLOAT_F) != 0 {
+        let f = crate::arith::eval_num(value)?.as_float_pub();
+        return Ok(format!("{:?}", f));
+    }
+    Ok(value.to_string())
+}
+
+pub fn format_int(n: i64, base: u32) -> String {
+    if base == 0 || base == 10 {
+        return n.to_string();
+    }
+    if crate::options::quick("cbases")
+        && (base == 16 || (base == 8 && crate::options::quick("octalzeroes")))
+    {
+        let digits = if base == 16 {
+            format!("0x{:X}", n.unsigned_abs())
+        } else {
+            format!("0{:o}", n.unsigned_abs())
+        };
+        return format!("{}{}", if n < 0 { "-" } else { "" }, digits);
+    }
+    let neg = n < 0;
+    let mut u = n.unsigned_abs();
+    let mut digits = Vec::new();
+    loop {
+        digits.push(
+            std::char::from_digit((u % base as u64) as u32, base)
+                .unwrap()
+                .to_ascii_uppercase(),
+        );
+        u /= base as u64;
+        if u == 0 {
+            break;
         }
     }
-    None
+    digits.reverse();
+    format!(
+        "{}{}#{}",
+        if neg { "-" } else { "" },
+        base,
+        digits.into_iter().collect::<String>()
+    )
+}
+
+pub fn format_float(f: f64, attrs: u32, digits: u32) -> String {
+    let d = if digits == 0 { 10 } else { digits as usize };
+    if attrs & FLOAT_F != 0 {
+        format!("{:.*}", d, f)
+    } else {
+        // C's %.*e: two-digit exponent with a sign.
+        let s = format!("{:.*e}", d.saturating_sub(1), f);
+        match s.split_once('e') {
+            Some((m, e)) => {
+                let (sign, digits) = match e.strip_prefix('-') {
+                    Some(d) => ('-', d),
+                    None => ('+', e),
+                };
+                format!("{}e{}{:0>2}", m, sign, digits)
+            }
+            None => s,
+        }
+    }
+}
+
+/// zsh's -L/-R/-Z display (getstrvalue in Src/params.c). `width` is the
+/// field width; numeric parameters keep a leading `-`, `0x` or `base#`
+/// before zero padding.
+pub fn justify(v: &str, attrs: u32, width: usize) -> String {
+    let chars: Vec<char> = v.chars().collect();
+    let fwidth = if width > 0 { width } else { chars.len() };
+    if attrs & LEFT != 0 {
+        let mut t = 0;
+        if attrs & RIGHT_Z != 0 {
+            while chars.get(t) == Some(&'0') {
+                t += 1;
+            }
+        } else {
+            while chars.get(t).is_some_and(|c| *c == ' ' || *c == '\t') {
+                t += 1;
+            }
+        }
+        let mut out: String = chars[t..].iter().take(fwidth).collect();
+        let n = out.chars().count();
+        out.extend(std::iter::repeat_n(' ', fwidth - n));
+        return out;
+    }
+    if chars.len() >= fwidth {
+        return chars[chars.len() - fwidth..].iter().collect();
+    }
+    let numeric = attrs & (INTEGER | FLOAT_E | FLOAT_F) != 0;
+    let mut zero = true;
+    let mut pref = 0;
+    if attrs & RIGHT_Z != 0 {
+        let mut t = chars
+            .iter()
+            .take_while(|c| **c == ' ' || **c == '\t')
+            .count();
+        if numeric && chars.get(t) == Some(&'-') {
+            t += 1;
+        }
+        if attrs & INTEGER != 0 {
+            if crate::options::quick("cbases")
+                && chars.get(t) == Some(&'0')
+                && chars.get(t + 1) == Some(&'x')
+            {
+                t += 2;
+            } else if let Some(k) = chars[t..].iter().position(|c| *c == '#') {
+                t += k + 1;
+            }
+        }
+        pref = t;
+        if t >= chars.len() || (!numeric && !chars[t].is_ascii_digit()) {
+            zero = false;
+        }
+    }
+    let fill = if attrs & RIGHT_B != 0 || !zero {
+        ' '
+    } else {
+        '0'
+    };
+    let mut out: String = chars[..pref].iter().collect();
+    out.extend(std::iter::repeat_n(fill, fwidth - chars.len()));
+    out.extend(&chars[pref..]);
+    out
 }
 
 pub fn var_set(name: &str, value: &str, export: bool) -> bool {
     if name == "RANDOM" {
         seed_random(value.trim().parse().unwrap_or(0));
     }
-    let mut shell = SHELL.shell.lock().unwrap();
-    if shell
-        .vars
-        .get(name)
-        .map(|v| v.flags & crate::types::VAR_READONLY != 0)
-        .unwrap_or(false)
-    {
-        eprintln!("meowsh: {}: readonly variable", name);
+    let attrs = with_shell(|s| s.param(name).map(|p| p.attrs).unwrap_or(0));
+    if attrs & READONLY != 0 {
+        readonly_error(name);
         return false;
     }
-    // Setting a scalar with the same name as an existing array clears the
-    // array — they share a namespace.
-    shell.arrays.remove(name);
-    shell.assoc_arrays.remove(name);
-    let mut flags = shell.vars.get(name).map(|v| v.flags).unwrap_or(0);
-    if export || shell.opts & OPT_ALLEXPORT != 0 {
-        flags |= VAR_EXPORT;
+    if attrs & NAMEREF != 0 {
+        let target = with_shell(|s| s.scalar(name).map(|t| t.to_string())).unwrap_or_default();
+        if !target.is_empty() && target != name {
+            return var_set(&target, value, export);
+        }
     }
-    shell.vars.insert(
-        name.to_string(),
-        Var {
-            value: value.to_string(),
-            flags,
-        },
-    );
-
-    if let Some(array_name) = scalar_to_tied_array(name) {
-        let items = split_colon_list(value);
-        shell.arrays.insert(array_name.to_string(), items);
+    let value = match convert_for(attrs, value) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("meowsh: {}: {}", name, e);
+            return false;
+        }
+    };
+    let mut shell = SHELL.shell.lock().unwrap();
+    let allexport = shell.opts & OPT_ALLEXPORT != 0;
+    let p = shell
+        .params
+        .entry(name.to_string())
+        .or_insert_with(|| Param::scalar(""));
+    if export || allexport {
+        p.attrs |= EXPORT;
     }
+    p.attrs &= !UNSET;
+    if p.width == 0 && p.attrs & (LEFT | RIGHT_B | RIGHT_Z) != 0 {
+        p.width = value.chars().count();
+    }
+    p.value = Value::Scalar(value);
+    shell.sync_tie(name);
     true
 }
 
+/// Stores items into array `name`, honoring -U and readonly.
 pub fn array_set(name: &str, items: Vec<String>) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
-    if shell.assoc_arrays.contains_key(name) {
+    if shell.assoc(name).is_some() {
         let assoc = assoc_from_items(items);
-        shell.assoc_arrays.insert(name.to_string(), assoc);
+        shell.store(name, Value::Assoc(assoc));
         return true;
     }
     let items = maybe_unique_items(&shell, name, items);
-    sync_tied_scalar(&mut shell, name, &items);
-    shell.arrays.insert(name.to_string(), items);
+    shell.store(name, Value::Array(items));
     true
 }
 
@@ -445,17 +518,20 @@ pub fn array_append(name: &str, items: Vec<String>) -> bool {
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
-    if let Some(existing) = shell.assoc_arrays.get(name).cloned() {
+    if let Some(existing) = shell.assoc(name).cloned() {
         let mut assoc = existing;
         assoc.extend(assoc_from_items(items));
-        shell.assoc_arrays.insert(name.to_string(), assoc);
+        shell.store(name, Value::Assoc(assoc));
         return true;
     }
-    let mut combined = shell.arrays.get(name).cloned().unwrap_or_default();
+    let mut combined = match shell.param(name).map(|p| &p.value) {
+        Some(Value::Array(a)) => a.clone(),
+        Some(Value::Scalar(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    };
     combined.extend(items);
     let combined = maybe_unique_items(&shell, name, combined);
-    sync_tied_scalar(&mut shell, name, &combined);
-    shell.arrays.insert(name.to_string(), combined);
+    shell.store(name, Value::Array(combined));
     true
 }
 
@@ -464,7 +540,7 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
-    if let Some(assoc) = shell.assoc_arrays.get_mut(name) {
+    if let Some(assoc) = shell.assoc_mut(name) {
         let new_value = if append {
             let mut current = assoc.get(subscript).cloned().unwrap_or_default();
             current.push_str(&value);
@@ -482,7 +558,7 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
     if index == 0 {
         return false;
     }
-    let mut items = shell.arrays.get(name).cloned().unwrap_or_default();
+    let mut items = shell.array(name).cloned().unwrap_or_default();
     let idx = if index > 0 {
         (index - 1) as usize
     } else {
@@ -502,8 +578,7 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
         items[idx] = value;
     }
     let items = maybe_unique_items(&shell, name, items);
-    sync_tied_scalar(&mut shell, name, &items);
-    shell.arrays.insert(name.to_string(), items);
+    shell.store(name, Value::Array(items));
     true
 }
 
@@ -512,11 +587,13 @@ pub fn array_make_unique(name: &str) -> bool {
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
-    shell.unique_arrays.insert(name.to_string());
-    if let Some(items) = shell.arrays.get(name).cloned() {
-        let items = unique_items(items);
-        sync_tied_scalar(&mut shell, name, &items);
-        shell.arrays.insert(name.to_string(), items);
+    let p = shell
+        .params
+        .entry(name.to_string())
+        .or_insert_with(|| Param::with(Value::Array(Vec::new())));
+    p.attrs |= UNIQUE;
+    if let Some(items) = shell.array(name).cloned() {
+        shell.store(name, Value::Array(unique_items(items)));
     }
     true
 }
@@ -526,10 +603,12 @@ pub fn array_declare(name: &str) -> bool {
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
-    shell.assoc_arrays.remove(name);
-    shell.arrays.entry(name.to_string()).or_default();
-    let items = shell.arrays.get(name).cloned().unwrap_or_default();
-    sync_tied_scalar(&mut shell, name, &items);
+    let items = match shell.param(name).map(|p| &p.value) {
+        Some(Value::Array(a)) => a.clone(),
+        Some(Value::Scalar(s)) if !s.is_empty() => vec![s.clone()],
+        _ => Vec::new(),
+    };
+    shell.store(name, Value::Array(items));
     true
 }
 
@@ -538,112 +617,44 @@ pub fn assoc_declare(name: &str) -> bool {
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
-    shell.arrays.remove(name);
-    shell.assoc_arrays.entry(name.to_string()).or_default();
+    if shell.assoc(name).is_none() {
+        shell.store(name, Value::Assoc(BTreeMap::new()));
+    }
     true
 }
 
 pub fn assoc_set(name: &str, key: &str, value: &str) {
     let mut shell = SHELL.shell.lock().unwrap();
     shell
-        .assoc_arrays
-        .entry(name.to_string())
-        .or_default()
+        .assoc_entry(name)
         .insert(key.to_string(), value.to_string());
 }
 
 pub fn assoc_get(name: &str, key: &str) -> Option<String> {
-    SHELL
-        .shell
-        .lock()
-        .unwrap()
-        .assoc_arrays
-        .get(name)
-        .and_then(|assoc| assoc.get(key).cloned())
+    let shell = SHELL.shell.lock().unwrap();
+    shell.assoc(name).and_then(|m| m.get(key).cloned())
 }
 
 pub fn assoc_values(name: &str) -> Option<Vec<String>> {
-    SHELL
-        .shell
-        .lock()
-        .unwrap()
-        .assoc_arrays
-        .get(name)
-        .map(|assoc| assoc.values().cloned().collect())
+    let shell = SHELL.shell.lock().unwrap();
+    shell.assoc(name).map(|m| m.values().cloned().collect())
 }
 
 pub fn assoc_keys(name: &str) -> Option<Vec<String>> {
-    SHELL
-        .shell
-        .lock()
-        .unwrap()
-        .assoc_arrays
-        .get(name)
-        .map(|assoc| assoc.keys().cloned().collect())
+    let shell = SHELL.shell.lock().unwrap();
+    shell.assoc(name).map(|m| m.keys().cloned().collect())
 }
 
 fn prepare_array_mutation(shell: &mut Shell, name: &str) -> bool {
-    if let Some(var) = shell.vars.get_mut(name) {
-        if var.flags & crate::types::VAR_READONLY != 0 {
-            eprintln!("meowsh: {}: readonly variable", name);
-            return false;
-        }
-        var.value.clear();
+    if shell.param(name).is_some_and(|p| p.attrs & READONLY != 0) {
+        readonly_error(name);
+        return false;
     }
     true
 }
 
-fn seed_tied_array(shell: &mut Shell, array_name: &str, scalar_name: &str) {
-    if shell.arrays.contains_key(array_name) {
-        return;
-    }
-    if let Some(var) = shell.vars.get(scalar_name) {
-        shell
-            .arrays
-            .insert(array_name.to_string(), split_colon_list(&var.value));
-    }
-}
-
-fn scalar_to_tied_array(name: &str) -> Option<&'static str> {
-    match name {
-        "PATH" => Some("path"),
-        "FPATH" => Some("fpath"),
-        _ => None,
-    }
-}
-
-fn tied_array_to_scalar(name: &str) -> Option<&'static str> {
-    match name {
-        "path" => Some("PATH"),
-        "fpath" => Some("FPATH"),
-        _ => None,
-    }
-}
-
-fn split_colon_list(value: &str) -> Vec<String> {
-    if value.is_empty() {
-        Vec::new()
-    } else {
-        value.split(':').map(|s| s.to_string()).collect()
-    }
-}
-
-fn sync_tied_scalar(shell: &mut Shell, name: &str, items: &[String]) {
-    if let Some(scalar_name) = tied_array_to_scalar(name) {
-        let value = items.join(":");
-        let flags = shell
-            .vars
-            .get(scalar_name)
-            .map(|v| v.flags)
-            .unwrap_or(VAR_EXPORT);
-        shell
-            .vars
-            .insert(scalar_name.to_string(), Var { value, flags });
-    }
-}
-
 fn maybe_unique_items(shell: &Shell, name: &str, items: Vec<String>) -> Vec<String> {
-    if shell.unique_arrays.contains(name) {
+    if shell.param(name).is_some_and(|p| p.attrs & UNIQUE != 0) {
         unique_items(items)
     } else {
         items
@@ -672,53 +683,33 @@ fn assoc_from_items(items: Vec<String>) -> BTreeMap<String, String> {
 }
 
 pub fn array_get(name: &str) -> Option<Vec<String>> {
-    SHELL.shell.lock().unwrap().arrays.get(name).cloned()
+    SHELL.shell.lock().unwrap().array(name).cloned()
 }
 
 pub fn is_array(name: &str) -> bool {
     let shell = SHELL.shell.lock().unwrap();
-    shell.arrays.contains_key(name) || shell.assoc_arrays.contains_key(name)
+    shell
+        .param(name)
+        .is_some_and(|p| p.is_array() || p.is_assoc())
 }
 
 pub fn push_scope() {
-    let mut shell = SHELL.shell.lock().unwrap();
-    shell.local_scopes.push(HashMap::new());
+    SHELL.shell.lock().unwrap().push_scope();
 }
 
 pub fn pop_scope() {
-    let mut shell = SHELL.shell.lock().unwrap();
-    if let Some(scope) = shell.local_scopes.pop() {
-        for (name, prev) in scope {
-            match prev {
-                Some(var) => {
-                    shell.vars.insert(name, var);
-                }
-                None => {
-                    shell.vars.remove(&name);
-                }
-            }
-        }
-    }
+    SHELL.shell.lock().unwrap().pop_scope();
 }
 
 pub fn in_function_scope() -> bool {
     !SHELL.shell.lock().unwrap().local_scopes.is_empty()
 }
 
-// Snapshot the current value of `name` into the innermost scope so it will
-// be restored on scope exit. Returns true if a scope existed (i.e. we are
-// inside a function), false otherwise. The first call for a given name
-// wins; subsequent calls in the same scope are no-ops to preserve the
-// original prior value.
+/// Saves `name` in the innermost scope so it is restored when the
+/// function returns. False outside a function. Only the first call per
+/// scope records the prior state.
 pub fn declare_local(name: &str) -> bool {
-    let mut shell = SHELL.shell.lock().unwrap();
-    let prev = shell.vars.get(name).cloned();
-    if let Some(scope) = shell.local_scopes.last_mut() {
-        scope.entry(name.to_string()).or_insert(prev);
-        true
-    } else {
-        false
-    }
+    SHELL.shell.lock().unwrap().make_local(name)
 }
 
 pub fn shorten_path(p: &str) -> String {

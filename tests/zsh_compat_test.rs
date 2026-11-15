@@ -328,3 +328,75 @@ fn eval_catches_expansion_errors_but_not_exit() {
     let (status, out, _) = sh("eval 'exit 4'; echo not-reached");
     assert_eq!((status, out.as_str()), (4, ""));
 }
+
+// ---- zsh defaults, options, typeset, grammar ------------------------------
+
+#[test]
+fn zsh_defaults_and_sh_emulation() {
+    let (_, out, _) = sh("x='a b'; for w in $x; do echo \"[$w]\"; done; for w in $(echo c d); do echo \"[$w]\"; done");
+    assert_eq!(out, "[a b]\n[c]\n[d]\n");
+    let (status, out, err) = sh("echo nomatch-xyz-*; echo after");
+    assert_eq!((status, out.as_str()), (1, ""));
+    assert!(err.contains("no matches found: nomatch-xyz-*"));
+    let (_, out, _) = sh("emulate sh; x='a b'; set -- $x; echo $#; echo nomatch-xyz-*");
+    assert_eq!(out, "2\nnomatch-xyz-*\n");
+    let (_, out, _) = sh("setopt shwordsplit; x='a b'; set -- $x; echo $#; unsetopt sh_word_split; set -- $x; echo $#");
+    assert_eq!(out, "2\n1\n");
+    let (_, out, _) =
+        sh("echo ${options[nomatch]} ${options[shwordsplit]}; [[ $- == *f* ]] || echo rcs");
+    assert_eq!(out, "on off\nrcs\n");
+}
+
+#[test]
+fn typeset_attributes_and_printing() {
+    let (_, out, err) = sh(
+        "f() { local s=x; local -a a=(1 2); typeset -p s a; typeset +m s a; \
+         integer i=3.7; integer -i2 i; echo $i; typeset -p i; \
+         float -F2 g=3.14159; echo $g; typeset -R5 -u v=foo; echo \"[$v]\"; typeset -p v; \
+         typeset -Z4 z=7; echo $z; export e=1; typeset -p e; }; f; \
+         typeset -T TIED tied=(a b); echo $TIED; tied+=(c); echo $TIED; typeset -p tied",
+    );
+    assert_eq!(
+        out,
+        "typeset s=x\ntypeset -a a=( 1 2 )\nlocal s\narray local a\n2#11\ntypeset -i2 i=3\n\
+         3.14\n[  FOO]\ntypeset -R5 -u v=foo\n0007\nexport e=1\na:b\na:b:c\n\
+         typeset -aT TIED tied=( a b c )\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
+fn functions_prints_definitions() {
+    let (_, out, _) =
+        sh("f() { if a; then b; fi; for x in 1 2; do echo $x; done; c && d | e; }; functions f");
+    assert_eq!(
+        out,
+        "f () {\n\tif a\n\tthen\n\t\tb\n\tfi\n\tfor x in 1 2\n\tdo\n\t\techo $x\n\tdone\n\tc && d | e\n}\n"
+    );
+}
+
+#[test]
+fn zsh_loop_forms_and_coprocess() {
+    let (_, out, err) = sh(
+        "repeat 2 echo r; for x in a b; print $x; if [[ 1 == 1 ]] print short; \
+         if (false) { print no } else { print yes }; while (( n++ < 2 )) { print w$n }; \
+         case b { (a) echo A;; (b) echo B;; }; \
+         case x in (x) echo 1 ;| (*) echo 2 ;; esac; \
+         foreach v (p q)\nprint $v\nend\n\
+         coproc { read l; print got $l; }; print -p hi; read -p r; echo $r",
+    );
+    assert_eq!(
+        out, "r\nr\na\nb\nshort\nyes\nw1\nw2\nB\n1\n2\np\nq\ngot hi\n",
+        "stderr: {}",
+        err
+    );
+}
+
+#[test]
+fn precommand_modifiers_and_exec_options() {
+    let (_, out, _) = sh(
+        "noglob echo *; command -v sh >/dev/null && echo quiet; exec -a renamed sh -c 'echo $0'",
+    );
+    assert_eq!(out, "*\nquiet\nrenamed\n");
+}

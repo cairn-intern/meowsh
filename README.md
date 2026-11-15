@@ -30,11 +30,18 @@ After building, you can start the shell with:
 ./meowsh -s a b < script.sh # read commands from stdin with parameters
 ```
 
-Options: `-i` (force interactive), `-l`/`--login`, `-s`, `-c`, any `set`
-option letter (`-a`, `-e`, `-f`, `-h`, `-m`, `-n`, `-u`, `-v`, `-x`, `-C`),
-and `-o name` (for example `-o pipefail`). Startup files are read in zsh
-order: `~/.zshenv`, `~/.zprofile` (login), `~/.zshrc` (interactive),
-`~/.zlogin` (interactive login).
+meowsh behaves like zsh: unquoted parameters are not word-split, a glob
+that matches nothing is an error, and so on. Started as `sh` (or `ksh`,
+`bash`), or with `--emulate sh` as the first argument, it uses sh
+behavior and option letters instead, as zsh does; `emulate sh` switches
+inside a script.
+
+Options: `-i` (force interactive), `-l`/`--login`, `-s`, `-c`, `-o name`,
+and zsh's option letters (`-e` errexit, `-x` xtrace, `-f` no startup
+files, ...); all of zsh's named options are recognized by `setopt`,
+`set -o` and `$options`. Startup files are read in zsh order:
+`~/.zshenv`, `~/.zprofile` (login), `~/.zshrc` (interactive), `~/.zlogin`
+(interactive login).
 
 ## zsh startup files
 
@@ -61,6 +68,13 @@ and builtins include:
 - `[[ x == (a|b)* ]]` and `[[ -v name[key] ]]`
 - hooks: `precmd`, `preexec`, `chpwd`, `zshexit`, their `*_functions`
   arrays, and `add-zsh-hook`
+- `typeset` and `declare`, `local`, `export`, `readonly`, `integer`,
+  `float` with zsh's attributes (`-i`, `-E`/`-F`, `-L`/`-R`/`-Z`, `-l`/`-u`,
+  `-r`, `-x`, `-U`, `-T` tied pairs, `-g`, `-m`, `-p`), array values
+  (`typeset a=(x y)`), and `functions` to print definitions
+- `repeat`, `select`, `coproc` (`print -p`, `read -p`, `>&p`), `foreach`,
+  short and brace forms (`if [[ x ]] cmd`, `for x in a b; cmd`,
+  `while c { }`, `case w { }`), `;|`, `|&`, `noglob`, `-`, `exec -a`/`-l`/`-c`
 - `autoload` from `$fpath`, `print`, `emulate`, `is-at-least`,
   `zparseopts`, `fc -l`, `colors`, `unfunction`, `builtin`, `read -k`/`-q`,
   global aliases (`alias -g`) and the `$aliases`/`$galiases` arrays

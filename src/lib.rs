@@ -1,11 +1,14 @@
 pub mod arith;
 pub mod builtins;
+pub mod deparse;
 pub mod exec;
 pub mod expand;
 pub mod globber;
 pub mod jobs;
 pub mod lexer;
 pub mod lineedit;
+pub mod options;
+pub mod params;
 pub mod parser;
 pub mod pattern;
 pub mod shell;
@@ -13,6 +16,7 @@ pub mod sys;
 pub mod testexpr;
 pub mod trap;
 pub mod types;
+pub mod typeset;
 
 pub use exec::*;
 pub use expand::*;

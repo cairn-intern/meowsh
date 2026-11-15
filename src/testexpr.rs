@@ -123,7 +123,7 @@ fn var_is_set(arg: &str) -> bool {
         return !v.is_empty()
             || crate::shell::assoc_keys(name).is_some_and(|k| k.iter().any(|k| k == sub));
     }
-    let Some(items) = crate::shell::with_shell(|s| s.arrays.get(name).cloned()) else {
+    let Some(items) = crate::shell::with_shell(|s| s.array(name).cloned()) else {
         return false;
     };
     match crate::arith::eval(sub) {

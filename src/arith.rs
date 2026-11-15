@@ -20,6 +20,10 @@ impl Num {
         }
     }
 
+    pub fn as_float_pub(self) -> f64 {
+        self.as_float()
+    }
+
     fn as_float(self) -> f64 {
         match self {
             Num::I(n) => n as f64,
@@ -519,7 +523,7 @@ fn set_var(name: &str, v: Num) -> Result<(), String> {
     if crate::shell::var_set(name, &v.to_string(), false) {
         Ok(())
     } else {
-        Err(format!("{}: readonly variable", name))
+        Err(format!("read-only variable: {}", name))
     }
 }
 

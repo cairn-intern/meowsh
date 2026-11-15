@@ -22,6 +22,9 @@ fn run(args: &[&str], stdin: &str, cwd: Option<&std::path::Path>) -> Out {
     // otherwise keep the output pipes open.
     cmd.process_group(0)
         .env("HOME", home.path())
+        // These are POSIX behaviors; zsh mode differs (no word splitting
+        // of parameters, no-match errors).
+        .args(["--emulate", "sh"])
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

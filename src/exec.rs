@@ -14,9 +14,10 @@ use crate::shell::{
 use crate::sys::{close, dup_high, err_line, pipe_cloexec, read_all, temp_file_with};
 use crate::types::{
     AndOrOp, Assign, AssignValue, CaseItem, Flow, FuncDef, JobState, ListItem, Node, Redir,
-    RedirOp, SimpleCmd, Var, OPT_ERREXIT, OPT_NOCLOBBER, OPT_NOEXEC, OPT_PIPEFAIL, OPT_VERBOSE,
+    RedirOp, SimpleCmd, OPT_ERREXIT, OPT_NOCLOBBER, OPT_NOEXEC, OPT_PIPEFAIL, OPT_VERBOSE,
     OPT_XTRACE, VAR_READONLY,
 };
+use crate::typeset::DeclArg;
 use std::ffi::CString;
 use std::io::Write;
 use std::sync::atomic::Ordering;
@@ -198,6 +199,12 @@ pub fn exit_shell(status: i32) -> ! {
 
 /// Replaces the process with an external command. Never returns.
 pub fn exec_external(words: &[String], env: &[(String, String)]) -> ! {
+    exec_external_as(words, None, env)
+}
+
+/// Like `exec_external`, with `argv0` (when given) as the new program's
+/// argument zero instead of the command name.
+pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, String)]) -> ! {
     let name = &words[0];
     let path = if name.contains('/') {
         Some(name.clone())
@@ -211,7 +218,11 @@ pub fn exec_external(words: &[String], env: &[(String, String)]) -> ! {
     let to_c = |s: &str| CString::new(s.as_bytes()).ok();
     let (Some(c_path), Some(argv)) = (
         to_c(&path),
-        words.iter().map(|w| to_c(w)).collect::<Option<Vec<_>>>(),
+        words
+            .iter()
+            .enumerate()
+            .map(|(k, w)| to_c(if k == 0 { argv0.unwrap_or(w) } else { w }))
+            .collect::<Option<Vec<_>>>(),
     ) else {
         err_line(&format!("meowsh: {}: invalid argument", name));
         unsafe { libc::_exit(126) }
@@ -286,6 +297,13 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
         RedirOp::DupIn | RedirOp::DupOut => {
             if target == "-" {
                 return Ok(Target::Close);
+            }
+            // `>&p` / `<&p`: the coprocess.
+            if target == "p" {
+                return match with_shell(|s| s.coproc) {
+                    Some((w, rd)) => Ok(Target::Dup(if r.op == RedirOp::DupIn { rd } else { w })),
+                    None => Err(Some("no coprocess".to_string())),
+                };
             }
             match target.parse::<i32>() {
                 Ok(n) if n >= 0 => {
@@ -410,22 +428,17 @@ fn expand_assigns(assigns: &[Assign]) -> ExpResult<Vec<Expanded>> {
 }
 
 fn is_readonly(name: &str) -> bool {
-    with_shell(|s| {
-        s.vars
-            .get(name)
-            .map(|v| v.flags & VAR_READONLY != 0)
-            .unwrap_or(false)
-    })
+    with_shell(|s| s.param(name).is_some_and(|p| p.attrs & VAR_READONLY != 0))
 }
 
 fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
     if is_readonly(&a.name) {
-        err_line(&format!("meowsh: {}: readonly variable", a.name));
+        err_line(&format!("meowsh: read-only variable: {}", a.name));
         return Err(1);
     }
     let ok = match (&a.subscript, &a.value) {
         (Some(sub), Value::Scalar(v)) => {
-            let is_assoc = with_shell(|s| s.assoc_arrays.contains_key(&a.name));
+            let is_assoc = with_shell(|s| s.assoc(&a.name).is_some());
             let key = if is_assoc {
                 expand_string(sub).map_err(|e| e.status)?
             } else {
@@ -486,7 +499,7 @@ fn assign_text(a: &Expanded) -> String {
 }
 
 // Variables assigned for the duration of one builtin or function call.
-struct TempVars(Vec<(String, Option<Var>)>);
+struct TempVars(Vec<(String, Option<crate::params::Param>)>);
 
 impl TempVars {
     fn set(assigns: &[Expanded]) -> Result<TempVars, i32> {
@@ -497,11 +510,11 @@ impl TempVars {
                 continue;
             }
             if is_readonly(&a.name) {
-                err_line(&format!("meowsh: {}: readonly variable", a.name));
+                err_line(&format!("meowsh: read-only variable: {}", a.name));
                 saved.restore();
                 return Err(1);
             }
-            let prev = with_shell(|s| s.vars.get(&a.name).cloned());
+            let prev = with_shell(|s| s.param(&a.name).cloned());
             saved.0.push((a.name.clone(), prev));
             var_set(&a.name, v, true);
         }
@@ -511,12 +524,14 @@ impl TempVars {
     fn restore(self) {
         for (name, prev) in self.0.into_iter().rev() {
             match prev {
-                Some(var) => {
-                    var_set(&name, &var.value, false);
-                    with_shell(|s| s.vars.insert(name, var));
+                Some(p) => {
+                    with_shell(|s| {
+                        s.params.insert(name.clone(), p);
+                        s.sync_tie(&name);
+                    });
                 }
                 None => {
-                    with_shell(|s| s.vars.remove(&name));
+                    with_shell(|s| s.remove_param(&name));
                 }
             }
         }
@@ -534,34 +549,58 @@ fn xtrace(parts: &[String]) {
 
 // Declaration utilities take assignment arguments, which expand like
 // assignments (no field splitting or globbing).
-fn expand_command_words(raw: &[String]) -> ExpResult<Vec<String>> {
+// Expands a command's words. For declaration commands (`typeset`,
+// `local`, `export`, ...) arguments that are assignments expand like
+// assignment values, without splitting or globbing, and the command
+// also gets them as typed arguments, including array values.
+fn expand_command_words(
+    raw: &[String],
+    arrays: &[(usize, Vec<String>)],
+) -> ExpResult<(Vec<String>, Option<Vec<DeclArg>>)> {
     let Some(first) = raw.first() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
-    if !matches!(
-        first.as_str(),
-        "export" | "readonly" | "local" | "typeset" | "declare"
-    ) {
-        return expand_words(raw);
+    if !crate::parser::is_decl_word(first) {
+        return Ok((expand_words(raw)?, None));
     }
     let mut out = expand_words(&raw[..1])?;
-    for w in &raw[1..] {
+    let mut decl: Vec<DeclArg> = out.iter().cloned().map(DeclArg::Word).collect();
+    for (k, w) in raw.iter().enumerate().skip(1) {
+        if let Some((_, items)) = arrays.iter().find(|(i, _)| *i == k) {
+            let (name, _, append, _) = assignment_split(w).unwrap_or_default();
+            let items = expand_words(items)?;
+            out.push(format!("{}=({})", name, items.join(" ")));
+            decl.push(DeclArg::Array {
+                name,
+                append,
+                items,
+            });
+            continue;
+        }
         match assignment_split(w) {
             Some((name, sub, append, value)) => {
-                let sub = sub.map(|s| format!("[{}]", s)).unwrap_or_default();
+                let name = match sub {
+                    Some(s) => format!("{}[{}]", name, expand_string(&s)?),
+                    None => name,
+                };
+                let value = expand_assign_value(&value)?;
                 let op = if append { "+=" } else { "=" };
-                out.push(format!(
-                    "{}{}{}{}",
+                out.push(format!("{}{}{}", name, op, value));
+                decl.push(DeclArg::Assign {
                     name,
-                    sub,
-                    op,
-                    expand_assign_value(&value)?
-                ));
+                    append,
+                    value: Some(value),
+                });
             }
-            None => out.extend(expand_words(std::slice::from_ref(w))?),
+            None => {
+                for x in expand_words(std::slice::from_ref(w))? {
+                    out.push(x.clone());
+                    decl.push(DeclArg::Word(x));
+                }
+            }
         }
     }
-    Ok(out)
+    Ok((out, Some(decl)))
 }
 
 // ---- node execution -------------------------------------------------------
@@ -627,6 +666,9 @@ fn exec_node_inner(node: &Node) -> i32 {
             check_errexit(st);
             st
         }
+        Node::Repeat { count, body } => exec_repeat(count, body),
+        Node::Select { var, words, body } => exec_select(var, words.as_deref(), body),
+        Node::Coproc(body) => exec_coproc(body),
         Node::ForArith {
             init,
             cond,
@@ -679,7 +721,36 @@ fn exec_in_child(node: &Node) -> ! {
 
 fn exec_simple(cmd: &SimpleCmd, in_child: bool) -> i32 {
     with_shell(|s| s.last_cmdsub_status = None);
-    let words = match expand_command_words(&cmd.words) {
+    // zsh precommand modifiers that act before expansion: `noglob`
+    // (no filename generation), `nocorrect`, and `-` (dashed argv[0]).
+    let (mut noglob, mut dash) = (false, false);
+    let mut skip = 0;
+    while let Some(w) = cmd.words.get(skip) {
+        match w.as_str() {
+            "noglob" => noglob = true,
+            "nocorrect" => {}
+            "-" => dash = true,
+            _ => break,
+        }
+        skip += 1;
+    }
+    let raw = &cmd.words[skip..];
+    let arrays: Vec<(usize, Vec<String>)> = cmd
+        .decl_arrays
+        .iter()
+        .filter(|(i, _)| *i >= skip)
+        .map(|(i, a)| (i - skip, a.clone()))
+        .collect();
+    let saved_glob = noglob.then(|| {
+        let on = crate::options::is_set("glob");
+        crate::options::set("glob", false);
+        on
+    });
+    let expanded = expand_command_words(raw, &arrays);
+    if let Some(on) = saved_glob {
+        crate::options::set("glob", on);
+    }
+    let (words, decl) = match expanded {
         Ok(w) => w,
         Err(e) => return expansion_failed(e),
     };
@@ -711,41 +782,71 @@ fn exec_simple(cmd: &SimpleCmd, in_child: bool) -> i32 {
     let mut trace: Vec<String> = assigns.iter().map(assign_text).collect();
     trace.extend(words.iter().cloned());
     xtrace(&trace);
-    run_command(words, &assigns, &cmd.redirs, in_child)
+    run_command(words, decl, &assigns, &cmd.redirs, in_child, dash)
 }
 
+// Runs builtin `name`, giving declaration commands their typed arguments.
+fn run_builtin(name: &str, words: &[String], decl: &Option<Vec<DeclArg>>) -> i32 {
+    match decl {
+        Some(args) if crate::parser::is_decl_word(name) => crate::typeset::typeset(name, args),
+        _ => crate::builtins::run(name, words),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_command(
     mut words: Vec<String>,
+    mut decl: Option<Vec<DeclArg>>,
     assigns: &[Expanded],
     redirs: &[Redir],
     in_child: bool,
+    dash: bool,
 ) -> i32 {
-    // `command [-p] name ...` skips function lookup.
+    // `command [-pvV] name ...` skips function lookup; -v/-V describe
+    // the command instead; -p searches the default PATH.
     let mut skip_functions = false;
+    let mut default_path = false;
     if words[0] == "command" {
         let mut i = 1;
+        let mut describe = None;
         while i < words.len() && words[i].starts_with('-') && words[i] != "-" {
-            match words[i].as_str() {
-                "-p" => i += 1,
-                "--" => {
-                    i += 1;
-                    break;
-                }
-                _ => break,
+            if words[i] == "--" {
+                i += 1;
+                break;
             }
+            let flags = words[i][1..].to_string();
+            if !flags.chars().all(|c| matches!(c, 'p' | 'v' | 'V')) {
+                break;
+            }
+            for c in flags.chars() {
+                match c {
+                    'p' => default_path = true,
+                    'v' => describe = Some("-v"),
+                    _ => describe = Some("-V"),
+                }
+            }
+            i += 1;
         }
-        if i < words.len() && !matches!(words[i].as_str(), "-v" | "-V") {
-            words.drain(..i);
-            skip_functions = true;
-        } else if i >= words.len() {
+        if i >= words.len() && describe.is_none() {
             return 0;
         }
+        if let Some(flag) = describe {
+            // Describe through the builtin, so redirections apply.
+            let mut args = vec!["command".to_string(), flag.to_string()];
+            args.extend(words[i..].iter().cloned());
+            words = args;
+        } else {
+            words.drain(..i);
+            skip_functions = true;
+        }
+        decl = None;
     }
     // zsh/bash `builtin name ...` runs the builtin even if a function or
     // alias shadows it.
     let mut builtin_only = false;
     if words[0] == "builtin" {
         words.remove(0);
+        decl = None;
         if words.is_empty() {
             return 0;
         }
@@ -778,7 +879,7 @@ fn run_command(
             Ok(s) => s,
             Err(RedirError) => return 1,
         };
-        let st = crate::builtins::run(&name, &words);
+        let st = run_builtin(&name, &words, &decl);
         restore_redirs(saved);
         return st;
     }
@@ -812,7 +913,7 @@ fn run_command(
         };
         let st = match apply_redirs(redirs, true) {
             Ok(saved) => {
-                let st = crate::builtins::run(&name, &words);
+                let st = run_builtin(&name, &words, &decl);
                 restore_redirs(saved);
                 st
             }
@@ -841,19 +942,43 @@ fn run_command(
         })
         .collect();
     let env = build_env(&overrides);
+    // `-cmd` (the `-` precommand) gives the program a dashed argument zero;
+    // `command -p` looks only in the default PATH.
+    let argv0 = dash.then(|| format!("-{}", words[0]));
+    if default_path && !words[0].contains('/') {
+        if let Some(p) = ["/bin", "/usr/bin", "/sbin", "/usr/sbin"]
+            .iter()
+            .map(|d| format!("{}/{}", d, words[0]))
+            .find(|p| std::path::Path::new(p).is_file())
+        {
+            let name = words[0].clone();
+            words[0] = p;
+            let argv0 = argv0.unwrap_or(name);
+            return run_external(&words, Some(&argv0), &env, redirs, in_child);
+        }
+    }
+    run_external(&words, argv0.as_deref(), &env, redirs, in_child)
+}
 
+fn run_external(
+    words: &[String],
+    argv0: Option<&str>,
+    env: &[(String, String)],
+    redirs: &[Redir],
+    in_child: bool,
+) -> i32 {
     if in_child {
         if apply_redirs(redirs, false).is_err() {
             exit_child(1);
         }
-        exec_external(&words, &env);
+        exec_external_as(words, argv0, env);
     }
     let pid = fork_process(ForkKind::Foreground(0));
     if pid == 0 {
         if apply_redirs(redirs, false).is_err() {
             exit_child(1);
         }
-        exec_external(&words, &env);
+        exec_external_as(words, argv0, env);
     }
     if pid < 0 {
         return 1;
@@ -861,7 +986,49 @@ fn run_command(
     wait_foreground(&[pid], pid, &words.join(" "))[0]
 }
 
+// exec [-cl] [-a name] [cmd args]: replaces the shell. -a sets the
+// command's argument zero, -l prefixes it with `-` (a login shell), -c
+// clears the environment.
 fn exec_builtin(args: &[String], assigns: &[Expanded], redirs: &[Redir]) -> i32 {
+    let (mut argv0, mut login, mut clear) = (None::<String>, false, false);
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            break;
+        };
+        let mut chars = flags.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                'c' => clear = true,
+                'l' => login = true,
+                'a' => {
+                    let rest: String = chars.by_ref().collect();
+                    argv0 = Some(if rest.is_empty() {
+                        i += 1;
+                        match args.get(i) {
+                            Some(n) => n.clone(),
+                            None => {
+                                err_line("meowsh: exec: argument expected: -a");
+                                return 1;
+                            }
+                        }
+                    } else {
+                        rest
+                    });
+                }
+                _ => {
+                    err_line(&format!("meowsh: exec: bad option: -{}", c));
+                    return 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    let args = &args[i.min(args.len())..];
     if args.is_empty() {
         for a in assigns {
             if let Err(st) = apply_assign(a, false) {
@@ -888,8 +1055,16 @@ fn exec_builtin(args: &[String], assigns: &[Expanded], redirs: &[Redir]) -> i32 
             _ => None,
         })
         .collect();
-    let env = build_env(&overrides);
-    exec_external(args, &env)
+    let env = if clear {
+        overrides
+    } else {
+        build_env(&overrides)
+    };
+    let mut name = argv0.unwrap_or_else(|| args[0].clone());
+    if login {
+        name = format!("-{}", name);
+    }
+    exec_external_as(args, Some(&name), &env)
 }
 
 type Frame = (
@@ -1017,10 +1192,10 @@ fn exec_pipeline(cmds: &[Node], bang: bool) -> i32 {
     if bang {
         suppress_errexit(1);
     }
-    let status = if cmds.len() == 1 {
-        exec_node(&cmds[0])
-    } else {
-        run_pipeline(cmds)
+    let status = match cmds.len() {
+        0 => 0,
+        1 => exec_node(&cmds[0]),
+        _ => run_pipeline(cmds),
     };
     if bang {
         suppress_errexit(-1);
@@ -1034,7 +1209,7 @@ fn exec_pipeline(cmds: &[Node], bang: bool) -> i32 {
 /// pipeline.
 fn set_pipestatus(codes: &[i32]) {
     let items = codes.iter().map(|c| c.to_string()).collect();
-    with_shell(|s| s.arrays.insert("pipestatus".to_string(), items));
+    with_shell(|s| s.store("pipestatus", crate::params::Value::Array(items)));
 }
 
 fn run_pipeline(cmds: &[Node]) -> i32 {
@@ -1203,6 +1378,157 @@ fn exec_if(branches: &[(Node, Node)], else_body: Option<&Node>) -> i32 {
 
 // After a loop body: Some(true) leaves the loop, Some(false) starts the
 // next iteration, None continues normally.
+fn exec_repeat(count: &str, body: &Node) -> i32 {
+    let n = match expand_string(count).map(|c| crate::arith::eval(&c)) {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            err_line(&format!("meowsh: {}", e));
+            return 1;
+        }
+        Err(e) => return expansion_failed(e),
+    };
+    let mut status = 0;
+    with_shell(|s| s.loop_depth += 1);
+    for _ in 0..n.max(0) {
+        status = exec_node(body);
+        if loop_control() == Some(true) {
+            break;
+        }
+        crate::trap::run_pending();
+    }
+    with_shell(|s| s.loop_depth -= 1);
+    status
+}
+
+// zsh's select menu (selectlist in Src/loop.c): items in columns down
+// the screen, on standard error.
+fn select_menu(items: &[String]) {
+    let cols: usize = var_get("COLUMNS").parse().unwrap_or(80);
+    let lines: usize = var_get("LINES").parse().unwrap_or(24);
+    let mut longest = items
+        .iter()
+        .map(|i| i.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(1)
+        + 1;
+    let mut t0 = items.len();
+    while t0 > 0 {
+        t0 /= 10;
+        longest += 1;
+    }
+    let (fct, fw) = match (cols.saturating_sub(1)) / (longest + 3) {
+        0 => (1, 0),
+        n => (n, (cols - 1) / n),
+    };
+    let colsz = items.len().div_ceil(fct);
+    let mut text = String::new();
+    for row in 0..colsz.min(lines.saturating_sub(2).max(1)) {
+        let mut k = row;
+        while k < items.len() {
+            let entry = format!("{}) {}", k + 1, items[k]);
+            let w = entry.chars().count();
+            text.push_str(&entry);
+            if w < fw {
+                text.push_str(&" ".repeat(fw - w));
+            }
+            k += colsz;
+        }
+        text.push('\n');
+    }
+    err_line_raw(&text);
+}
+
+fn err_line_raw(s: &str) {
+    let _ = crate::sys::write_fd(2, s.as_bytes());
+}
+
+fn exec_select(var: &str, words: Option<&[String]>, body: &Node) -> i32 {
+    let items = match words {
+        Some(ws) => match expand_words(ws) {
+            Ok(v) => v,
+            Err(e) => return expansion_failed(e),
+        },
+        None => with_shell(|s| s.pos_params.clone()),
+    };
+    if items.is_empty() {
+        return 0;
+    }
+    let mut status = 0;
+    with_shell(|s| s.loop_depth += 1);
+    select_menu(&items);
+    let mut reader = crate::sys::LineReader::new(0);
+    loop {
+        let ps3 = var_get_opt("PS3").unwrap_or_else(|| "?# ".to_string());
+        err_line_raw(&crate::shell::expand_prompt(&ps3));
+        let Some(line) = reader.read_line() else {
+            var_set("REPLY", "", false);
+            err_line_raw("\n");
+            break;
+        };
+        let line = line.trim_end_matches('\n').to_string();
+        if line.is_empty() {
+            select_menu(&items);
+            continue;
+        }
+        var_set("REPLY", &line, false);
+        let choice = line
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|k| items.get(k).cloned())
+            .unwrap_or_default();
+        var_set(var, &choice, false);
+        status = exec_node(body);
+        if loop_control() == Some(true) {
+            break;
+        }
+    }
+    with_shell(|s| s.loop_depth -= 1);
+    status
+}
+
+// coproc cmd: runs cmd in the background connected to two pipes, which
+// `print -p`, `read -p` and the `>&p`/`<&p` redirections use.
+fn exec_coproc(body: &Node) -> i32 {
+    let (Ok((in_r, in_w)), Ok((out_r, out_w))) = (pipe_cloexec(), pipe_cloexec()) else {
+        err_line("meowsh: coproc: cannot create pipes");
+        return 1;
+    };
+    if let Some((a, b)) = with_shell(|s| s.coproc.take()) {
+        close(a);
+        close(b);
+    }
+    let pid = fork_process(ForkKind::Background);
+    if pid == 0 {
+        unsafe {
+            libc::dup2(in_r, 0);
+            libc::dup2(out_w, 1);
+        }
+        for fd in [in_r, in_w, out_r, out_w] {
+            close(fd);
+        }
+        exec_in_child(body);
+    }
+    close(in_r);
+    close(out_w);
+    if pid < 0 {
+        close(in_w);
+        close(out_r);
+        return 1;
+    }
+    let (w, r) = (dup_high(in_w), dup_high(out_r));
+    close(in_w);
+    close(out_r);
+    with_shell(|s| {
+        s.coproc = Some((w, r));
+        s.last_bg_pid = pid;
+    });
+    add_job(pid, &[pid], JobState::Running, &describe(body));
+    0
+}
+
 fn loop_control() -> Option<bool> {
     with_shell(|s| match s.flow {
         Flow::None => None,
@@ -1349,7 +1675,14 @@ fn exec_case(word: &str, items: &[CaseItem]) -> i32 {
             Some(b) => exec_node(b),
             None => 0,
         };
-        if !item.fallthrough || flow_pending() {
+        if flow_pending() {
+            break;
+        }
+        if item.cont {
+            falling = false;
+            continue;
+        }
+        if !item.fallthrough {
             break;
         }
         falling = true;
@@ -1665,10 +1998,7 @@ mod tests {
 
     fn reset_shell() {
         let mut shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
-        shell.vars.clear();
-        shell.arrays.clear();
-        shell.assoc_arrays.clear();
-        shell.unique_arrays.clear();
+        shell.params.clear();
         shell.zstyles.clear();
         shell.functions.clear();
         shell.local_scopes.clear();
@@ -1684,7 +2014,7 @@ mod tests {
 
     fn var(name: &str) -> Option<String> {
         let shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
-        shell.vars.get(name).map(|v| v.value.clone())
+        shell.scalar(name).map(|v| v.to_string())
     }
 
     #[test]
