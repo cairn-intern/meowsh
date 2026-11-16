@@ -149,10 +149,23 @@ fn special_typeset(
     if autoload && !global && !SRANDOM_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
+    // SECONDS may be made a float (fractional seconds) or an integer again.
+    if name == "SECONDS" {
+        use std::sync::atomic::Ordering;
+        if on & (FLOAT_E | FLOAT_F) != 0 {
+            crate::shell::SECONDS_FLOAT.store(true, Ordering::Relaxed);
+        } else if on & INTEGER != 0 {
+            crate::shell::SECONDS_FLOAT.store(false, Ordering::Relaxed);
+        }
+    }
     if ops.isset('p') {
         let v = crate::shell::var_get(name);
         let g = if level > 0 { "-g " } else { "" };
-        out(&if numeric {
+        let float = name == "SECONDS"
+            && crate::shell::SECONDS_FLOAT.load(std::sync::atomic::Ordering::Relaxed);
+        out(&if float {
+            format!("typeset {}-F {}={}\n", g, name, v)
+        } else if numeric {
             format!("typeset {}-i10 {}={}\n", g, name, v)
         } else {
             format!(
@@ -338,6 +351,7 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
         } else if posix && cmd == "readonly" {
             pf.posix_readonly = true;
         }
+        pf.posix_arrays = ops.isset('a');
         if let Some(a) = ops.arg('p') {
             match a {
                 "1" => pf.line = true,
@@ -458,9 +472,12 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
                     && crate::shell::var_exists(&name) =>
                 {
                     let g = if locallevel() > 0 { "-g " } else { "" };
+                    let float = name == "SECONDS"
+                        && crate::shell::SECONDS_FLOAT.load(std::sync::atomic::Ordering::Relaxed);
                     out(&format!(
-                        "typeset {}-i10 {}={}\n",
+                        "typeset {}{} {}={}\n",
                         g,
+                        if float { "-F" } else { "-i10" },
                         name,
                         crate::shell::var_get(&name)
                     ));
@@ -734,6 +751,14 @@ fn typeset_single(
             warn(cmd, &format!("{}: read-only reference", pname));
             return false;
         }
+        // POSIX_BUILTINS: read-only can't be turned off.
+        if pm.attrs & READONLY != 0
+            && off & READONLY != 0
+            && crate::options::is_set("posixbuiltins")
+        {
+            crate::shell::shell_err(&format!("read-only variable: {}", pname));
+            return false;
+        }
         if pm.attrs & READONLY != 0 && off & READONLY == 0 && has_value(asg) {
             // zsh reports this as a shell error, without the command name.
             crate::shell::shell_err(&format!("read-only variable: {}", pname));
@@ -848,6 +873,15 @@ fn typeset_single(
         let mut p = Param::with(value);
         p.attrs = on & !(READONLY | K_ARRAY | K_ASSOC | TIED | LOCAL);
         if crate::options::is_set_in(s, "typesettounset") && !has_value(asg) && carried.is_none() {
+            p.attrs |= UNSET | DECLARED;
+        }
+        // POSIX_BUILTINS: `readonly name` / `export name` leave a new
+        // parameter unset.
+        if crate::options::is_set_in(s, "posixbuiltins")
+            && on & (READONLY | EXPORT) != 0
+            && !has_value(asg)
+            && carried.is_none()
+        {
             p.attrs |= UNSET | DECLARED;
         }
         p.level = match keep_level {
@@ -1145,6 +1179,8 @@ pub struct PrintFlags {
     pub line: bool,
     pub posix_export: bool,
     pub posix_readonly: bool,
+    // POSIX `export -ap` / `readonly -ap`: arrays are listed too.
+    pub posix_arrays: bool,
 }
 
 const PMTYPES: &[(u32, &str, char, u8)] = &[
@@ -1209,14 +1245,14 @@ pub fn display_value(_s: &Shell, p: &Param) -> String {
 fn value_text(p: &Param, pf: &PrintFlags) -> String {
     match &p.value {
         Value::Scalar(v) => {
+            // A numeric parameter with no value yet is zero.
+            let num = if v.trim().is_empty() { "0" } else { v.trim() };
             if p.attrs & INTEGER != 0 {
-                v.trim()
-                    .parse::<i64>()
+                num.parse::<i64>()
                     .map(|n| n.to_string())
                     .unwrap_or_else(|_| v.clone())
             } else if p.attrs & (FLOAT_E | FLOAT_F) != 0 {
-                v.trim()
-                    .parse::<f64>()
+                num.parse::<f64>()
                     .map(|f| crate::shell::format_float(f, p.attrs, p.base))
                     .unwrap_or_else(|_| v.clone())
             } else {
@@ -1237,9 +1273,13 @@ fn value_text(p: &Param, pf: &PrintFlags) -> String {
                     s
                 }
             } else {
+                // zsh prints `( a b )`, and `(  )` when empty.
                 let mut s = String::from("( ");
                 for x in a {
                     s.push_str(&quote_value(x));
+                    s.push(' ');
+                }
+                if a.is_empty() {
                     s.push(' ');
                 }
                 s.push(')');
@@ -1317,7 +1357,13 @@ pub fn print_param(name: &str, p: &Param, pf: &PrintFlags, locallevel: usize) ->
             out.push_str("typeset ");
         }
     }
-    if pf.type_ || pf.typeset {
+    // POSIX `export -p` and `readonly -p` show no flags and no hashes,
+    // and arrays only when asked for with -a.
+    let posix_list = pf.posix_export || pf.posix_readonly;
+    if posix_list && (p.is_assoc() || (p.is_array() && !pf.posix_arrays)) {
+        return String::new();
+    }
+    if (pf.type_ || pf.typeset) && !posix_list {
         let mut doneminus = false;
         for &(bit, word, letter, how) in PMTYPES {
             if altname != '\0' && altname == letter {

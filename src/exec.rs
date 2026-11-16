@@ -76,7 +76,9 @@ fn check_errexit(status: i32) {
     let (live, idle, trapped) = with_shell(|s| {
         (
             s.errexit_suppressed == 0,
-            matches!(s.flow, Flow::None | Flow::Return(_)),
+            // A fatal error on the way out still runs the ZERR trap.
+            matches!(s.flow, Flow::None | Flow::Return(_))
+                || (s.error_exit && matches!(s.flow, Flow::Exit(_))),
             s.traps
                 .get(&crate::trap::SIG_ZERR)
                 .is_some_and(|a| !a.is_empty()),
@@ -1020,6 +1022,32 @@ fn expand_assigns(assigns: &[Assign]) -> ExpResult<Vec<Expanded>> {
     let mut out = Vec::new();
     for a in assigns {
         let value = match &a.value {
+            // GLOB_ASSIGN: `name=pattern` is globbed, and several matches
+            // make the parameter an array.
+            AssignValue::Scalar(v)
+                if a.subscript.is_none() && crate::options::is_set("globassign") =>
+            {
+                let mut words = expand_words(std::slice::from_ref(v))?;
+                if words.len() > 1 {
+                    Value::Array(
+                        words
+                            .into_iter()
+                            .map(crate::shell::ArrItem::Plain)
+                            .collect(),
+                    )
+                } else {
+                    // A file name from a pattern is text: a numeric
+                    // parameter becomes a plain one, as in zsh.
+                    if v.contains(['*', '?', '[']) {
+                        with_shell(|s| {
+                            if let Some(p) = s.param_mut(&a.name) {
+                                p.attrs &= !crate::params::NUMERIC;
+                            }
+                        });
+                    }
+                    Value::Scalar(words.pop().unwrap_or_default())
+                }
+            }
             AssignValue::Scalar(v) => Value::Scalar(expand_assign_value(v)?),
             AssignValue::Array(items) => Value::Array(expand_array_items(items)?),
         };
@@ -1217,7 +1245,10 @@ fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
             }
         },
         (None, Value::Array(items)) => {
-            crate::shell::array_assign_items(&a.name, items.clone(), a.append)
+            // A declared but unset parameter (TYPESET_TO_UNSET) has no
+            // value to append to.
+            let append = a.append && param_kind(&a.name) != ParamKind::Unset;
+            crate::shell::array_assign_items(&a.name, items.clone(), append)
         }
         (None, Value::Scalar(v)) if a.append && param_kind(&a.name) == ParamKind::Numeric => {
             // Numeric parameters add.
@@ -1291,7 +1322,14 @@ impl TempVars {
         let mut saved = TempVars(Vec::new());
         for a in assigns {
             let Value::Scalar(v) = &a.value else { continue };
+            // `HELLO[2,4]=oo cmd`: the element changes for the command too.
             if a.subscript.is_some() {
+                let prev = with_shell(|s| s.param(&a.name).cloned());
+                saved.0.push((a.name.clone(), prev));
+                if let Err(st) = apply_assign(a, export) {
+                    saved.restore();
+                    return Err(st);
+                }
                 continue;
             }
             if is_readonly(&a.name) {
@@ -1684,24 +1722,16 @@ fn exec_in_child(node: &Node) -> ! {
 // Records the line of the command running (not inside traps or a
 // NO_EVAL_LINENO eval).
 fn set_lineno(line: usize) {
-    if !crate::trap::in_trap() {
-        crate::shell::with_err_ctx(|e| {
-            if e.frozen == 0 {
-                e.lineno = line;
-            }
-        });
-    }
+    crate::shell::with_err_ctx(|e| {
+        if e.frozen == 0 && !crate::trap::keeps_trigger_line(e.stack.len()) {
+            e.lineno = line;
+        }
+    });
 }
 
 fn exec_simple(cmd: &SimpleCmd, in_child: bool) -> i32 {
     // A trap runs with the line of the command that triggered it.
-    if !crate::trap::in_trap() {
-        crate::shell::with_err_ctx(|e| {
-            if e.frozen == 0 {
-                e.lineno = cmd.line;
-            }
-        });
-    }
+    set_lineno(cmd.line);
     // A command other than `exit` resets the CHECK_JOBS warning.
     if cmd.words.first().is_some_and(|w| w != "exit") {
         crate::jobs::EXIT_WARNED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2425,6 +2455,43 @@ fn restore_function_frame(entry: Frame, status: i32, posix_traps: bool) -> i32 {
     status
 }
 
+// Enters a function, eval or sourced file `name` whose lines count from
+// `base`, recording where it was called from. Returns the caller's line.
+fn push_frame(name: &str, base: usize) -> usize {
+    let file = code_origin();
+    crate::shell::with_err_ctx(|e| {
+        let (caller, caller_base) = e
+            .stack
+            .last()
+            .map(|(n, b)| (n.clone(), *b))
+            .unwrap_or_else(|| (e.name.clone(), 0));
+        let here = e.lineno;
+        e.calls.push((
+            format!("{}:{}", caller, here.saturating_sub(caller_base)),
+            format!("{}:{}", file, here),
+        ));
+        e.stack.push((name.to_string(), base));
+        here
+    })
+}
+
+// For each running function, the file it was defined in (when known) and
+// the source depth it was called at.
+static FUNC_ORIGINS: std::sync::Mutex<Vec<(Option<String>, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The file the code now running came from, as the prompt's %x shows it:
+/// the running function's own file, unless a file sourced since then is
+/// running.
+pub fn code_origin() -> String {
+    let depth = with_shell(|s| s.source_depth);
+    let top = FUNC_ORIGINS.lock().ok().and_then(|o| o.last().cloned());
+    match top {
+        Some((Some(origin), d)) if d == depth => origin,
+        _ => with_shell(|s| s.function_origin()),
+    }
+}
+
 // Set while XTRACE comes from a `functions -T` function.
 static TRACE_FROM_T: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -2448,10 +2515,18 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
         });
         return 1;
     }
-    let saved_line = crate::shell::with_err_ctx(|e| {
-        e.stack.push((words[0].clone(), line));
-        e.lineno
+    let saved_line = push_frame(&words[0], line);
+    // The file the function was defined in, for the prompt's %x.
+    let origin = with_shell(|s| {
+        let f = s
+            .functions
+            .get(&words[0])
+            .filter(|f| Arc::ptr_eq(&f.body, body));
+        (f.map(|f| f.origin.clone()), s.source_depth)
     });
+    if let Ok(mut o) = FUNC_ORIGINS.lock() {
+        o.push(origin);
+    }
     // Traced functions (functions -t / -T) run with XTRACE; a named
     // function called from a -T one does not.
     use std::sync::atomic::Ordering;
@@ -2598,8 +2673,12 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
     });
     crate::shell::with_err_ctx(|e| {
         e.stack.pop();
+        e.calls.pop();
         e.lineno = saved_line;
     });
+    if let Ok(mut o) = FUNC_ORIGINS.lock() {
+        o.pop();
+    }
     if kind.is_some() || saved_trace.1 {
         with_shell(|s| crate::options::set_in(s, "xtrace", saved_trace.0));
         TRACE_FROM_T.store(saved_trace.1, Ordering::SeqCst);
@@ -3387,15 +3466,13 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
     // NO_EVAL_LINENO: an eval keeps its caller's name and line.
     let frozen = ctx == Some("(eval)") && !crate::options::is_set("evallineno");
     let ctx = ctx.filter(|_| !frozen);
-    let saved_line = crate::shell::with_err_ctx(|e| {
-        if let Some(c) = ctx {
-            e.stack.push((c.to_string(), 0));
-        }
-        if frozen {
-            e.frozen += 1;
-        }
-        e.lineno
-    });
+    let saved_line = match ctx {
+        Some(c) => push_frame(c, 0),
+        None => crate::shell::with_err_ctx(|e| e.lineno),
+    };
+    if frozen {
+        crate::shell::with_err_ctx(|e| e.frozen += 1);
+    }
     // zsh parses an `eval` or `-c` string whole before running it (so
     // aliases it defines apply only later); sourced files, and sh mode as
     // in bash, go command by command.
@@ -3408,6 +3485,7 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
     crate::shell::with_err_ctx(|e| {
         if ctx.is_some() {
             e.stack.pop();
+            e.calls.pop();
         }
         if frozen {
             e.frozen -= 1;
@@ -3463,7 +3541,8 @@ fn run_parsed(src: &str) -> i32 {
         }
         match parser.parse_complete_command() {
             Ok(Some(node)) => {
-                status = exec_node(&node);
+                // A sourced file's commands get the DEBUG trap too.
+                status = exec_with_debug(&node);
                 crate::trap::run_pending();
             }
             Ok(None) => break,

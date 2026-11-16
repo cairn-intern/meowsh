@@ -321,14 +321,28 @@ fn init_job_control() {
 }
 
 fn source_startup_files(login: bool, interactive: bool) {
-    let home = meowsh::shell::var_get_opt("HOME").unwrap_or_default();
-    if home.is_empty() {
+    // The files are in $ZDOTDIR, or $HOME without it; .zshenv may set
+    // ZDOTDIR for the others.
+    let dir = || {
+        meowsh::shell::var_get_opt("ZDOTDIR")
+            .filter(|d| !d.is_empty())
+            .or_else(|| meowsh::shell::var_get_opt("HOME"))
+            .filter(|d| !d.is_empty())
+    };
+    let Some(env_dir) = dir() else {
         return;
-    }
-    let home_path = Path::new(&home);
+    };
     // zsh order: .zshenv always, .zprofile for login shells, .zshrc for
     // interactive shells, .zlogin for interactive login shells.
-    source_startup(&home_path.join(".zshenv").to_string_lossy());
+    source_startup(&Path::new(&env_dir).join(".zshenv").to_string_lossy());
+    // NO_RCS set by .zshenv skips the rest.
+    if !options::is_set("rcs") {
+        return;
+    }
+    let Some(d) = dir() else {
+        return;
+    };
+    let home_path = Path::new(&d);
     if login {
         source_startup(&home_path.join(".zprofile").to_string_lossy());
     }

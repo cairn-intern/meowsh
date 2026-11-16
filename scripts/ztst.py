@@ -167,6 +167,15 @@ def zsh_glob_to_regex(p):
                 body = body.replace("[:alpha:]", "a-zA-Z").replace("[:alnum:]", "a-zA-Z0-9")
                 out.append("[" + body + "]")
                 i = j
+        elif c == "(" and p.startswith("(#c", i):
+            # (#cN) or (#cN,M): the previous item N to M times.
+            m = re.match(r"\(#c(\d+)(?:,(\d*))?\)", p[i:])
+            if m:
+                n, top = m.group(1), m.group(2)
+                out.append("{%s}" % n if top is None else "{%s,%s}" % (n, top))
+                i += m.end()
+                continue
+            out.append("(?:")
         elif c == "(":
             out.append("(?:")
         elif c == ")":

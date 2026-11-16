@@ -187,6 +187,19 @@ fn lookup(name: &str) -> Val {
             v.reverse();
             return Val::List(v, true);
         }
+        // $functrace / $funcfiletrace: where each of those was called
+        // from, innermost first.
+        "functrace" | "funcfiletrace" if !crate::shell::var_exists(name) => {
+            let file = name == "funcfiletrace";
+            let mut v: Vec<String> = crate::shell::with_err_ctx(|e| {
+                e.calls
+                    .iter()
+                    .map(|(t, f)| if file { f.clone() } else { t.clone() })
+                    .collect()
+            });
+            v.reverse();
+            return Val::List(v, true);
+        }
         "LINENO" if !crate::shell::var_exists("LINENO") => {
             return Val::Str(crate::shell::lineno().to_string())
         }

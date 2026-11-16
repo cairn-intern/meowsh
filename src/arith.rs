@@ -313,7 +313,15 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
                 }
             }
             let word: String = c[start..i].iter().collect();
-            // `Inf` and `NaN`, in any case, are float constants.
+            // `Inf` and `NaN`, in any case, are float constants, so a
+            // subscript after one reads as a base: `Inf[0]` is an error.
+            if !sh
+                && word.split_once('[').is_some_and(|(n, _)| {
+                    n.eq_ignore_ascii_case("inf") || n.eq_ignore_ascii_case("nan")
+                })
+            {
+                return Err("bad base syntax".to_string());
+            }
             if sh {
                 out.push(T::Ident(word));
             } else if word.eq_ignore_ascii_case("inf") {

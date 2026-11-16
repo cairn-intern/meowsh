@@ -1373,3 +1373,237 @@ fn unterminated_here_document_is_silent_in_zsh_mode() {
     assert_eq!(stdout, "body\n");
     assert!(!stderr.contains("here-document"), "{}", stderr);
 }
+
+#[test]
+fn functions_called_from_traps_count_their_own_lines() {
+    let (_, stdout, _) = run_script(
+        "f() {\n  print f $LINENO\n}\ntrap f USR1\nkill -USR1 $$\n:\nTRAPUSR2() {\n  print t $LINENO\n}\nkill -USR2 $$\n:",
+    );
+    assert_eq!(stdout, "f 1\nt 1\n");
+}
+
+#[test]
+fn monitor_needs_a_terminal() {
+    let out = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args([
+            "-fc",
+            "setopt monitor; echo $?; [[ -o monitor ]] || echo off",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\noff\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("can't change option: monitor"));
+}
+
+#[test]
+fn wait_for_a_finished_job_in_a_script_finds_no_job() {
+    let out = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args(["-fc", "sleep 0.1 & sleep 0.3; wait %%; echo $?"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "127\n");
+}
+
+#[test]
+fn array_append_to_declared_unset_parameter() {
+    let (_, stdout, _) = run_script(
+        "() { setopt localoptions typeset_to_unset; typeset a; a+=(1 2 3); print \"${(q@)a}\" }",
+    );
+    assert_eq!(stdout, "1 2 3\n");
+}
+
+#[test]
+fn subscripted_temporary_assignment_applies_to_the_command() {
+    let (_, stdout, _) =
+        run_script("call() { print $HELLO; }; HELLO=world; HELLO[2,4]=oo call; call");
+    assert_eq!(stdout, "wood\nworld\n");
+}
+
+#[test]
+fn glob_assign_globs_scalar_values() {
+    let dir = TempDir::new().unwrap();
+    for f in ["tmpfile1", "tmpfile2"] {
+        fs::write(dir.path().join(f), "").unwrap();
+    }
+    let (_, stdout, _) = run_script(&format!(
+        "cd {}; integer i n x; setopt globassign; i=tmpfile1; n=tmpf*; x=*2; typeset -p i n x",
+        dir.path().display()
+    ));
+    assert_eq!(
+        stdout,
+        "typeset -i i=0\ntypeset -a n=( tmpfile1 tmpfile2 )\ntypeset x=tmpfile2\n"
+    );
+}
+
+#[test]
+fn continue_in_a_subshell_ends_the_subshell() {
+    let out = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args([
+            "-fc",
+            "for x in a b; do ( echo $x; continue; echo after ); done; echo $?",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nb\n1\n");
+}
+
+#[test]
+fn seconds_can_be_a_float() {
+    let (_, stdout, _) = run_script(
+        "typeset -F SECONDS; sleep 0.2; (( SECONDS > 0.1 && SECONDS < 5 )) && echo ok; typeset -p SECONDS | cut -c1-18",
+    );
+    assert_eq!(stdout, "ok\ntypeset -F SECONDS\n");
+}
+
+#[test]
+fn fc_reports_missing_events_and_bad_sizes() {
+    let (_, stdout, stderr) = run_script("fc -l nosuchevent; echo $?; fc -p /dev/null 1x; echo $?");
+    assert_eq!(stdout, "1\n1\n");
+    assert!(
+        stderr.contains("event not found: nosuchevent"),
+        "{}",
+        stderr
+    );
+    assert!(stderr.contains("HISTSIZE must be an integer"), "{}", stderr);
+}
+
+#[test]
+fn cd_s_refuses_symbolic_links_and_chaselinks_survives_a_rename() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path().display();
+    fs::create_dir_all(dir.path().join("real")).unwrap();
+    std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
+    fs::create_dir_all(dir.path().join("foo")).unwrap();
+    let (_, stdout, stderr) = run_script(&format!(
+        "cd {d}; cd -s link; echo $?; setopt chaselinks; cd foo; mv ../foo ../bar; cd .; print ${{PWD:t}}"
+    ));
+    assert_eq!(stdout, "1\nbar\n");
+    assert!(stderr.contains("not a directory: link"), "{}", stderr);
+}
+
+#[test]
+fn posix_readonly_without_a_value_stays_unset_and_read_only() {
+    let (_, stdout, stderr) = run_script(
+        "setopt posixbuiltins; readonly pbro; echo ${+pbro}; readonly -p | grep pbro; typeset -g +r pbro; echo $?",
+    );
+    assert_eq!(stdout, "0\nreadonly pbro\n1\n");
+    assert!(stderr.contains("read-only variable: pbro"), "{}", stderr);
+}
+
+#[test]
+fn typeset_prints_empty_arrays_and_numbers_like_zsh() {
+    let (_, stdout, _) = run_script("typeset -a x; typeset -i n; typeset -F f; typeset -p x n f");
+    assert_eq!(
+        stdout,
+        "typeset -a x=(  )\ntypeset -i n=0\ntypeset -F f=0.0000000000\n"
+    );
+}
+
+#[test]
+fn posix_export_listing_has_no_flags_or_hashes() {
+    let (_, stdout, _) = run_script(
+        "function { local -rax zqarr=(2); local -rAx zqh=(3 3); local -rx zqsc=1; emulate -L sh; export -p | grep zq; export -ap | grep zqarr }",
+    );
+    assert_eq!(stdout, "export zqsc=1\nexport zqarr=( 2 )\n");
+}
+
+#[test]
+fn a_subscript_after_inf_is_bad_base_syntax() {
+    let (_, _, stderr) = run_script("integer Inf; print $(( Inf[0] ))");
+    assert!(stderr.contains("bad base syntax"), "{}", stderr);
+}
+
+#[test]
+fn zerr_trap_runs_on_fatal_errors_and_trap_errors_stay_in_the_trap() {
+    let (_, stdout, _) = run_script(
+        "KO() { { : $KO } 2>&1 }
+(set -u; TRAPZERR() { echo trap; }; KO; echo not-reached); echo $?
+(set -u; TRAPZERR() { KO; echo no; }; false; echo goes-on); echo $?",
+    );
+    assert_eq!(
+        stdout,
+        "KO: KO: parameter not set\ntrap\n1\nKO: KO: parameter not set\ngoes-on\n0\n"
+    );
+}
+
+#[test]
+fn anonymous_function_exit_trap_runs_inside_its_redirection() {
+    let dir = TempDir::new().unwrap();
+    let (_, stdout, _) = run_script(&format!(
+        "cd {}; () {{ trap 'echo exit-trap' EXIT; echo in }} >o.txt; echo file:; cat o.txt",
+        dir.path().display()
+    ));
+    assert_eq!(stdout, "file:\nin\nexit-trap\n");
+}
+
+#[test]
+fn startup_files_come_from_zdotdir_and_no_rcs_stops_them() {
+    let home = TempDir::new().unwrap();
+    let zdot = TempDir::new().unwrap();
+    fs::write(
+        zdot.path().join(".zshenv"),
+        "print from zdotdir; setopt norcs\n",
+    )
+    .unwrap();
+    fs::write(zdot.path().join(".zshrc"), "print rc\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args(["-i", "-c", "true"])
+        .env("HOME", home.path())
+        .env("ZDOTDIR", zdot.path())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "from zdotdir\n");
+}
+
+#[test]
+fn functrace_and_funcfiletrace_name_the_call_sites() {
+    let (_, stdout, _) =
+        run_script("f() {\n  print -l $functrace -- $funcfiletrace\n}\ng() {\n  f\n}\ng");
+    assert_eq!(stdout, "g:1\nmeowsh:7\n--\nmeowsh:5\nmeowsh:7\n");
+}
+
+#[test]
+fn prompt_x_is_the_running_functions_file_even_when_copied() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("line_info"), "\nprint -P \"%1x:%I here\"\n").unwrap();
+    let (_, stdout, _) = run_script(&format!(
+        "cd {}; fpath=(.); autoload -Uz line_info; functions -c line_info copy; copy",
+        dir.path().display()
+    ));
+    assert_eq!(stdout, "line_info:2 here\n");
+}
+
+#[test]
+fn debug_trap_runs_for_commands_in_sourced_files() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("s"), "print one\nprint two\n").unwrap();
+    let (_, stdout, _) = run_script(&format!(
+        "cd {}; unsetopt debugbeforecmd; trap 'print dbg' DEBUG; . ./s; trap - DEBUG",
+        dir.path().display()
+    ));
+    assert_eq!(stdout, "dbg\none\ndbg\ntwo\ndbg\ndbg\n");
+}
+
+#[test]
+fn kill_with_a_job_spec_in_an_interactive_shell_does_not_hang() {
+    // Resolving %1 read an option under the shell lock kill already held.
+    let home = TempDir::new().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args(["-i", "-c", "sleep 5 & kill %1; echo done"])
+        .env("HOME", home.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            let _ = child.kill();
+            panic!("kill %1 hung");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+}

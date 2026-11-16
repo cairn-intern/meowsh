@@ -287,6 +287,9 @@ pub fn eval_context() -> Vec<String> {
     v
 }
 
+/// `typeset -F SECONDS`: $SECONDS counts fractions of a second.
+pub static SECONDS_FLOAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// How many subshells deep this process is ($ZSH_SUBSHELL).
 pub static SUBSHELL_LEVEL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -323,13 +326,14 @@ fn dynamic_var(name: &str) -> Option<String> {
             RANDOM_STATE.store(x, Ordering::Relaxed);
             Some(((x >> 33) % 32768).to_string())
         }
-        "SECONDS" => Some(
-            START
-                .get_or_init(std::time::Instant::now)
-                .elapsed()
-                .as_secs()
-                .to_string(),
-        ),
+        "SECONDS" => {
+            let t = START.get_or_init(std::time::Instant::now).elapsed();
+            Some(if SECONDS_FLOAT.load(Ordering::Relaxed) {
+                format!("{:.10}", t.as_secs_f64())
+            } else {
+                t.as_secs().to_string()
+            })
+        }
         "EPOCHSECONDS" | "EPOCHREALTIME" => {
             let d = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1911,7 +1915,7 @@ impl Prompt {
                 'i' => out.push_str(&lineno().to_string()),
                 'I' => out.push_str(&with_err_ctx(|e| e.lineno).to_string()),
                 'x' => {
-                    let file = with_shell(|s| s.function_origin());
+                    let file = crate::exec::code_origin();
                     out.push_str(&prompt_path(&file, arg, false));
                 }
                 'T' => out.push_str(time_fmt("%k:%M").trim_start()),
@@ -2163,6 +2167,10 @@ pub struct ErrCtx {
     // (name, line the numbering starts after) for each function,
     // `(eval)` or sourced file being run.
     pub stack: Vec<(String, usize)>,
+    // For each entry of `stack`, where it was called from: zsh's
+    // $functrace entry (caller:line in the caller) and $funcfiletrace
+    // entry (file:line in the file).
+    pub calls: Vec<(String, String)>,
     // Line of the command running, in its input.
     pub lineno: usize,
     // The script, or the shell's name for `-c` and standard input.
@@ -2176,6 +2184,7 @@ pub struct ErrCtx {
 
 static ERR_CTX: std::sync::Mutex<ErrCtx> = std::sync::Mutex::new(ErrCtx {
     stack: Vec::new(),
+    calls: Vec::new(),
     lineno: 0,
     name: String::new(),
     interactive: false,

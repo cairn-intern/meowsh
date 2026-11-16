@@ -197,6 +197,15 @@ pub fn is_set(name: &str) -> bool {
 
 /// Sets an option by any accepted spelling. False if there is no such
 /// option.
+/// The option `name` can't be put into that state here: MONITOR needs a
+/// terminal, as zsh's does. Returns its canonical name.
+pub fn refused(name: &str, on: bool) -> Option<&'static str> {
+    let (c, v) = resolve(name)?;
+    let effective = if on { v } else { !v };
+    let no_tty = crate::jobs::TTY_FD.load(std::sync::atomic::Ordering::SeqCst) < 0;
+    (c == "monitor" && effective && no_tty).then_some(c)
+}
+
 pub fn set(name: &str, on: bool) -> bool {
     match resolve(name) {
         Some((c, v)) => {

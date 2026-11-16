@@ -439,6 +439,10 @@ fn builtin_break(words: &[String], is_break: bool) -> i32 {
                 "not in for, while, until, select, or repeat loop"
             },
         );
+        // In a subshell of a loop this is fatal: the subshell ends there.
+        if outer > 0 {
+            return crate::exec::abort_command(1);
+        }
         return 1;
     }
     let n = n.min(depth);
@@ -881,6 +885,10 @@ fn builtin_set(words: &[String]) -> i32 {
                 'o' => match args.get(i + 1) {
                     Some(name) => {
                         i += 1;
+                        if let Some(c) = crate::options::refused(name, on) {
+                            builtin_err("set", &format!("can't change option: {}", c));
+                            return 1;
+                        }
                         if !crate::options::set(name, on) {
                             return usage("set", &format!("no such option: {}", name));
                         }
@@ -901,7 +909,12 @@ fn builtin_set(words: &[String]) -> i32 {
                 's' if crate::options::letter('s').is_none() => {}
                 c => match crate::options::letter(c) {
                     Some((name, v)) => {
-                        crate::options::set(name, if on { v } else { !v });
+                        let state = if on { v } else { !v };
+                        if let Some(c) = crate::options::refused(name, state) {
+                            builtin_err("set", &format!("can't change option: {}", c));
+                            return 1;
+                        }
+                        crate::options::set(name, state);
                     }
                     None => {
                         return usage(
@@ -1829,6 +1842,21 @@ fn print_dirstack() {
     out(&text);
 }
 
+// Whether any part of `path` (relative to the current directory) is a
+// symbolic link.
+fn has_symlink(path: &str) -> bool {
+    let mut cur = std::path::PathBuf::new();
+    if path.starts_with('/') {
+        cur.push("/");
+    }
+    path.split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .any(|c| {
+            cur.push(c);
+            std::fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink())
+        })
+}
+
 // zsh's cd_try_chdir: the full path (logical unless chasing links),
 // changed into.
 fn cd_try(prefix: Option<&str>, dest: &str, physical: bool) -> Result<String, i32> {
@@ -1843,6 +1871,11 @@ fn cd_try(prefix: Option<&str>, dest: &str, physical: bool) -> Result<String, i3
         None => format!("{}/{}", pwd.trim_end_matches('/'), dest),
     };
     if physical {
+        // From where the shell really is: $PWD may name a directory that
+        // has since been renamed.
+        if prefix.is_none() && !dest.starts_with('/') && chdir(dest).is_ok() {
+            return Ok(physical_cwd().unwrap_or(full));
+        }
         chdir(&full)?;
         return Ok(physical_cwd().unwrap_or(full));
     }
@@ -1932,6 +1965,7 @@ fn cd_family(words: &[String], kind: CdKind) -> i32 {
     let cmd = words[0].as_str();
     let mut physical = crate::options::is_set("chaselinks");
     let mut quiet = false;
+    let mut nolinks = false;
     let mut i = 1;
     while let Some(a) = words.get(i) {
         let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
@@ -1949,7 +1983,7 @@ fn cd_family(words: &[String], kind: CdKind) -> i32 {
                 'P' => physical = true,
                 'L' => physical = false,
                 'q' => quiet = true,
-                's' => {}
+                's' => nolinks = true,
                 _ => return usage(cmd, &format!("bad option: -{}", c)),
             }
         }
@@ -2053,6 +2087,11 @@ fn cd_family(words: &[String], kind: CdKind) -> i32 {
     let Some(dest) = list.get(d).cloned() else {
         return 1;
     };
+    // -s: a path through a symbolic link is refused.
+    if nolinks && has_symlink(&dest) {
+        builtin_err(cmd, &format!("not a directory: {}", dest));
+        return 1;
+    }
     let Some(newdir) = cd_do_chdir(cmd, &dest, physical, &mut printdir) else {
         return 1;
     };
@@ -3937,7 +3976,10 @@ fn builtin_setopt(words: &[String], value: bool) -> i32 {
             let on = if arg == "-o" { value } else { !value };
             match args.get(i + 1) {
                 Some(o) => {
-                    if !crate::options::set(o, on) {
+                    if let Some(c) = crate::options::refused(o, on) {
+                        builtin_err(name, &format!("can't change option: {}", c));
+                        status = 1;
+                    } else if !crate::options::set(o, on) {
                         builtin_err(name, &format!("no such option: {}", o));
                         status = 1;
                     }
@@ -3953,7 +3995,13 @@ fn builtin_setopt(words: &[String], value: bool) -> i32 {
             for c in arg[1..].chars() {
                 match crate::options::letter(c) {
                     Some((o, v)) => {
-                        crate::options::set(o, if on { v } else { !v });
+                        let state = if on { v } else { !v };
+                        if let Some(c) = crate::options::refused(o, state) {
+                            builtin_err(name, &format!("can't change option: {}", c));
+                            status = 1;
+                        } else {
+                            crate::options::set(o, state);
+                        }
                     }
                     None => {
                         builtin_err(name, &format!("bad option: -{}", c));
@@ -3961,6 +4009,9 @@ fn builtin_setopt(words: &[String], value: bool) -> i32 {
                     }
                 }
             }
+        } else if let Some(c) = crate::options::refused(arg, value) {
+            builtin_err(name, &format!("can't change option: {}", c));
+            status = 1;
         } else if !crate::options::set(arg, value) {
             builtin_err(name, &format!("no such option: {}", arg));
             status = 1;
@@ -4145,6 +4196,7 @@ pub fn run_hooks(hook: &str, args: &[String]) {
 // do nothing.
 fn builtin_fc(words: &[String]) -> i32 {
     let (mut list, mut numbers, mut reverse) = (false, true, false);
+    let (mut push, mut pop) = (false, false);
     let mut range = Vec::new();
     let mut i = 1;
     while let Some(a) = words.get(i) {
@@ -4162,6 +4214,8 @@ fn builtin_fc(words: &[String]) -> i32 {
                         'l' => list = true,
                         'n' => numbers = false,
                         'r' => reverse = true,
+                        'p' => push = true,
+                        'P' => pop = true,
                         't' => i += 1,
                         _ => {}
                     }
@@ -4172,7 +4226,17 @@ fn builtin_fc(words: &[String]) -> i32 {
         }
         i += 1;
     }
-    if !list {
+    // fc -p [file [histsize [savehist]]]: the sizes must be integers.
+    if push {
+        for (arg, var) in range.iter().skip(1).zip(["HISTSIZE", "SAVEHIST"]) {
+            if arg.parse::<i64>().is_err() {
+                builtin_err("fc", &format!("{} must be an integer", var));
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if pop || !list {
         return 0;
     }
     let mut lines = with_shell(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone());
@@ -4182,19 +4246,29 @@ fn builtin_fc(words: &[String]) -> i32 {
         lines.pop();
     }
     let n = lines.len() as i64;
-    let pos = |spec: &str, default: i64| -> i64 {
+    // An event by number, or the latest one starting with the text.
+    let pos = |spec: &str| -> Option<i64> {
         match spec.parse::<i64>() {
-            Ok(k) if k < 0 => (n + k + 1).max(1),
-            Ok(k) => k.max(1),
+            Ok(k) if k < 0 => Some((n + k + 1).max(1)),
+            Ok(k) => Some(k.max(1)),
             Err(_) => lines
                 .iter()
                 .rposition(|l| l.starts_with(spec))
-                .map(|k| k as i64 + 1)
-                .unwrap_or(default),
+                .map(|k| k as i64 + 1),
         }
     };
-    let first = range.first().map(|f| pos(f, 1)).unwrap_or((n - 15).max(1));
-    let last = range.get(1).map(|l| pos(l, n)).unwrap_or(n);
+    let mut ends = Vec::new();
+    for spec in range.iter().take(2) {
+        match pos(spec) {
+            Some(k) => ends.push(k),
+            None => {
+                builtin_err("fc", &format!("event not found: {}", spec));
+                return 1;
+            }
+        }
+    }
+    let first = ends.first().copied().unwrap_or((n - 15).max(1));
+    let last = ends.get(1).copied().unwrap_or(n);
     let mut picked: Vec<(i64, &String)> = (first..=last.min(n))
         .filter_map(|k| lines.get((k - 1) as usize).map(|l| (k, l)))
         .collect();

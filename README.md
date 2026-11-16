@@ -39,9 +39,10 @@ inside a script.
 Options: `-i` (force interactive), `-l`/`--login`, `-s`, `-c`, `-o name`,
 and zsh's option letters (`-e` errexit, `-x` xtrace, `-f` no startup
 files, ...); all of zsh's named options are recognized by `setopt`,
-`set -o` and `$options`. Startup files are read in zsh order:
-`~/.zshenv`, `~/.zprofile` (login), `~/.zshrc` (interactive), `~/.zlogin`
-(interactive login).
+`set -o` and `$options`. Startup files are read in zsh order from
+`$ZDOTDIR` (or `$HOME` without it): `.zshenv`, `.zprofile` (login),
+`.zshrc` (interactive), `.zlogin` (interactive login); `NO_RCS` set in
+`.zshenv` skips the rest.
 
 ## zsh startup files
 

@@ -651,9 +651,19 @@ impl Parser {
     // redirections. An argument may start with a glob group: `(a|b)*`.
     fn anon_func_rest(&mut self, line: usize, traced: bool) -> PResult<Node> {
         self.skip_newlines()?;
-        let body = self.parse_command()?;
+        let mut body = self.parse_command()?;
         let mut args = Vec::new();
         let mut redirs = Vec::new();
+        // `() { ... } >file`: the redirection is the call's, so it is still
+        // in place while the function's EXIT trap runs.
+        if let Node::Redirected { node, redirs: r } = body {
+            if matches!(*node, Node::Brace(_)) {
+                redirs = r;
+                body = *node;
+            } else {
+                body = Node::Redirected { node, redirs: r };
+            }
+        }
         loop {
             if let Some(r) = self.try_parse_redirect()? {
                 redirs.push(r);

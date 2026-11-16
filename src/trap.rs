@@ -229,11 +229,32 @@ pub fn run_pending() {
     }
 }
 
+// How many functions deep the running trap started.
+static TRAP_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the line number stays that of the command that triggered the
+/// running trap: true in the trap's own code, false inside a function it
+/// calls (a TRAPxxx function counts its own lines, as in zsh).
+pub fn keeps_trigger_line(depth: usize) -> bool {
+    IN_TRAP.load(Ordering::SeqCst) && depth <= TRAP_DEPTH.load(Ordering::SeqCst)
+}
+
 /// Runs a trap action with `$?` preserved.
 pub fn run_action(action: &str) {
     IN_TRAP.store(true, Ordering::SeqCst);
-    let saved = with_shell(|s| s.last_status);
+    TRAP_DEPTH.store(
+        crate::shell::with_err_ctx(|e| e.stack.len()),
+        Ordering::SeqCst,
+    );
+    let (saved, error_before) = with_shell(|s| (s.last_status, s.error_exit));
     let st = crate::shell::in_eval_context("trap", || crate::exec::run_string(action));
+    // An error inside the trap ends the trap, not the code it interrupted.
+    with_shell(|s| {
+        if s.error_exit && !error_before && matches!(s.flow, Flow::Exit(_)) {
+            s.error_exit = false;
+            s.flow = Flow::None;
+        }
+    });
     // A TRAPxxx function returning non-zero makes the function it
     // interrupted return with that status.
     let trap_func = action.starts_with("TRAP") && !action.contains(';');

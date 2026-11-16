@@ -751,6 +751,21 @@ pub fn builtin_jobs(args: &[String]) -> i32 {
 /// zsh's getjob(): `%`, `%+`, `%%`, `%-`, `%N`, `%?text`, `%text` or
 /// `text`. Errors carry zsh's message.
 fn resolve_spec(jobs: &[Job], spec: &str) -> Result<i32, String> {
+    // A script never reports finished jobs, and zsh drops them there, so
+    // only an interactive shell keeps them until they are reported.
+    // (Callers may hold the shell lock, so the flag comes from the error
+    // context, not the options.)
+    let kept: Vec<Job>;
+    let jobs = if crate::shell::with_err_ctx(|e| e.interactive) {
+        jobs
+    } else {
+        kept = jobs
+            .iter()
+            .filter(|j| j.state != JobState::Done)
+            .cloned()
+            .collect();
+        &kept
+    };
     let live: Vec<&Job> = jobs
         .iter()
         .filter(|j| j.state != JobState::Done || !j.notified)
@@ -991,6 +1006,8 @@ pub fn builtin_wait(args: &[String]) -> i32 {
     let posix = crate::options::is_set("posixbuiltins");
     for arg in args {
         if arg.starts_with('%') && zsh_mode() {
+            // Jobs that ended since they were last looked at count as done.
+            reap_jobs(false);
             let jobs: Vec<Job> =
                 with_shell(|s| s.jobs.lock().map(|j| j.clone()).unwrap_or_default());
             match resolve_spec(&jobs, arg) {
