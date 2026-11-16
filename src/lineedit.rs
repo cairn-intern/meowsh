@@ -29,8 +29,16 @@ impl MeowshHelper {
                     i += 1;
                 }
                 CharOrAnsi::Char(c) => match *c {
-                    ' ' | '\t' => {
-                        colored.push(*c);
+                    // A newline (pasted text) starts another command.
+                    '\n' => {
+                        colored.push('\n');
+                        i += 1;
+                        is_start_of_command = true;
+                    }
+                    // Every other blank is passed over; the word scan
+                    // below stops at blanks without consuming them.
+                    c if c.is_whitespace() => {
+                        colored.push(c);
                         i += 1;
                     }
                     '#' if is_start_of_command => {
@@ -920,6 +928,22 @@ mod tests {
         // Unknown command
         let h = helper.highlight("nonexistent_command", 0);
         assert!(h.contains("\x1b[31mnonexistent_command\x1b[0m"));
+    }
+
+    #[test]
+    fn highlighting_a_pasted_multi_line_command_finishes() {
+        // A newline (or other blank) as a word's first character used to
+        // stop the word scan without moving on: the shell spun forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(MeowshHelper.highlight_line("echo a\necho b\r\n\x0bx"));
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("highlighting hung");
+        // Each line's first word is a command.
+        assert_eq!(out.matches("\x1b[32mecho").count(), 2, "{:?}", out);
+        assert_eq!(strip_ansi(&out), "echo a\necho b\r\n\x0bx");
     }
 
     #[test]
