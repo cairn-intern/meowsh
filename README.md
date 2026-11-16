@@ -132,7 +132,17 @@ are accepted and do nothing, so zle plugins such as zsh-autosuggestions
 load but stay inactive (meowsh shows its own history suggestions), and
 zsh completion scripts (`#compdef`) are not run.
 Other zsh options are recorded by `setopt` but have no effect. Up and Down
-search history for lines starting with the typed text. History is kept in
+search history for lines starting with the typed text.
+
+Tab completes commands and file names with zsh's menu selection (what
+`zstyle ':completion:*' menu select` gives, as oh-my-zsh sets it): the
+first Tab inserts what the matches share and lists them in a grid below
+the line, the second starts selecting. Tab, Shift-Tab and the arrows move
+the selection, which is inserted as it moves; Enter keeps it, Ctrl-G puts
+back the word as typed, and typing anything else carries on from the
+selection. A grid taller than the terminal scrolls with the selection.
+
+History is kept in
 `~/.meowsh_history`; `$HISTFILE` is not used, so zsh's history file is
 never rewritten in a different format.
 

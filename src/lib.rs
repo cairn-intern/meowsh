@@ -7,6 +7,7 @@ pub mod globber;
 pub mod jobs;
 pub mod lexer;
 pub mod lineedit;
+pub mod menu;
 pub mod options;
 pub mod params;
 pub mod parser;

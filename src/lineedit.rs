@@ -8,7 +8,7 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
 use rustyline::validate::Validator;
-use rustyline::{Cmd, ColorMode, Editor, Helper, KeyCode, KeyEvent, Modifiers};
+use rustyline::{ColorMode, Editor, Helper, KeyCode, KeyEvent, Modifiers};
 use std::borrow::Cow;
 use std::cell::RefCell;
 
@@ -472,24 +472,30 @@ impl Completer for MeowshHelper {
         pos: usize,
         _ctx: &rustyline::Context<'_>,
     ) -> Result<(usize, Vec<rustyline::completion::Pair>), ReadlineError> {
-        let (clean_line, mappings) = crate::get_clean_and_mappings(line);
-        // `mappings` has one entry per character of `clean_line`, so all
-        // positions below are character indices, not byte offsets.
-        let chars: Vec<char> = clean_line.chars().collect();
-        let clean_pos = mappings
-            .iter()
-            .position(|&raw| raw >= pos)
-            .unwrap_or(chars.len())
-            .min(chars.len());
-        let word_start = chars[..clean_pos]
-            .iter()
-            .rposition(|c| c.is_whitespace() || ";|&".contains(*c))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let start = mappings[word_start];
-        let prefix: String = chars[..clean_pos].iter().collect();
-        Ok((start, self.get_completions(&prefix)))
+        Ok(crate::menu::take_pending().unwrap_or_else(|| candidates(line, pos)))
     }
+}
+
+/// The matches for the word before `pos` in `line`, and the byte offset
+/// where that word starts.
+pub(crate) fn candidates(line: &str, pos: usize) -> (usize, Vec<rustyline::completion::Pair>) {
+    let (clean_line, mappings) = crate::get_clean_and_mappings(line);
+    // `mappings` has one entry per character of `clean_line`, so all
+    // positions below are character indices, not byte offsets.
+    let chars: Vec<char> = clean_line.chars().collect();
+    let clean_pos = mappings
+        .iter()
+        .position(|&raw| raw >= pos)
+        .unwrap_or(chars.len())
+        .min(chars.len());
+    let word_start = chars[..clean_pos]
+        .iter()
+        .rposition(|c| c.is_whitespace() || ";|&".contains(*c))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let start = mappings.get(word_start).copied().unwrap_or(pos);
+    let prefix: String = chars[..clean_pos].iter().collect();
+    (start, MeowshHelper.get_completions(&prefix))
 }
 
 // zsh's RPROMPT for the line being read: its rendered text and width,
@@ -599,6 +605,9 @@ impl Highlighter for MeowshHelper {
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        if crate::menu::is_drawn(hint) {
+            return Cow::Borrowed(hint);
+        }
         let clear = if hint_clears_right_prompt(hint) {
             "\x1b[K"
         } else {
@@ -639,7 +648,8 @@ impl rustyline::hint::Hint for MeowshHint {
     }
 
     fn completion(&self) -> Option<&str> {
-        Some(&self.completion)
+        // The completion menu has nothing to accept.
+        Some(self.completion.as_str()).filter(|c| !c.is_empty())
     }
 }
 
@@ -647,6 +657,12 @@ impl Hinter for MeowshHelper {
     type Hint = MeowshHint;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &rustyline::Context<'_>) -> Option<MeowshHint> {
+        if let Some(grid) = crate::menu::hint(line, pos) {
+            return Some(MeowshHint {
+                display: grid,
+                completion: String::new(),
+            });
+        }
         // Only show hint if cursor is at the end of the line
         if pos < line.len() {
             return None;
@@ -733,18 +749,30 @@ pub fn run_interactive() -> i32 {
         Err(_) => return run_fd(0, true),
     };
     rl.set_color_mode(ColorMode::Forced);
+    // The menu's replacements arrive as a single completion match, which
+    // list completion inserts with the cursor after it.
+    rl.set_completion_type(rustyline::CompletionType::List);
     rl.set_helper(Some(MeowshHelper));
     let _ = rl.set_max_history_size(1000);
-    // Up/Down search history for lines starting with what is typed, as
-    // oh-my-zsh binds them.
-    rl.bind_sequence(
-        KeyEvent(KeyCode::Up, Modifiers::NONE),
-        Cmd::HistorySearchBackward,
-    );
-    rl.bind_sequence(
-        KeyEvent(KeyCode::Down, Modifiers::NONE),
-        Cmd::HistorySearchForward,
-    );
+    // Tab opens zsh's completion menu, which takes the arrows, Enter and
+    // Ctrl-G while it is selecting. Otherwise Up/Down search history for
+    // lines starting with what is typed, as oh-my-zsh binds them.
+    use crate::menu::{Key, MenuKey};
+    for (key, menu_key) in [
+        (KeyEvent(KeyCode::Tab, Modifiers::NONE), Key::Tab),
+        (KeyEvent(KeyCode::BackTab, Modifiers::NONE), Key::BackTab),
+        (KeyEvent(KeyCode::Up, Modifiers::NONE), Key::Up),
+        (KeyEvent(KeyCode::Down, Modifiers::NONE), Key::Down),
+        (KeyEvent(KeyCode::Left, Modifiers::NONE), Key::Left),
+        (KeyEvent(KeyCode::Right, Modifiers::NONE), Key::Right),
+        (KeyEvent(KeyCode::Enter, Modifiers::NONE), Key::Enter),
+        (KeyEvent::ctrl('G'), Key::Cancel),
+    ] {
+        rl.bind_sequence(
+            key,
+            rustyline::EventHandler::Conditional(Box::new(MenuKey(menu_key))),
+        );
+    }
 
     let history_file = crate::shell::with_shell(|s| s.history_file.clone());
     if !history_file.is_empty() {
@@ -762,6 +790,7 @@ pub fn run_interactive() -> i32 {
                 primary_prompt()
             };
             set_right_prompt(&prompt, cont);
+            crate::menu::reset();
             let line = rl.borrow_mut().readline(&prompt);
             match line {
                 Ok(line) => InputLine::Line(line + "\n"),
