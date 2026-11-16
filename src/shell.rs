@@ -1016,7 +1016,7 @@ pub fn array_set(name: &str, items: Vec<String>) -> bool {
         return false;
     }
     if shell.assoc(name).is_some() {
-        if items.len() % 2 != 0 {
+        if !items.len().is_multiple_of(2) {
             drop(shell);
             shell_err("bad set of key/value pairs for associative array");
             return false;
