@@ -22,6 +22,35 @@ impl From<LexError> for ParseError {
 
 type PResult<T> = Result<T, ParseError>;
 
+// zsh's reserved words, which POSIX_ALIASES keeps from alias expansion.
+const RESERVED_WORDS: &[&str] = &[
+    "!",
+    "[[",
+    "{",
+    "}",
+    "case",
+    "coproc",
+    "do",
+    "done",
+    "elif",
+    "else",
+    "end",
+    "esac",
+    "fi",
+    "for",
+    "foreach",
+    "function",
+    "if",
+    "in",
+    "nocorrect",
+    "repeat",
+    "select",
+    "then",
+    "time",
+    "until",
+    "while",
+];
+
 const LIST_TERMINATORS: &[&str] = &[
     "then", "else", "elif", "fi", "do", "done", "esac", "}", "end",
 ];
@@ -121,7 +150,8 @@ impl Parser {
                 None => self.lex.next_token()?,
             },
         };
-        if !matches!(t, Tok::Newline | Tok::Eof) {
+        // zsh names the last token read, a newline included.
+        if !matches!(t, Tok::Eof) {
             self.last = Some(t.clone());
         }
         Ok(t)
@@ -152,6 +182,14 @@ impl Parser {
 
     fn skip_newlines(&mut self) -> PResult<()> {
         while matches!(self.peek()?, Tok::Newline) {
+            self.next()?;
+        }
+        Ok(())
+    }
+
+    // After `|`, `&&` or `||`: zsh takes `;` there as it takes a newline.
+    fn skip_linebreak(&mut self) -> PResult<()> {
+        while matches!(self.peek()?, Tok::Newline | Tok::Op(";")) {
             self.next()?;
         }
         Ok(())
@@ -295,7 +333,7 @@ impl Parser {
                 _ => break,
             };
             self.next()?;
-            self.skip_newlines()?;
+            self.skip_linebreak()?;
             rest.push((op, self.parse_pipeline()?));
         }
         if rest.is_empty() {
@@ -309,11 +347,20 @@ impl Parser {
 
     // pipeline: ['!'] command ('|' linebreak command)*
     fn parse_pipeline(&mut self) -> PResult<Node> {
+        // `!` and `time` may be aliases too.
+        while self.try_alias()? {}
         // zsh's `time` reserved word times the pipeline after it.
         if self.peek_is_word("time")? && !crate::builtins::is_disabled('r', "time") {
             self.next()?;
             let inner = self.parse_pipeline()?;
             return Ok(Node::Time(Box::new(inner)));
+        }
+        // `{!}`: the word after `{` is `!}`, a `!` before the closing brace.
+        if self.brace_depth > 0 && self.peek_is_word("!}")? {
+            self.next()?;
+            self.queued.push(Tok::Word("}".to_string()));
+            self.peeked = Some(Tok::Word("!".to_string()));
+            self.peeked_queued = true;
         }
         let mut bang = false;
         while self.peek_is_word("!")? {
@@ -351,7 +398,7 @@ impl Parser {
                     },
                 ));
             }
-            self.skip_newlines()?;
+            self.skip_linebreak()?;
             cmds.push(self.parse_command()?);
         }
         if cmds.len() == 1 && !bang {
@@ -376,7 +423,7 @@ impl Parser {
         let pos = self.lex.pos();
         self.alias_guard
             .iter()
-            .any(|(n, end)| n == name && pos < *end)
+            .any(|(n, end)| n == name && pos <= *end)
     }
 
     /// If the next token is an unquoted word naming an alias, replaces it
@@ -389,8 +436,17 @@ impl Parser {
     fn try_alias_in(&mut self, global: bool) -> PResult<bool> {
         let name = match self.peek()? {
             Tok::Word(w) => w.clone(),
+            // zsh aliases tokens such as `&&` too.
+            Tok::Op(op) => op.to_string(),
             _ => return Ok(false),
         };
+        // POSIX_ALIASES: reserved words are never aliases.
+        if !global
+            && RESERVED_WORDS.contains(&name.as_str())
+            && crate::options::is_set("posixaliases")
+        {
+            return Ok(false);
+        }
         // A word split off another has no input position of its own.
         if self.peeked_queued || !self.queued.is_empty() {
             return Ok(false);
@@ -409,10 +465,30 @@ impl Parser {
         let Some(value) = found else {
             return Ok(false);
         };
+        // `alias() { ... }` would define a function named after the alias's
+        // text; zsh refuses unless ALIAS_FUNC_DEF.
+        if !global && self.lex.next_after_blanks_is("()") && !crate::options::is_set("aliasfuncdef")
+        {
+            return Err(ParseError::Syntax(format!(
+                "defining function based on alias `{}'",
+                name
+            )));
+        }
         // The peeked token has been lexed; the lexer sits right after it.
         self.peeked = None;
         let pos = self.lex.pos();
-        let text = format!("{} ", value);
+        // A space keeps the text apart from a word the alias was split
+        // from (`{end`); otherwise nothing is added, as a global alias may
+        // open a quote the input closes (`alias -g S='"'`).
+        let joined = self
+            .lex
+            .next_char()
+            .is_some_and(|c| !c.is_whitespace() && !"|&;<>()".contains(c));
+        let text = if joined {
+            format!("{} ", value)
+        } else {
+            value.clone()
+        };
         let len = text.chars().count();
         for (_, end) in self.alias_guard.iter_mut() {
             if *end >= pos {
@@ -563,6 +639,11 @@ impl Parser {
     fn parse_anon_func(&mut self) -> PResult<Node> {
         let line = self.lex.line();
         self.next()?; // )
+                      // `( )` before a separator is an empty subshell; a newline may
+                      // still come before an anonymous function's body.
+        if !matches!(self.peek()?, Tok::Newline) && self.at_command_end()? {
+            return Ok(Node::Subshell(Box::new(Node::Empty)));
+        }
         self.anon_func_rest(line, false)
     }
 
@@ -1290,44 +1371,15 @@ impl Parser {
                 self.next()?;
                 break;
             }
-            let mut patterns = Vec::new();
-            // A leading `(` is POSIX's optional paren, or a zsh pattern
-            // that starts with a group.
-            let mut done = false;
-            if self.peek_is_op("(")? {
-                self.next()?;
-                let (alts, group) = self.case_group()?;
-                match group {
-                    Some(pat) => patterns.push(pat),
-                    None => {
-                        patterns.extend(alts);
-                        done = true;
-                    }
-                }
-                if !done {
-                    match self.next()? {
-                        Tok::Op("|") => {}
-                        Tok::Op(")") => done = true,
-                        Tok::Eof => return Err(self.eof_error("`)'")),
-                        t => return Err(self.unexpected(&t)),
-                    }
-                }
+            // The patterns are read as raw text, as zsh's lexer reads them,
+            // so the token just peeked is read again.
+            if self.peeked_queued {
+                let t = self.next()?;
+                return Err(self.unexpected(&t));
             }
-            if !done {
-                loop {
-                    match self.next()? {
-                        Tok::Word(w) => patterns.push(w),
-                        Tok::Eof => return Err(self.eof_error("a case pattern")),
-                        t => return Err(self.unexpected(&t)),
-                    }
-                    match self.next()? {
-                        Tok::Op("|") => continue,
-                        Tok::Op(")") => break,
-                        Tok::Eof => return Err(self.eof_error("`)'")),
-                        t => return Err(self.unexpected(&t)),
-                    }
-                }
-            }
+            self.peeked = None;
+            self.lex.unread_token();
+            let patterns = self.lex.case_patterns()?;
             let body = self.parse_list(false)?;
             let body = match body {
                 Node::Empty => None,
@@ -1359,38 +1411,6 @@ impl Parser {
             });
         }
         Ok(Node::Case { word, items })
-    }
-
-    // After a `(` that opens a case item: reads `a|b|c)`. If a pattern
-    // character follows the `)` (or another `)`/`|`), this was a zsh
-    // group such as `(darwin|freebsd)*)` and the grouped pattern is
-    // returned; otherwise it was POSIX's optional paren and the
-    // alternatives are the item's patterns.
-    fn case_group(&mut self) -> PResult<(Vec<String>, Option<String>)> {
-        let mut alts = Vec::new();
-        loop {
-            match self.next()? {
-                Tok::Word(w) => alts.push(w),
-                Tok::Op("|") => {}
-                Tok::Op(")") => break,
-                Tok::Eof => return Err(self.eof_error("`)'")),
-                t => return Err(self.unexpected(&t)),
-            }
-        }
-        let zsh_group = match self.peek()? {
-            Tok::Op(")") | Tok::Op("|") => true,
-            Tok::Word(w) => w.starts_with(['*', '?', '[']),
-            _ => false,
-        };
-        if !zsh_group {
-            return Ok((alts, None));
-        }
-        let mut pat = format!("({})", alts.join("|"));
-        if let Tok::Word(w) = self.peek()?.clone() {
-            self.next()?;
-            pat.push_str(&w);
-        }
-        Ok((Vec::new(), Some(pat)))
     }
 
     // [[ expr ]]: operands and operators are kept as raw words and
@@ -1457,7 +1477,7 @@ fn tok_text(t: &Tok) -> String {
         Tok::IoVar(v) => format!("{{{}}}", v),
         Tok::Op(o) => o.to_string(),
         Tok::Arith(e) => format!("(({}))", e),
-        Tok::Newline => "newline".to_string(),
+        Tok::Newline => "\\n".to_string(),
         Tok::Eof => "end of file".to_string(),
     }
 }
@@ -1646,6 +1666,41 @@ mod tests {
             Node::Simple(c) => assert_eq!(c.redirs.len(), 2),
             n => panic!("{:?}", n),
         }
+    }
+
+    #[test]
+    fn case_patterns_read_as_zsh_reads_them() {
+        let pats = |src: &str| match parse_one(src) {
+            Node::Case { items, .. } => items.into_iter().map(|i| i.patterns).collect::<Vec<_>>(),
+            n => panic!("{:?}", n),
+        };
+        // Blanks and `|` inside a group belong to the pattern.
+        assert_eq!(
+            pats("case x in ( no | (grumph) ) :;; esac"),
+            [vec!["no", "(grumph)"]]
+        );
+        assert_eq!(
+            pats("case x in (*with sep*)) :;; esac"),
+            [vec!["(*with sep*)"]]
+        );
+        assert_eq!(
+            pats("case x in (*with sep*) :;; esac"),
+            [vec!["*with sep*"]]
+        );
+        assert_eq!(
+            pats("case x in ([a-m])(|[n-z])rr) :;; esac"),
+            [vec!["([a-m])(|[n-z])rr"]]
+        );
+        // Empty alternatives match the empty string.
+        assert_eq!(
+            pats("case x in ||jurgle) :;; esac"),
+            [vec!["", "", "jurgle"]]
+        );
+        // Quoted `)` and `|` don't end or split a pattern.
+        assert_eq!(
+            pats("case x in 'a)'|\"b|c\") :;; esac"),
+            [vec!["'a)'", "\"b|c\""]]
+        );
     }
 
     #[test]

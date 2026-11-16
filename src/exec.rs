@@ -529,7 +529,11 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
             match target.parse::<i32>() {
                 Ok(n) if n >= 0 => {
                     if unsafe { libc::fcntl(n, libc::F_GETFD) } < 0 {
-                        return Err(Some(format!("{}: {}", n, strerror(libc::EBADF))));
+                        return Err(Some(format!(
+                            "{}: {}",
+                            n,
+                            strerror(libc::EBADF).to_lowercase()
+                        )));
                     }
                     Ok(Target::Dup(n))
                 }
@@ -664,10 +668,20 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
             continue;
         }
         let fd = r.fd;
+        // `>&n` must name a descriptor open before this command, so it is
+        // looked up before saving: a saved copy may take that number.
+        let dup = matches!(r.op, RedirOp::DupIn | RedirOp::DupOut);
+        let early =
+            dup.then(|| match open_redir(r) {
+                Ok(Target::Dup(n)) if saved.iter().any(|&(_, copy)| copy == n) => Err(Some(
+                    format!("{}: {}", n, strerror(libc::EBADF).to_lowercase()),
+                )),
+                t => t,
+            });
         if save && !saved.iter().any(|&(f, _)| f == fd) {
             saved.push((fd, dup_high(fd)));
         }
-        let target = match open_redir(r) {
+        let target = match early.unwrap_or_else(|| open_redir(r)) {
             Ok(t) => t,
             Err(msg) => {
                 if let Some(m) = msg {
@@ -745,6 +759,9 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
             Target::Dup(src) => src == fd || unsafe { libc::dup2(src, fd) } >= 0,
             Target::Close => {
                 close(fd);
+                if save && fd == 1 {
+                    STDOUT_CLOSED_FOR_CMD.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 true
             }
         };
@@ -838,22 +855,45 @@ fn redir_to_var(r: &Redir, var: &str) -> Result<(), RedirError> {
         s.param(var)
             .is_some_and(|p| p.attrs & crate::params::READONLY != 0)
     });
+    let closing = matches!(r.op, RedirOp::DupIn | RedirOp::DupOut) && r.target == "-";
     if readonly {
-        shell_err(&format!(
-            "can't close file descriptor from readonly parameter {}",
-            var
-        ));
+        shell_err(&if closing {
+            format!(
+                "can't close file descriptor from readonly parameter {}",
+                var
+            )
+        } else {
+            format!(
+                "can't allocate file descriptor to readonly parameter {}",
+                var
+            )
+        });
         return Err(RedirError);
     }
-    let closing = matches!(r.op, RedirOp::DupIn | RedirOp::DupOut) && r.target == "-";
+    let held = var_get(var).trim().parse::<i32>().ok();
+    let is_open = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
     if closing {
-        let fd = var_get(var).trim().parse::<i32>().unwrap_or(-1);
-        if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
-            shell_err(&format!("{}: bad file descriptor", fd));
+        let fd = held.unwrap_or(-1);
+        if fd < 0 || !is_open(fd) {
+            shell_err(&format!(
+                "failed to close file descriptor {}: bad file descriptor",
+                fd
+            ));
             return Err(RedirError);
         }
         close(fd);
         return Ok(());
+    }
+    // NO_CLOBBER: a parameter already holding an open descriptor is not
+    // overwritten (any other value is).
+    if let Some(fd) = held.filter(|&fd| fd >= 0 && is_open(fd)) {
+        if !crate::options::is_set("clobber") {
+            shell_err(&format!(
+                "can't clobber parameter {} containing file descriptor {}",
+                var, fd
+            ));
+            return Err(RedirError);
+        }
     }
     let src = match open_redir(r) {
         Ok(Target::Opened(fd)) | Ok(Target::Both(fd)) => (fd, true),
@@ -879,12 +919,20 @@ fn redir_to_var(r: &Redir, var: &str) -> Result<(), RedirError> {
     Ok(())
 }
 
+/// Set while standard output is closed by the running command's own
+/// `>&-`: writing to it is then not an error (zsh's `print foo >&-`).
+pub static STDOUT_CLOSED_FOR_CMD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn restore_redirs(saved: SavedFds) {
     let mut workers = Vec::new();
     for (fd, copy) in saved.into_iter().rev() {
         if fd == -2 {
             workers.push(copy);
             continue;
+        }
+        if fd == 1 {
+            STDOUT_CLOSED_FOR_CMD.store(false, std::sync::atomic::Ordering::Relaxed);
         }
         if copy >= 0 {
             unsafe {
@@ -1351,6 +1399,19 @@ fn xtrace_line(text: &str) {
 // `local`, `export`, ...) arguments that are assignments expand like
 // assignment values, without splitting or globbing, and the command
 // also gets them as typed arguments, including array values.
+// The index of the word that holds `exec -a`'s name: the word after
+// `-a` (or `-ca`), or `-aNAME` itself.
+fn exec_argv0_index(raw: &[String]) -> Option<usize> {
+    for (i, w) in raw.iter().enumerate().skip(1) {
+        let letters = w.strip_prefix('-').filter(|l| !l.is_empty() && *l != "-")?;
+        if let Some(p) = letters.find('a') {
+            let k = if p + 1 < letters.len() { i } else { i + 1 };
+            return (k < raw.len()).then_some(k);
+        }
+    }
+    None
+}
+
 fn expand_command_words(
     raw: &[String],
     arrays: &[(usize, Vec<String>)],
@@ -1358,6 +1419,18 @@ fn expand_command_words(
     let Some(first) = raw.first() else {
         return Ok((Vec::new(), None));
     };
+    // zsh reads `exec`'s options before filename generation, so the
+    // name after `-a` is not globbed.
+    if let Some(k) = (first == "exec").then(|| exec_argv0_index(raw)).flatten() {
+        let mut out = expand_words(&raw[..k])?;
+        let glob = crate::options::is_set("glob");
+        crate::options::set("glob", false);
+        let name = expand_words(&raw[k..=k]);
+        crate::options::set("glob", glob);
+        out.extend(name?);
+        out.extend(expand_words(&raw[k + 1..])?);
+        return Ok((out, None));
+    }
     if !crate::parser::is_decl_word(first) {
         return Ok((expand_words(raw)?, None));
     }
@@ -1483,7 +1556,10 @@ fn exec_node_inner(node: &Node) -> i32 {
                     crate::shell::var_set("TRY_BLOCK_ERROR", "-1", false);
                 }
             });
-            if flow() == Flow::None {
+            // A `return` in the cleanup doesn't replace the try block's
+            // own break, continue or return: its status is ignored.
+            if flow() == Flow::None || (pending != Flow::None && matches!(flow(), Flow::Return(_)))
+            {
                 set_flow(pending);
             }
             st
@@ -1878,11 +1954,17 @@ fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
             return 1;
         }
         if !crate::options::is_set("shnullcmd") {
+            // Without NULLCMD there is nothing to run, even for a read
+            // that READNULLCMD would serve.
+            let Some(null) = var_get_opt("NULLCMD") else {
+                shell_err("redirection with no command");
+                return 1;
+            };
             let reading = cmd.redirs.len() == 1 && cmd.redirs[0].op == RedirOp::Read;
             let name = if reading {
-                var_get_opt("READNULLCMD").unwrap_or_else(|| "more".to_string())
+                var_get_opt("READNULLCMD").unwrap_or(null)
             } else {
-                var_get_opt("NULLCMD").unwrap_or_else(|| "cat".to_string())
+                null
             };
             if !name.is_empty() {
                 return run_command(vec![name], None, &[], &cmd.redirs, in_child, dash);
@@ -2015,7 +2097,7 @@ fn run_command(
     if crate::builtins::is_special_builtin(&name) && !via_command {
         for a in assigns {
             if let Err(st) = apply_assign(a, false) {
-                if !interactive() {
+                if !interactive() && !crate::options::is_set("continueonerror") {
                     set_error_exit(st);
                 }
                 return st;
@@ -2023,7 +2105,14 @@ fn run_command(
         }
         let saved = match apply_redirs(redirs, true) {
             Ok(s) => s,
-            Err(RedirError) => return 1,
+            // POSIX_BUILTINS: a special builtin's failed redirection ends
+            // a script.
+            Err(RedirError) => {
+                if !interactive() && crate::options::is_set("posixbuiltins") {
+                    set_error_exit(1);
+                }
+                return 1;
+            }
         };
         let st = run_builtin(&name, &words, &decl);
         restore_redirs(saved);
@@ -2181,15 +2270,20 @@ fn exec_builtin(args: &[String], assigns: &[Expanded], redirs: &[Redir]) -> i32 
     }
     let args = &args[i.min(args.len())..];
     if args.is_empty() {
-        for a in assigns {
-            if let Err(st) = apply_assign(a, false) {
-                return st;
+        // Without POSIX_BUILTINS, `x=v exec >file` keeps x as it was, and
+        // a failed redirection doesn't end the script.
+        let posix = crate::options::is_set("posixbuiltins");
+        if posix {
+            for a in assigns {
+                if let Err(st) = apply_assign(a, false) {
+                    return st;
+                }
             }
         }
         return match apply_redirs(redirs, false) {
             Ok(_) => 0,
             Err(RedirError) => {
-                if !interactive() {
+                if !interactive() && posix {
                     set_error_exit(1);
                 }
                 1
@@ -3386,7 +3480,15 @@ fn run_parsed(src: &str) -> i32 {
                 };
                 crate::shell::with_err_ctx(|e| e.lineno = line);
                 shell_err(&msg);
-                status = parse_error_status();
+                // zsh's `.` gives 126 for a file it can't parse.
+                let sourced = crate::shell::EVAL_CONTEXT
+                    .lock()
+                    .is_ok_and(|c| c.last() == Some(&"file"));
+                status = if sourced && !sh_emulation() {
+                    126
+                } else {
+                    parse_error_status()
+                };
                 with_shell(|s| s.last_status = status);
                 break;
             }

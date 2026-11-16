@@ -78,6 +78,10 @@ pub fn shell_init() {
     set_default(&mut shell, "HISTSIZE", "1000".to_string(), 0);
     set_default(&mut shell, "SAVEHIST", "1000".to_string(), 0);
     set_default(&mut shell, "PS4", "+ ".to_string(), 0);
+    // What a redirection with no command runs; unsetting NULLCMD makes
+    // that an error.
+    set_default(&mut shell, "NULLCMD", "cat".to_string(), 0);
+    set_default(&mut shell, "READNULLCMD", "more".to_string(), 0);
     // zsh frameworks such as oh-my-zsh refuse to load without
     // ZSH_VERSION. The suffix keeps per-version files (for example
     // ~/.zcompdump-host-$ZSH_VERSION) apart from real zsh's.
@@ -2164,6 +2168,8 @@ pub struct ErrCtx {
     // The script, or the shell's name for `-c` and standard input.
     pub name: String,
     pub interactive: bool,
+    // Commands come from standard input (SHIN_STDIN).
+    pub stdin: bool,
     // Inside an eval with NO_EVAL_LINENO: line numbers stay the caller's.
     pub frozen: usize,
 }
@@ -2173,6 +2179,7 @@ static ERR_CTX: std::sync::Mutex<ErrCtx> = std::sync::Mutex::new(ErrCtx {
     lineno: 0,
     name: String::new(),
     interactive: false,
+    stdin: false,
     frozen: 0,
 });
 
@@ -2186,8 +2193,11 @@ pub fn with_err_ctx<R>(f: impl FnOnce(&mut ErrCtx) -> R) -> R {
 /// file or script running. Interactive commands typed at the prompt get
 /// just `name: ` / `builtin: `.
 pub fn err_prefix(builtin: Option<&str>) -> String {
+    // Commands read from standard input are reported as typed ones are,
+    // without a line number. (No option lookup here: callers may hold the
+    // shell lock.)
     with_err_ctx(|e| {
-        if e.interactive && e.stack.is_empty() {
+        if (e.interactive || e.stdin) && e.stack.is_empty() {
             return match builtin {
                 Some(b) => format!("{}: ", b),
                 None => format!("{}: ", e.name),

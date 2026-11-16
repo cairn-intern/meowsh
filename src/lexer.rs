@@ -542,6 +542,108 @@ impl Lexer {
         Some(word)
     }
 
+    /// The next input character.
+    pub fn next_char(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    /// Whether the input continues with `text` after blanks.
+    pub fn next_after_blanks_is(&self, text: &str) -> bool {
+        let mut i = self.pos;
+        while matches!(self.chars.get(i), Some(' ' | '\t')) {
+            i += 1;
+        }
+        text.chars()
+            .enumerate()
+            .all(|(k, c)| self.chars.get(i + k) == Some(&c))
+    }
+
+    /// Moves back to the start of the token last read, so it can be read
+    /// again another way.
+    pub fn unread_token(&mut self) {
+        self.pos = self.tok_start;
+    }
+
+    /// Reads a case item's patterns up to the `)` that ends them, as zsh's
+    /// lexer does in a case pattern: parentheses nest, so `|` and blanks
+    /// inside a group belong to the pattern, and the alternatives are the
+    /// parts between top-level `|`, blanks around them dropped. A leading
+    /// `(` is POSIX's optional one when a blank follows its `)`, otherwise
+    /// it starts a group (`(a|b)*)`).
+    pub fn case_patterns(&mut self) -> Result<Vec<String>, LexError> {
+        let c = &self.chars;
+        let mut i = self.pos;
+        while c.get(i).is_some_and(|&ch| ch == ' ' || ch == '\t') {
+            i += 1;
+        }
+        // The index of the `)` that brings the depth below zero, from `i`.
+        let close = |mut j: usize| -> Option<usize> {
+            let mut depth = 0usize;
+            while j < c.len() {
+                match c[j] {
+                    '\\' => j += 1,
+                    '\'' => j = scan_squote(c, j)? - 1,
+                    '"' => j = scan_dquote(c, j)? - 1,
+                    '`' => j = scan_bquote(c, j)? - 1,
+                    '$' if c.get(j + 1) == Some(&'\'') => j = scan_dollar_squote(c, j + 1)? - 1,
+                    '$' if c.get(j + 1) == Some(&'{') => j = scan_brace(c, j + 1, false)? - 1,
+                    '(' => depth += 1,
+                    ')' if depth == 0 => return Some(j),
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        };
+        let (start, end) = match c.get(i) {
+            Some('(') => {
+                let Some(j) = close(i + 1) else {
+                    return Err(self.incomplete("unmatched ("));
+                };
+                if c.get(j + 1).is_none_or(|ch| ch.is_whitespace()) {
+                    (i + 1, j)
+                } else {
+                    match close(i) {
+                        Some(k) => (i, k),
+                        None => return Err(self.incomplete("unmatched (")),
+                    }
+                }
+            }
+            _ => match close(i) {
+                Some(k) => (i, k),
+                None => return Err(self.incomplete("unmatched (")),
+            },
+        };
+        // Split at the top-level `|`s.
+        let mut alts = Vec::new();
+        let mut from = start;
+        let mut j = start;
+        let mut depth = 0usize;
+        while j < end {
+            match c[j] {
+                '\\' => j += 1,
+                '\'' => j = scan_squote(c, j).map_or(end, |e| e - 1),
+                '"' => j = scan_dquote(c, j).map_or(end, |e| e - 1),
+                '`' => j = scan_bquote(c, j).map_or(end, |e| e - 1),
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                '|' if depth == 0 => {
+                    alts.push(c[from..j].iter().collect::<String>());
+                    from = j + 1;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        alts.push(c[from..end].iter().collect::<String>());
+        self.pos = end + 1;
+        Ok(alts
+            .into_iter()
+            .map(|a| a.trim_matches([' ', '\t', '\n']).to_string())
+            .collect())
+    }
+
     pub fn set_pos(&mut self, pos: usize) {
         self.pos = pos.min(self.chars.len());
     }
@@ -608,10 +710,14 @@ impl Lexer {
                     if !self.final_input {
                         return Err(LexError::Incomplete);
                     }
-                    eprintln!(
-                        "meowsh: warning: here-document delimited by end-of-file (wanted `{}')",
-                        hd.delim
-                    );
+                    // zsh takes the end of input as the end silently; the
+                    // warning is bash's, for sh emulation.
+                    if crate::exec::sh_emulation_pub() {
+                        eprintln!(
+                            "meowsh: warning: here-document delimited by end-of-file (wanted `{}')",
+                            hd.delim
+                        );
+                    }
                     break;
                 }
                 let start = self.pos;
@@ -815,9 +921,14 @@ impl Lexer {
                 // zsh: `(` inside a word continues it, as in the glob
                 // qualifier `*(N)` or the pattern `x_(a|b)_*`. Not after
                 // `name=` (array value) and not `name()` (function).
+                // SH_GLOB: parentheses aren't glob syntax, so `(` ends the
+                // word (`while(cmd)`), except in a KSH_GLOB `!(pat)`.
                 '(' if !out.is_empty()
                     && !is_assign_prefix(&out)
-                    && self.chars.get(self.pos + 1) != Some(&')') =>
+                    && self.chars.get(self.pos + 1) != Some(&')')
+                    && (!crate::options::is_set("shglob")
+                        || (crate::options::is_set("kshglob")
+                            && out.ends_with(['@', '*', '+', '?', '!']))) =>
                 {
                     let end = scan_paren(&self.chars, self.pos).ok_or_else(|| {
                         self.incomplete("unexpected end of file while looking for matching `)'")

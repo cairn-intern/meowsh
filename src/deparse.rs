@@ -281,11 +281,13 @@ impl Deparser {
                 self.indent += 1;
                 for item in items {
                     self.newline();
-                    self.push(&format!("({}) ", item.patterns.join("|")));
+                    // zsh's spacing: ` | ` between patterns, and a blank
+                    // before the terminator even with no commands.
+                    self.push(&format!("({}) ", item.patterns.join(" | ")));
                     if let Some(b) = &item.body {
                         self.inline_list(b);
-                        self.push(" ");
                     }
+                    self.push(" ");
                     self.push(if item.fallthrough {
                         ";&"
                     } else if item.cont {

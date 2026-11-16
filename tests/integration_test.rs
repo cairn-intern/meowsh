@@ -197,7 +197,7 @@ fn test_redirection_restores_originally_closed_fd() {
     let (status, stdout, stderr) = run_script(&script);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "status=1");
-    assert!(stderr.contains("Bad file descriptor"));
+    assert!(stderr.contains("99: bad file descriptor"), "{}", stderr);
     assert_eq!(fs::read_to_string(out_path).unwrap(), "");
 }
 
@@ -1076,4 +1076,300 @@ fn zpty_master_is_not_inherited_by_later_commands() {
         run_script("zpty z cat; ls -l /proc/self/fd | grep -c ptmx; zpty -d z");
     assert_eq!(status, 0, "{}", stderr);
     assert_eq!(stdout.trim(), "0");
+}
+
+#[test]
+fn semicolon_after_pipe_and_andor_is_a_line_break() {
+    let (status, stdout, stderr) =
+        run_script("echo pipe | ; tr a-z A-Z\ntrue && ; echo and\nfalse || ; echo or");
+    assert_eq!(status, 0, "{}", stderr);
+    assert_eq!(stdout, "PIPE\nand\nor\n");
+}
+
+#[test]
+fn empty_subshell_before_a_separator() {
+    let (status, stdout, stderr) =
+        run_script("{ ( ) } always { echo foo }; ( ) && echo and; () { echo anon $1 } x");
+    assert_eq!(status, 0, "{}", stderr);
+    assert_eq!(stdout, "foo\nand\nanon x\n");
+}
+
+#[test]
+fn return_in_always_block_keeps_the_try_blocks_status() {
+    let (_, stdout, _) = run_script("() { { return 2 } always { return 3 } }; echo $?");
+    assert_eq!(stdout, "2\n");
+}
+
+#[test]
+fn bang_alone_in_braces_negates_an_empty_command() {
+    let (status, stdout, stderr) = run_script("fn() { ! {!} && ! (!) || ! {!} }; fn; echo $?");
+    assert_eq!(status, 0);
+    assert_eq!(stdout, "0\n");
+    assert!(stderr.is_empty(), "{}", stderr);
+}
+
+#[test]
+fn exec_a_name_is_not_globbed() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("foobar"), "").unwrap();
+    let exe = env!("CARGO_BIN_EXE_meowsh");
+    let (_, stdout, stderr) = run_script(&format!(
+        "cd {}; (exec -a foo* {} -fc 'print -r -- $0')",
+        dir.path().display(),
+        exe
+    ));
+    assert_eq!(stdout, "foo*\n", "{}", stderr);
+}
+
+#[test]
+fn case_patterns_with_groups_blanks_and_empty_alternatives() {
+    let (status, stdout, stderr) = run_script(
+        "case grumph in ( no | (grumph) ) echo 1;; esac
+case horrible in ([a-m])(|[n-z])rr(|ib(um|le|ah))) echo 2;; esac
+case 'a b c' in (*b c)) echo 3;; esac
+case '' in burble) echo no;; spurble|) echo 4;; esac",
+    );
+    assert_eq!(status, 0, "{}", stderr);
+    assert_eq!(stdout, "1\n2\n3\n4\n");
+}
+
+#[test]
+fn sourcing_a_file_that_does_not_parse_gives_126() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("bad"), "[[\n").unwrap();
+    let (_, stdout, stderr) = run_script(&format!("cd {}; . ./bad; echo $?", dir.path().display()));
+    assert_eq!(stdout, "126\n");
+    assert!(
+        stderr.contains("./bad:2: parse error near `\\n'"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn sh_glob_makes_parentheses_end_words() {
+    let (status, stdout, stderr) = run_script(
+        "setopt shglob; eval 'if !(echo a); then echo no; fi; print -l x | while(read l)do(print got it)done'",
+    );
+    assert_eq!(status, 0, "{}", stderr);
+    assert_eq!(stdout, "a\ngot it\n");
+}
+
+#[test]
+fn path_script_finds_the_script_in_path() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("myscript"), "echo found it\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args(["-f", "-o", "pathscript", "myscript"])
+        .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "found it\n");
+}
+
+#[test]
+fn errors_on_standard_input_have_no_line_number() {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .arg("-f")
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"nosuchcmd_x\nset -- a; shift 2\necho 'open\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("meowsh: command not found: nosuchcmd_x\n"),
+        "{}",
+        err
+    );
+    assert!(
+        err.contains("shift: shift count must be <= $#\n"),
+        "{}",
+        err
+    );
+    assert!(err.contains("meowsh: unmatched '\n"), "{}", err);
+}
+
+#[test]
+fn reserved_words_and_tokens_can_be_aliases() {
+    let (_, stdout, stderr) = run_script(
+        "alias '!=echo bang'; eval '! true'
+alias -g '&&=(){ return $?; } && '
+eval 'echo one
+&& echo two'",
+    );
+    assert_eq!(stdout, "bang true\none\ntwo\n", "{}", stderr);
+    // POSIX_ALIASES keeps reserved words from expanding.
+    let (status, stdout, _) = run_script("alias '!=echo bang'; setopt posixaliases; eval '! true'");
+    assert_eq!((status, stdout.as_str()), (1, ""));
+}
+
+#[test]
+fn alias_text_is_inserted_without_an_extra_space() {
+    // A global alias opening a quote closed by the input keeps its spacing.
+    let (_, stdout, _) = run_script("alias -g S='\"'; eval 'echo S a string S \"'");
+    assert_eq!(stdout, " a string S \n");
+    // Split from `{end`, the alias text stays a separate word.
+    let (_, stdout, _) = run_script("alias '{=echo'; eval '{end'");
+    assert_eq!(stdout, "end\n");
+}
+
+#[test]
+fn defining_a_function_through_an_alias_needs_alias_func_def() {
+    let (status, _, stderr) = run_script("alias b2=x; alias b1=b2; eval 'b1() { :; }'");
+    assert_eq!(status, 1);
+    assert!(
+        stderr.contains("defining function based on alias `b1'"),
+        "{}",
+        stderr
+    );
+    let (_, stdout, _) = run_script(
+        "alias good=isafunc; setopt aliasfuncdef; eval 'good() { echo works; }'; isafunc",
+    );
+    assert_eq!(stdout, "works\n");
+}
+
+#[test]
+fn alias_listing_skips_names_with_equals() {
+    let (_, stdout, stderr) = run_script("aliases[x=y]=z; alias -L | grep -c x=y");
+    assert_eq!(stdout, "0\n");
+    assert!(
+        stderr.contains("invalid alias 'x=y' encountered while printing aliases"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn fc_counts_back_from_the_event_before_itself() {
+    use std::io::Write;
+    let home = TempDir::new().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args(["-fis"])
+        .env("HOME", home.path())
+        .env("PS1", "")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"echo a\necho b\nfc -l -2\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.ends_with("    1  echo a\n    2  echo b\n"),
+        "{}",
+        stdout
+    );
+}
+
+#[test]
+fn dollar_quote_meta_control_and_posix_strings() {
+    let (_, stdout, _) = run_script(
+        "c=$'\\M-\\\\'; print $(( [#16] #c )); c=$'\\C-a'; print $(( #c ))
+s=$'b\\0c'; print ${#s}; setopt posixstrings; s=$'b\\0c'; print ${#s}",
+    );
+    assert_eq!(stdout, "16#DC\n1\n3\n1\n");
+}
+
+#[test]
+fn null_redirection_needs_nullcmd() {
+    let (status, stdout, stderr) =
+        run_script("print in >o$$; unset NULLCMD; READNULLCMD=cat; <o$$; st=$?; rm o$$; exit $st");
+    assert_eq!(status, 1);
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("redirection with no command"), "{}", stderr);
+}
+
+#[test]
+fn read_from_a_closed_descriptor_fails_with_1() {
+    let (_, stdout, _) = run_script("read foo <&-; echo $?");
+    assert_eq!(stdout, "1\n");
+}
+
+#[test]
+fn brace_fd_redirections_report_like_zsh() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path().display();
+    let (_, _, stderr) = run_script(&format!(
+        "cd {d}; exec {{v}}>a; exec {{v}}>&-; exec {{v}}>&-; typeset -r r; : {{r}}>b"
+    ));
+    assert!(
+        stderr.contains("failed to close file descriptor"),
+        "{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("can't allocate file descriptor to readonly parameter r"),
+        "{}",
+        stderr
+    );
+    let (status, _, stderr) = run_script(&format!(
+        "cd {d}; setopt noclobber; exec {{v}}>c; exec {{v}}>e"
+    ));
+    assert_eq!(status, 1);
+    assert!(
+        stderr.contains("can't clobber parameter v containing file descriptor"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn dup_to_a_closed_descriptor_fails_even_when_its_number_is_reused() {
+    // Saving stdout for the builtin takes the lowest free descriptor from
+    // 10, which used to make `>&10` look open.
+    let (_, stdout, stderr) = run_script("x=10; print gone >&$x; echo $?");
+    assert_eq!(stdout, "1\n");
+    assert!(stderr.contains("10: bad file descriptor"), "{}", stderr);
+}
+
+#[test]
+fn exec_redirection_failures_follow_posix_builtins() {
+    let (status, stdout, _) = run_script("exec >/nonexistent/x; echo output");
+    assert_eq!((status, stdout.as_str()), (0, "output\n"));
+    // A script (not an interactive shell) ends there under POSIX_BUILTINS.
+    let out = Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args([
+            "-fc",
+            "setopt posixbuiltins; set >/nonexistent/x; echo output",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    // Assignments before a bare exec stay temporary without it.
+    let (_, stdout, _) = run_script("x=43; x=44 exec 2>&2; echo $x");
+    assert_eq!(stdout, "43\n");
+}
+
+#[test]
+fn writing_to_a_stdout_closed_by_exec_is_reported() {
+    let (_, _, stderr) = run_script("print quiet >&-");
+    assert!(!stderr.contains("write error"), "{}", stderr);
+    let (_, _, stderr) = run_script("(exec >&-; print loud)");
+    assert!(
+        stderr.contains("write error: bad file descriptor"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn unterminated_here_document_is_silent_in_zsh_mode() {
+    let (_, stdout, stderr) = run_script("eval 'cat <<EOF\nbody'");
+    assert_eq!(stdout, "body\n");
+    assert!(!stderr.contains("here-document"), "{}", stderr);
 }

@@ -406,8 +406,15 @@ fn print_main(name: &str, ops: &Ops, mut args: Vec<String>, printf: bool) -> i32
     }
     match crate::sys::write_fd(fd, out.as_bytes()) {
         Ok(()) => ret,
-        // A closed standard output (`>&-`) is not an error, as in zsh.
-        Err(e) if fd == 1 && e.raw_os_error() == Some(libc::EBADF) => ret,
+        Err(e) if fd == 1 && e.raw_os_error() == Some(libc::EBADF) => {
+            // Closed for this command alone (`print foo >&-`) it is not
+            // worth a word, as in zsh; closed for good (`exec >&-`) zsh
+            // reports it but keeps the status.
+            if !crate::exec::STDOUT_CLOSED_FOR_CMD.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::shell::shell_err("write error: bad file descriptor");
+            }
+            ret
+        }
         Err(e) => {
             builtin_err(name, &format!("write error: {}", e));
             1

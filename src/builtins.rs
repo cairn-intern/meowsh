@@ -1521,7 +1521,10 @@ fn builtin_read(words: &[String]) -> i32 {
                     escaped.push(false);
                 }
                 Ok(None) => break,
-                Err(_) => return 128 + libc::SIGINT,
+                // Only an interrupt counts as one; a closed or unreadable
+                // descriptor is a plain failure.
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => return 128 + libc::SIGINT,
+                Err(_) => return 1,
             }
         }
     }
@@ -2310,6 +2313,18 @@ fn builtin_alias(words: &[String]) -> i32 {
         let text: String = all
             .iter()
             .filter(|(k, _)| args.is_empty() || args.iter().any(|p| crate::pattern::matches(p, k)))
+            .filter(|(k, _)| {
+                // `alias -L` output is read back as commands, which a name
+                // containing `=` would not survive.
+                let bad = list_cmd && k.contains('=');
+                if bad {
+                    crate::shell::shell_err(&format!(
+                        "invalid alias '{}' encountered while printing aliases",
+                        k
+                    ));
+                }
+                !bad
+            })
             .map(|(k, v)| show(k, v))
             .collect();
         out(&text);
@@ -4160,7 +4175,12 @@ fn builtin_fc(words: &[String]) -> i32 {
     if !list {
         return 0;
     }
-    let lines = with_shell(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    let mut lines = with_shell(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    // An interactive shell has already added the line running now; it is
+    // the current event, and -1 is the one before it.
+    if crate::shell::with_err_ctx(|e| e.interactive) {
+        lines.pop();
+    }
     let n = lines.len() as i64;
     let pos = |spec: &str, default: i64| -> i64 {
         match spec.parse::<i64>() {

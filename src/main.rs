@@ -205,9 +205,11 @@ fn main() {
             });
         }
         let name = s.script_name.clone();
+        let stdin = args.command.is_none() && args.script.is_none();
         meowsh::shell::with_err_ctx(|e| {
             e.name = name;
             e.interactive = interactive;
+            e.stdin = stdin;
         });
         options::set_in(s, "login", args.login);
         options::set_in(
@@ -229,7 +231,21 @@ fn main() {
     let status = if let Some(cmd) = &args.command {
         run_string(cmd)
     } else if let Some(path) = &args.script {
-        match open_script(path) {
+        // PATH_SCRIPT: a script name without a slash not found here is
+        // looked for in $PATH.
+        let opened = open_script(path).or_else(|e| {
+            if e != libc::ENOENT || path.contains('/') || !options::is_set("pathscript") {
+                return Err(e);
+            }
+            meowsh::shell::var_get_opt("PATH")
+                .unwrap_or_default()
+                .split(':')
+                .filter(|d| !d.is_empty())
+                .map(|d| format!("{}/{}", d, path))
+                .find(|p| std::path::Path::new(p).is_file())
+                .map_or(Err(e), |p| open_script(&p))
+        });
+        match opened {
             Ok(fd) => run_fd(fd, false),
             Err(e) => {
                 // zsh's wording, naming the shell as it was invoked.

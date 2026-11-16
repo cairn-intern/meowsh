@@ -279,8 +279,9 @@ fn zparseopts_and_fc() {
          echo \"c=$clear t=${stamp[*]} o=${opts[*]} rest=$*\"; }; f -c -t fmt x -P y",
     );
     assert_eq!(out, "c=-c t=-t fmt o=-P rest=x y\n");
+    // The running fc is the current event, not listed (as zsh does).
     let (_, out) = interactive("", "echo a\nfc -ln -2\n");
-    assert_eq!(out, "a\necho a\nfc -ln -2\n");
+    assert_eq!(out, "a\necho a\n");
 }
 
 #[test]

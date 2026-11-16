@@ -717,7 +717,7 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
         }
         '\'' if mode == Mode::Unquoted => {
             let (ie, end) = bounds(scan_dollar_squote(chars, i + 1), n);
-            let s = ansi_c(&chars[i + 2..ie.max(i + 2)]);
+            let s = dollar_squote_text(&chars[i + 2..ie.max(i + 2)]);
             for c in s.chars() {
                 ctx.push(c, Q);
             }
@@ -2478,7 +2478,9 @@ fn unquote(s: &str) -> String {
             }
             '$' if chars.get(i + 1) == Some(&'\'') => {
                 let end = scan_dollar_squote(&chars, i + 1).unwrap_or(chars.len() + 1);
-                out.push_str(&ansi_c(&chars[i + 2..(end - 1).min(chars.len())]));
+                out.push_str(&dollar_squote_text(
+                    &chars[i + 2..(end - 1).min(chars.len())],
+                ));
                 i = end;
             }
             '"' => {
@@ -4219,7 +4221,27 @@ fn ansi_c(chars: &[char]) -> String {
         let s: String = chars[start..*i].iter().collect();
         u32::from_str_radix(&s, radix).ok()
     };
+    // `\M-x` sets the top bit of the next character, `\C-x` makes it a
+    // control character; the next character may be an escape itself.
+    let (mut meta, mut ctrl) = (false, false);
+    let mut mark = 0;
+    let modify = |out: &mut String, meta: &mut bool, ctrl: &mut bool, mark: usize| {
+        if (*meta || *ctrl) && out.chars().count() > mark {
+            let mut v = out.pop().unwrap_or_default() as u32;
+            if *ctrl {
+                v = if v == u32::from(b'?') { 0x7f } else { v & 0x1f };
+            }
+            if *meta {
+                v |= 0x80;
+            }
+            out.push(char::from_u32(v).unwrap_or('?'));
+            *meta = false;
+            *ctrl = false;
+        }
+    };
     while i < n {
+        modify(&mut out, &mut meta, &mut ctrl, mark);
+        mark = out.chars().count();
         if chars[i] != '\\' || i + 1 >= n {
             out.push(chars[i]);
             i += 1;
@@ -4229,6 +4251,17 @@ fn ansi_c(chars: &[char]) -> String {
         let c = chars[i];
         i += 1;
         match c {
+            'M' | 'C' => {
+                if chars.get(i) == Some(&'-') {
+                    i += 1;
+                }
+                if c == 'M' {
+                    meta = true;
+                } else {
+                    ctrl = true;
+                }
+                continue;
+            }
             'n' => out.push('\n'),
             't' => out.push('\t'),
             'r' => out.push('\r'),
@@ -4268,7 +4301,19 @@ fn ansi_c(chars: &[char]) -> String {
             }
         }
     }
+    modify(&mut out, &mut meta, &mut ctrl, mark);
     out
+}
+
+// `$'...'`: with POSIX_STRINGS a null character ends the string.
+fn dollar_squote_text(chars: &[char]) -> String {
+    let mut s = ansi_c(chars);
+    if crate::options::is_set("posixstrings") {
+        if let Some(k) = s.find('\0') {
+            s.truncate(k);
+        }
+    }
+    s
 }
 
 /// Decodes backslash escapes the way `$'...'` does (used by `echo -e`).
