@@ -31,6 +31,12 @@ struct Menu {
 
 static MENU: Mutex<Option<Menu>> = Mutex::new(None);
 
+// Up/Down on an empty line step through history one entry at a time
+// (the editor's prefix search finds nothing for an empty prefix). Holds
+// the line such a step left, so the next Up or Down keeps stepping; a
+// pending step records the line it lands on.
+static BROWSE: Mutex<(Option<String>, bool)> = Mutex::new((None, false));
+
 /// A key the menu handles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
@@ -58,10 +64,42 @@ pub fn reset() {
     if let Ok(mut m) = MENU.lock() {
         *m = None;
     }
+    if let Ok(mut b) = BROWSE.lock() {
+        *b = (None, false);
+    }
+}
+
+// Up/Down outside the menu: oh-my-zsh's up-line-or-beginning-search,
+// which searches history for lines starting with what is typed, or steps
+// to the previous or next line when nothing is.
+fn history_key(up: bool, line: &str, pos: usize) -> Cmd {
+    let Ok(mut b) = BROWSE.lock() else {
+        return Cmd::Noop;
+    };
+    let stepping = b.0.as_deref() == Some(line);
+    if line.get(..pos).is_some_and(str::is_empty) || stepping {
+        b.1 = true;
+        return if up {
+            Cmd::PreviousHistory
+        } else {
+            Cmd::NextHistory
+        };
+    }
+    b.0 = None;
+    if up {
+        Cmd::HistorySearchBackward
+    } else {
+        Cmd::HistorySearchForward
+    }
 }
 
 /// The grid to draw below `line`, or None when no menu is open there.
 pub fn hint(line: &str, pos: usize) -> Option<String> {
+    if let Ok(mut b) = BROWSE.lock() {
+        if b.1 {
+            *b = (Some(line.to_string()), false);
+        }
+    }
     let mut guard = MENU.lock().ok()?;
     if !guard
         .as_ref()
@@ -127,8 +165,8 @@ fn on_key(key: Key, line: &str, pos: usize) -> Option<Cmd> {
             // it does without one.
             *guard = None;
             match key {
-                Key::Up => Some(Cmd::HistorySearchBackward),
-                Key::Down => Some(Cmd::HistorySearchForward),
+                Key::Up => Some(history_key(true, line, pos)),
+                Key::Down => Some(history_key(false, line, pos)),
                 _ => None,
             }
         }
@@ -612,6 +650,30 @@ mod tests {
         let (start, m) = take_pending().unwrap();
         assert_eq!((start, m[0].replacement.as_str()), (3, "main.rs"));
         assert!(take_pending().is_none());
+    }
+
+    #[test]
+    fn up_on_an_empty_line_steps_through_history() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        // The editor's prefix search finds nothing for an empty prefix.
+        assert_eq!(on_key(Key::Up, "", 0), Some(Cmd::PreviousHistory));
+        // The line it lands on keeps the next Up and Down stepping.
+        let _ = hint("echo second", 11);
+        assert_eq!(
+            on_key(Key::Up, "echo second", 11),
+            Some(Cmd::PreviousHistory)
+        );
+        let _ = hint("echo first", 10);
+        assert_eq!(on_key(Key::Down, "echo first", 10), Some(Cmd::NextHistory));
+        // Typed text searches by prefix.
+        let _ = hint("echo second", 11);
+        assert_eq!(on_key(Key::Up, "ec", 2), Some(Cmd::HistorySearchBackward));
+        let _ = hint("echo second", 2);
+        assert_eq!(
+            on_key(Key::Up, "echo second", 2),
+            Some(Cmd::HistorySearchBackward)
+        );
     }
 
     #[test]
