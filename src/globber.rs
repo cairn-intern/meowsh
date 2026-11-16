@@ -19,6 +19,15 @@ pub struct Quals {
     sort: Option<(char, bool)>,
     // `:h`, `:t`, ... applied to each match.
     modifiers: String,
+    // `(e:code:)` / `(+func)`: shell code each match must pass, with
+    // $REPLY set to it (and able to replace it via REPLY or reply).
+    code: Vec<String>,
+    // `(P:word:)`: words put before each match.
+    prepend: Vec<String>,
+    // `([n,m])`: which of the sorted matches to keep.
+    range: Option<(i64, i64)>,
+    // `(Yn)`: stop after n matches.
+    limit: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -32,30 +41,87 @@ enum Test {
     Perm(u32),
     // Modified less (`-`) / more (`+`) / exactly than `n` units ago.
     Mtime(char, i64, u64),
+    // `F`: a directory with something in it.
+    Full,
     Negate(Box<Test>),
 }
 
 /// Splits a trailing qualifier group `(...)` off `pattern`. A final group
 /// counts as qualifiers when it has no `|`, as with zsh's BARE_GLOB_QUAL.
 pub fn split_qualifiers(pattern: &str) -> (&str, Option<Quals>) {
-    let Some(body) = pattern.strip_suffix(')') else {
-        return (pattern, None);
-    };
-    let Some(open) = body.rfind('(') else {
-        return (pattern, None);
-    };
-    if open == 0 || body[..open].ends_with('\\') {
+    let chars: Vec<char> = pattern.chars().collect();
+    if chars.last() != Some(&')') {
         return (pattern, None);
     }
-    let inner = &body[open + 1..];
-    let inner = inner.strip_prefix("#q").unwrap_or(inner);
-    if inner.contains(['|', '(', ')', '~']) || inner.contains("\\") {
-        return (pattern, None);
+    // The `(` matching the final `)`.
+    let mut depth = 0;
+    let mut open = None;
+    let mut k = chars.len();
+    while k > 0 {
+        k -= 1;
+        let escaped = k > 0 && chars[k - 1] == '\\';
+        match chars[k] {
+            ')' if !escaped => depth += 1,
+            '(' if !escaped => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(k);
+                    break;
+                }
+            }
+            _ => {}
+        }
     }
-    match parse_quals(inner) {
-        Some(q) => (&body[..open], Some(q)),
+    let Some(open) = open.filter(|&o| o > 0) else {
+        return (pattern, None);
+    };
+    let inner: String = chars[open + 1..chars.len() - 1].iter().collect();
+    // Without BARE_GLOB_QUAL only `(#q...)` holds qualifiers.
+    let inner = match inner.strip_prefix("#q") {
+        Some(rest) => rest.to_string(),
+        None if !crate::options::is_set("bareglobqual") => return (pattern, None),
+        None if inner.contains('|') || inner.starts_with('#') => return (pattern, None),
+        None => inner,
+    };
+    let byte_open: usize = chars[..open].iter().map(|c| c.len_utf8()).sum();
+    match parse_quals(&inner) {
+        Some(q) => (&pattern[..byte_open], Some(q)),
         None => (pattern, None),
     }
+}
+
+// A qualifier argument: text between a delimiter and its partner
+// (`(`, `[`, `{`, `<` pair up; anything else closes itself).
+fn delimited(chars: &[char], i: &mut usize) -> Option<String> {
+    let open = *chars.get(*i)?;
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '<' => '>',
+        c => c,
+    };
+    // Quoted characters arrive backslash-escaped: skip them, and drop
+    // the escapes from the text.
+    let mut out = String::new();
+    let mut k = *i + 1;
+    while k < chars.len() {
+        match chars[k] {
+            '\\' if k + 1 < chars.len() => {
+                out.push(chars[k + 1]);
+                k += 2;
+            }
+            c if c == close => {
+                *i = k + 1;
+                return Some(out);
+            }
+            c => {
+                out.push(c);
+                k += 1;
+            }
+        }
+    }
+    None
 }
 
 fn parse_quals(s: &str) -> Option<Quals> {
@@ -84,12 +150,53 @@ fn parse_quals(s: &str) -> Option<Quals> {
                 negate = !negate;
                 continue;
             }
+            'e' => {
+                q.code.push(delimited(&chars, &mut i)?);
+                continue;
+            }
+            '+' => {
+                let start = i;
+                while chars
+                    .get(i)
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                {
+                    i += 1;
+                }
+                q.code.push(chars[start..i].iter().collect());
+                continue;
+            }
+            'P' => {
+                q.prepend.push(delimited(&chars, &mut i)?);
+                continue;
+            }
+            'Y' => {
+                let start = i;
+                while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                    i += 1;
+                }
+                q.limit = Some(chars[start..i].iter().collect::<String>().parse().ok()?);
+                continue;
+            }
+            '[' => {
+                i -= 1;
+                let spec = delimited(&chars, &mut i)?;
+                let eval = |t: &str| crate::arith::eval(t.trim()).ok();
+                q.range = Some(match spec.split_once(',') {
+                    Some((a, b)) => (eval(a)?, eval(b)?),
+                    None => {
+                        let n = eval(&spec)?;
+                        (n, n)
+                    }
+                });
+                continue;
+            }
             '.' => Test::Regular,
             '/' => Test::Dir,
             '@' => Test::Link,
             '*' => Test::Exec,
             '=' => Test::Socket,
             'p' => Test::Fifo,
+            'F' => Test::Full,
             'r' => Test::Perm(0o400),
             'w' => Test::Perm(0o200),
             'x' => Test::Perm(0o100),
@@ -133,8 +240,8 @@ fn parse_quals(s: &str) -> Option<Quals> {
                 continue;
             }
             // Accepted without effect.
-            '-' | ',' | 'L' | 'U' | 'G' | 's' | 'S' | 't' | 'T' | 'F' => continue,
-            '0'..='9' | '[' | ']' => continue,
+            '-' | ',' | 'L' | 'U' | 'G' | 's' | 'S' | 't' | 'T' => continue,
+            '0'..='9' | ']' => continue,
             _ => return None,
         };
         let test = if negate {
@@ -145,6 +252,25 @@ fn parse_quals(s: &str) -> Option<Quals> {
         q.tests.push(test);
     }
     Some(q)
+}
+
+// `(e:code:)`: runs code with $REPLY set to the match; a zero status
+// keeps it, replaced by $reply (if set) or a changed $REPLY.
+fn run_code(code: &str, path: &str) -> Option<Vec<String>> {
+    crate::shell::var_set("REPLY", path, false);
+    crate::shell::with_shell(|s| {
+        s.remove_param("reply");
+    });
+    let st =
+        crate::shell::in_eval_context("globqual", || crate::exec::run_string_named(code, None));
+    if st != 0 {
+        return None;
+    }
+    let reply = crate::shell::with_shell(|s| s.array("reply").cloned());
+    Some(match reply {
+        Some(items) => items,
+        None => vec![crate::shell::var_get("REPLY")],
+    })
 }
 
 fn passes(path: &Path, test: &Test) -> bool {
@@ -162,6 +288,9 @@ fn passes(path: &Path, test: &Test) -> bool {
                 Test::Socket => m.mode() & libc::S_IFMT == libc::S_IFSOCK,
                 Test::Fifo => m.mode() & libc::S_IFMT == libc::S_IFIFO,
                 Test::Perm(bits) => m.permissions().mode() & bits != 0,
+                Test::Full => {
+                    m.is_dir() && fs::read_dir(path).is_ok_and(|mut d| d.next().is_some())
+                }
                 Test::Mtime(sign, n, secs) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -250,11 +379,18 @@ fn sort_matches(out: &mut Vec<String>, q: &Quals) {
                 out.reverse();
             }
         }
-        None => {
-            out.sort();
-            out.dedup();
-        }
+        None => sort_names(out),
     }
+}
+
+// The default order: by name, numbers by value with NUMERIC_GLOB_SORT.
+fn sort_names(out: &mut Vec<String>) {
+    if crate::options::is_set("numericglobsort") {
+        out.sort_by(|a, b| crate::expand::numeric_order(a, b));
+    } else {
+        out.sort();
+    }
+    out.dedup();
 }
 
 /// Expands `pattern`. Returns the sorted matches; empty if none.
@@ -319,33 +455,80 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
         .into_iter()
         .filter(|p| !p.is_empty() && fs::symlink_metadata(p).is_ok())
         .collect();
-    if let Some(q) = quals {
-        if !q.modifiers.is_empty() {
-            out.retain(|p| q.tests.iter().all(|t| passes(Path::new(p), t)));
-            sort_matches(&mut out, q);
-            return out
-                .iter()
-                .map(|p| crate::expand::modify_word(p, &q.modifiers))
-                .collect();
-        }
-        out.retain(|p| q.tests.iter().all(|t| passes(Path::new(p), t)));
-        if let Some((key, rev)) = q.sort {
-            match key {
-                'n' => out.sort(),
-                'm' => out.sort_by_key(|p| {
-                    std::cmp::Reverse(fs::metadata(p).map(|m| m.mtime()).unwrap_or(0))
-                }),
-                'L' => out.sort_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)),
-                _ => {}
+    let Some(q) = quals else {
+        sort_names(&mut out);
+        return out;
+    };
+    out.retain(|p| q.tests.iter().all(|t| passes(Path::new(p), t)));
+    sort_matches(&mut out, q);
+    if !q.code.is_empty() {
+        let saved = (
+            crate::shell::var_get_opt("REPLY"),
+            crate::shell::with_shell(|s| s.array("reply").cloned()),
+        );
+        let mut kept = Vec::new();
+        for p in &out {
+            let mut cur = vec![p.clone()];
+            for code in &q.code {
+                let mut next = Vec::new();
+                for c in &cur {
+                    if let Some(r) = run_code(code, c) {
+                        next.extend(r);
+                    }
+                }
+                cur = next;
             }
-            if rev {
-                out.reverse();
-            }
-            return out;
+            kept.extend(cur);
         }
+        match saved.0 {
+            Some(v) => {
+                crate::shell::var_set("REPLY", &v, false);
+            }
+            None => crate::shell::with_shell(|s| {
+                s.remove_param("REPLY");
+            }),
+        }
+        match saved.1 {
+            Some(a) => {
+                crate::shell::array_set("reply", a);
+            }
+            None => crate::shell::with_shell(|s| {
+                s.remove_param("reply");
+            }),
+        }
+        out = kept;
     }
-    out.sort();
-    out.dedup();
+    if let Some(n) = q.limit {
+        out.truncate(n);
+    }
+    if let Some((a, b)) = q.range {
+        let len = out.len() as i64;
+        let idx = |n: i64| if n < 0 { len + n } else { n - 1 };
+        let (lo, hi) = (idx(a).max(0), idx(b).min(len - 1));
+        out = if lo <= hi && lo < len {
+            out[lo as usize..=hi as usize].to_vec()
+        } else {
+            Vec::new()
+        };
+    }
+    if !q.modifiers.is_empty() {
+        out = out
+            .iter()
+            .map(|p| crate::expand::modify_word(p, &q.modifiers))
+            .collect();
+    }
+    if !q.prepend.is_empty() {
+        out = out
+            .into_iter()
+            .flat_map(|p| {
+                q.prepend
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(p))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
     out
 }
 
@@ -355,6 +538,9 @@ mod tests {
 
     #[test]
     fn qualifiers_split_only_without_alternation() {
+        let _lock = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::shell::shell_init();
+        crate::shell::with_shell(|s| crate::options::init(s, crate::options::Emulation::Zsh));
         assert!(split_qualifiers("*(N)").1.is_some_and(|q| q.null));
         assert!(split_qualifiers("*.(rs|toml)").1.is_none());
         assert_eq!(split_qualifiers("*(Nm-1)").0, "*");
@@ -363,6 +549,9 @@ mod tests {
 
     #[test]
     fn globbing_with_groups_ranges_and_qualifiers() {
+        let _lock = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::shell::shell_init();
+        crate::shell::with_shell(|s| crate::options::init(s, crate::options::Emulation::Zsh));
         let dir = tempfile::TempDir::new().unwrap();
         let d = dir.path().to_str().unwrap();
         for f in ["a.rs", "b.toml", "c.txt", "f1", "f2", "f10", ".hidden"] {

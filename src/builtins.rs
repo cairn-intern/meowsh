@@ -36,6 +36,7 @@ const REGULAR: &[&str] = &[
     "hash",
     "history",
     "jobs",
+    "disown",
     "kill",
     "local",
     "popd",
@@ -63,6 +64,12 @@ const REGULAR: &[&str] = &[
     "zmodload",
     "emulate",
     "print",
+    "printf",
+    "let",
+    "limit",
+    "unlimit",
+    "zselect",
+    "zpty",
     "zle",
     "zcompile",
     "zrecompile",
@@ -246,14 +253,12 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "bg" => builtin_bg(&words[1..]),
         "fg" => builtin_fg(&words[1..]),
         "jobs" => builtin_jobs(&words[1..]),
+        "disown" => crate::jobs::builtin_disown(&words[1..]),
         "wait" => builtin_wait(&words[1..]),
         "cd" => builtin_cd(words),
         "pushd" => builtin_pushd(words),
-        "popd" => builtin_popd(),
-        "dirs" => {
-            print_dirs();
-            0
-        }
+        "popd" => builtin_popd(words),
+        "dirs" => builtin_dirs(words),
         "command" => builtin_command(words),
         "echo" => builtin_echo(words),
         "getopts" => builtin_getopts(words),
@@ -273,7 +278,13 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "umask" => builtin_umask(words),
         "zstyle" => builtin_zstyle(&words[1..]),
         "add-zsh-hook" => builtin_add_zsh_hook(words),
-        "print" => builtin_print(words),
+        "print" => crate::print::builtin_print(words),
+        "let" => builtin_let(words),
+        "limit" => builtin_limit(words),
+        "unlimit" => builtin_unlimit(words),
+        "zselect" => builtin_zselect(words),
+        "zpty" => crate::zpty::builtin_zpty(words),
+        "printf" => crate::print::builtin_printf(words),
         // Accepted for zsh startup-file compatibility; no effect. There is
         // no zle, so widgets defined with `zle -N` never run.
         "emulate" => builtin_emulate(words),
@@ -284,8 +295,9 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "zparseopts" => builtin_zparseopts(words),
         "fc" => builtin_fc(words),
         "colors" => builtin_colors(),
-        "bindkey" | "compinit" | "compdef" | "compaudit" | "zmodload" | "zle" | "zcompile"
-        | "zrecompile" | "bashcompinit" | "complete" | "compctl" => 0,
+        "zmodload" => builtin_zmodload(words),
+        "bindkey" | "compinit" | "compdef" | "compaudit" | "zle" | "zcompile" | "zrecompile"
+        | "bashcompinit" | "complete" | "compctl" => 0,
         _ => {
             builtin_err(name, "not a builtin");
             1
@@ -304,6 +316,87 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+// zsh/zselect: `zselect -t centiseconds [-r|-w|-e fd...]` waits for an
+// fd to be ready or the timeout; 1 on timeout.
+fn builtin_zselect(words: &[String]) -> i32 {
+    let mut timeout: i32 = -1;
+    let mut fds: Vec<libc::pollfd> = Vec::new();
+    let mut mode = libc::POLLIN;
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        let arg = |i: &mut usize, rest: &str| -> Option<String> {
+            if !rest.is_empty() {
+                Some(rest.to_string())
+            } else {
+                *i += 1;
+                words.get(*i).cloned()
+            }
+        };
+        if let Some(rest) = a.strip_prefix("-t") {
+            match arg(&mut i, rest).and_then(|t| t.parse::<i32>().ok()) {
+                Some(t) => timeout = t.saturating_mul(10),
+                None => {
+                    builtin_err("zselect", "timeout expected");
+                    return 2;
+                }
+            }
+        } else if let Some(rest) = a
+            .strip_prefix("-r")
+            .or(a.strip_prefix("-w"))
+            .or(a.strip_prefix("-e"))
+        {
+            mode = match &a[..2] {
+                "-w" => libc::POLLOUT,
+                "-e" => libc::POLLPRI,
+                _ => libc::POLLIN,
+            };
+            if let Some(fd) = arg(&mut i, rest).and_then(|f| f.parse().ok()) {
+                fds.push(libc::pollfd {
+                    fd,
+                    events: mode,
+                    revents: 0,
+                });
+            }
+        } else if let Ok(fd) = a.parse::<i32>() {
+            fds.push(libc::pollfd {
+                fd,
+                events: mode,
+                revents: 0,
+            });
+        } else if a == "-a" || a == "-A" {
+            i += 1;
+        }
+        i += 1;
+    }
+    let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+    if n <= 0 {
+        1
+    } else {
+        0
+    }
+}
+
+// let expr...: each argument is evaluated; true when the last is non-zero.
+fn builtin_let(words: &[String]) -> i32 {
+    if words.len() < 2 {
+        builtin_err("let", "not enough arguments");
+        return 1;
+    }
+    let mut st = 1;
+    for w in &words[1..] {
+        st = match crate::arith::eval_num(w) {
+            Ok(v) => i32::from(!v.truthy()),
+            Err(e) => {
+                if !e.is_empty() {
+                    shell_err(&e);
+                }
+                return 2;
+            }
+        };
+    }
+    st
+}
+
 fn usage(name: &str, msg: &str) -> i32 {
     builtin_err(name, msg);
     2
@@ -313,23 +406,40 @@ fn usage(name: &str, msg: &str) -> i32 {
 
 fn builtin_break(words: &[String], is_break: bool) -> i32 {
     let name = &words[0];
+    let zsh = !crate::exec::sh_emulation_pub();
     let n = match words.get(1) {
         None => 1,
-        Some(a) => match a.parse::<usize>() {
-            Ok(n) if n >= 1 => n,
+        Some(a) => match a.parse::<i64>().or_else(|_| crate::arith::eval(a)) {
+            Ok(n) if n >= 1 => n as usize,
+            // zsh: a fatal error.
+            Ok(n) if zsh => {
+                builtin_err(name, &format!("argument is not positive: {}", n));
+                return crate::exec::abort_command(1);
+            }
             _ => {
                 builtin_err(name, &format!("{}: loop count out of range", a));
                 return 1;
             }
         },
     };
-    let depth = with_shell(|s| s.loop_depth);
+    let (depth, outer) = with_shell(|s| (s.loop_depth, s.subshell_loop_depth));
     if depth == 0 {
-        err_line(&format!(
-            "meowsh: {}: only meaningful in a `for', `while', or `until' loop",
-            name
-        ));
-        return 0;
+        if !zsh {
+            err_line(&format!(
+                "meowsh: {}: only meaningful in a `for', `while', or `until' loop",
+                name
+            ));
+            return 0;
+        }
+        builtin_err(
+            name,
+            if outer > 0 {
+                "not in same subshell as first enclosing loop"
+            } else {
+                "not in for, while, until, select, or repeat loop"
+            },
+        );
+        return 1;
     }
     let n = n.min(depth);
     set_flow(if is_break {
@@ -343,7 +453,9 @@ fn builtin_break(words: &[String], is_break: bool) -> i32 {
 // zsh: an error inside eval ends the eval with status 1 instead of
 // leaving the shell.
 fn builtin_eval(words: &[String]) -> i32 {
-    let st = crate::exec::run_string_named(&words[1..].join(" "), Some("(eval)"));
+    let st = crate::shell::in_eval_context("eval", || {
+        crate::exec::run_string_named(&words[1..].join(" "), Some("(eval)"))
+    });
     with_shell(|s| {
         if s.error_exit {
             s.error_exit = false;
@@ -356,11 +468,41 @@ fn builtin_eval(words: &[String]) -> i32 {
     })
 }
 
+// zmodload: modules are built in, so loading always works. `-ap` lists
+// the parameters that autoload from a module (SRANDOM from zsh/random,
+// until a parameter of that name replaces it).
+fn builtin_zmodload(words: &[String]) -> i32 {
+    let flags: String = words[1..]
+        .iter()
+        .take_while(|w| w.starts_with('-'))
+        .flat_map(|w| w[1..].chars())
+        .collect();
+    if flags.contains('u') && words.iter().any(|w| w == "zsh/random") {
+        crate::typeset::SRANDOM_LOADED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    if flags.contains('a')
+        && flags.contains('p')
+        && words.len() == 2
+        && with_shell(|s| s.param("SRANDOM").is_none())
+    {
+        out("SRANDOM (zsh/random)\n");
+    }
+    0
+}
+
 fn builtin_exit(words: &[String]) -> i32 {
     let code = match words.get(1) {
         None => last_status(),
+        // zsh evaluates the status as arithmetic: `exit $?+8`.
         Some(a) => match a.trim().parse::<i64>() {
             Ok(n) => (n & 0xff) as i32,
+            Err(_) if !crate::exec::sh_emulation_pub() => match crate::arith::eval(a) {
+                Ok(n) => (n & 0xff) as i32,
+                Err(e) => {
+                    shell_err(&e);
+                    1
+                }
+            },
             Err(_) => {
                 builtin_err("exit", &format!("{}: numeric argument required", a));
                 2
@@ -368,6 +510,10 @@ fn builtin_exit(words: &[String]) -> i32 {
         },
     };
     with_shell(|s| s.error_exit = false);
+    // CHECK_JOBS: the first `exit` with jobs only warns.
+    if crate::jobs::exit_blocked() {
+        return 1;
+    }
     set_flow(Flow::Exit(code));
     code
 }
@@ -383,8 +529,19 @@ fn builtin_return(words: &[String]) -> i32 {
     }
     let code = match words.get(1) {
         None => last_status(),
+        // zsh evaluates the status as arithmetic: `exit $?+8`.
+        // zsh: a function may return any integer, `return -1` included.
         Some(a) => match a.trim().parse::<i64>() {
+            Ok(n) if !crate::exec::sh_emulation_pub() && funcs > 0 => n as i32,
             Ok(n) => (n & 0xff) as i32,
+            Err(_) if !crate::exec::sh_emulation_pub() => match crate::arith::eval(a) {
+                Ok(n) if funcs > 0 => n as i32,
+                Ok(n) => (n & 0xff) as i32,
+                Err(e) => {
+                    shell_err(&e);
+                    1
+                }
+            },
             Err(_) => {
                 builtin_err("return", &format!("{}: numeric argument required", a));
                 2
@@ -448,7 +605,9 @@ pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
             s.source_file.replace(path.to_string()),
         )
     });
-    let mut st = crate::exec::run_string_named(&content, Some(path));
+    let mut st = crate::shell::in_eval_context("file", || {
+        crate::exec::run_string_named(&content, Some(path))
+    });
     with_shell(|s| {
         s.source_depth -= 1;
         s.argv0 = saved_argv0;
@@ -468,9 +627,16 @@ fn builtin_source(words: &[String]) -> i32 {
     let Some(file) = words.get(1) else {
         return usage(&words[0], "filename argument required");
     };
-    let Some(path) = find_sourced(file) else {
-        builtin_err(&words[0], &format!("{}: not found", file));
-        return 1;
+    let path = find_sourced(file)
+        .filter(|p| std::path::Path::new(p).exists() && !std::path::Path::new(p).is_dir());
+    let Some(path) = path else {
+        builtin_err(&words[0], &format!("no such file or directory: {}", file));
+        // POSIX_BUILTINS: `.` is special, and its failure ends a script.
+        if crate::options::is_set("posixbuiltins") && !with_shell(|s| s.interactive) {
+            with_shell(|s| s.flow = Flow::Exit(1));
+            return 1;
+        }
+        return 127;
     };
     let args = if words.len() > 2 {
         Some(&words[2..])
@@ -516,6 +682,36 @@ fn list_vars(prefix: &str, flag: u32) {
 }
 
 fn builtin_unset(words: &[String]) -> i32 {
+    // -m: the arguments are patterns matched against parameter names.
+    let opts: Vec<&String> = words[1..]
+        .iter()
+        .take_while(|w| w.starts_with('-') && w.len() > 1)
+        .collect();
+    if opts.iter().any(|o| o.contains('m')) && !opts.iter().any(|o| o.contains('f')) {
+        let pats = &words[1 + opts.len()..];
+        let names: Vec<String> = with_shell(|s| {
+            let mut v: Vec<String> = s.params.keys().cloned().collect();
+            v.sort();
+            v
+        });
+        let mut cmd = vec!["unset".to_string()];
+        if opts.iter().any(|o| o.contains('n')) {
+            cmd.push("-n".to_string());
+        }
+        cmd.push("--".to_string());
+        for pat in pats {
+            cmd.extend(
+                names
+                    .iter()
+                    .filter(|n| crate::pattern::matches(pat, n))
+                    .cloned(),
+            );
+        }
+        if cmd.last().is_some_and(|l| l == "--") {
+            return 1;
+        }
+        return builtin_unset(&cmd);
+    }
     let mut functions = false;
     let mut no_deref = false;
     let mut status = 0;
@@ -534,11 +730,54 @@ fn builtin_unset(words: &[String]) -> i32 {
                 no_deref = true;
                 continue;
             }
+            "--" => continue,
             _ => {}
         }
         if functions {
             with_shell(|s| s.functions.remove(a.as_str()));
             crate::trap::function_removed(a);
+            continue;
+        }
+        // `unset name[sub]`: an element (a key, array elements emptied,
+        // or characters of a scalar), through a reference too.
+        if let Some((name, sub)) = a.strip_suffix(']').and_then(|x| x.split_once('[')) {
+            let _swap = crate::shell::RefSwap::enter(name);
+            let target = crate::shell::split_target_pub(&with_shell(|s| s.resolve_name(name)));
+            let kind = with_shell(|s| {
+                s.param(&target)
+                    .map(|p| (p.is_assoc(), p.is_array(), p.attrs & VAR_READONLY != 0))
+            });
+            match kind {
+                None => {}
+                Some((_, _, true)) => {
+                    crate::shell::shell_err(&format!("read-only variable: {}", target));
+                    status = 1;
+                }
+                Some((true, _, _)) => {
+                    let key = crate::expand::expand_string(sub).unwrap_or_else(|_| sub.to_string());
+                    with_shell(|s| {
+                        if let Some(crate::params::Value::Assoc(m)) =
+                            s.param_mut(&target).map(|p| &mut p.value)
+                        {
+                            m.remove(&key);
+                        }
+                    });
+                }
+                Some((false, is_array, _)) => {
+                    let sub = crate::expand::expand_string(sub).unwrap_or_else(|_| sub.to_string());
+                    let range = if sub.contains(',') {
+                        sub.clone()
+                    } else {
+                        format!("{0},{0}", sub)
+                    };
+                    let fill = if is_array {
+                        vec![String::new()]
+                    } else {
+                        Vec::new()
+                    };
+                    crate::shell::array_splice(&target, &range, fill);
+                }
+            }
             continue;
         }
         let target = if no_deref {
@@ -547,16 +786,38 @@ fn builtin_unset(words: &[String]) -> i32 {
             with_shell(|s| s.resolve_name(a))
         };
         let a = &target;
+        // A placeholder reference (referring to nothing) stays.
+        if !no_deref
+            && with_shell(|s| {
+                s.param(a.as_str())
+                    .is_some_and(|p| p.attrs & crate::params::NAMEREF != 0)
+            })
+        {
+            continue;
+        }
         let readonly = with_shell(|s| {
             s.param(a.as_str())
                 .is_some_and(|p| p.attrs & VAR_READONLY != 0)
         });
         if readonly {
-            builtin_err("unset", &format!("read-only variable: {}", a));
+            crate::shell::shell_err(&format!("read-only variable: {}", a));
             status = 1;
             continue;
         }
-        with_shell(|s| s.remove_param(a.as_str()));
+        // A local stays local after unset (zsh): only its value goes.
+        with_shell(|s| {
+            let local = s
+                .param(a.as_str())
+                .is_some_and(|p| p.level > 0 && p.tie.is_none());
+            if local {
+                if let Some(p) = s.param_mut(a.as_str()) {
+                    p.value = crate::params::Value::Scalar(String::new());
+                    p.attrs = crate::params::UNSET;
+                }
+            } else {
+                s.remove_param(a.as_str());
+            }
+        });
     }
     status
 }
@@ -564,12 +825,28 @@ fn builtin_unset(words: &[String]) -> i32 {
 // `set -o` / `set +o` listings.
 fn list_options(as_commands: bool) {
     let mut text = String::new();
+    // zsh names an option that is on by default in the current
+    // emulation by its `no` form, with the state inverted.
+    let emu = with_shell(|s| s.emulation);
     for name in crate::options::names() {
         let on = crate::options::is_set(name);
+        let def = crate::options::default_in(name, emu);
         if as_commands {
-            text.push_str(&format!("set {}o {}\n", if on { '-' } else { '+' }, name));
+            let sign = if def != on { '-' } else { '+' };
+            text.push_str(&format!(
+                "set {}o {}{}\n",
+                sign,
+                if def { "no" } else { "" },
+                name
+            ));
+        } else if def {
+            text.push_str(&format!(
+                "no{:<19} {}\n",
+                name,
+                if on { "off" } else { "on" }
+            ));
         } else {
-            text.push_str(&format!("{:<22}{}\n", name, if on { "on" } else { "off" }));
+            text.push_str(&format!("{:<21} {}\n", name, if on { "on" } else { "off" }));
         }
     }
     out(&text);
@@ -665,25 +942,77 @@ fn builtin_set(words: &[String]) -> i32 {
     0
 }
 
+// zsh's shift [-p] [n] [array ...]: arrays named after the count are
+// shifted instead of the positional parameters; -p takes from the end.
 fn builtin_shift(words: &[String]) -> i32 {
-    let n = match words.get(1) {
-        None => 1,
-        Some(a) => match a.parse::<usize>() {
+    let mut args = &words[1..];
+    let mut pop = false;
+    if args.first().is_some_and(|a| a == "-p") {
+        pop = true;
+        args = &args[1..];
+    }
+    let is_array = |n: &str| n == "argv" || with_shell(|s| s.array(n).is_some());
+    let mut num: i64 = 1;
+    if let Some(a) = args.first().filter(|a| !is_array(a)) {
+        num = match crate::arith::eval(a) {
             Ok(n) => n,
-            Err(_) => {
-                builtin_err("shift", &format!("{}: numeric argument required", a));
+            Err(e) => {
+                shell_err(&e);
                 return 1;
             }
-        },
-    };
-    with_shell(|s| {
-        if n > s.pos_params.len() {
-            builtin_err("shift", "can't shift that many");
-            return 1;
+        };
+        args = &args[1..];
+    }
+    if num < 0 {
+        builtin_err("shift", "argument to shift must be non-negative");
+        return 1;
+    }
+    let num = num as usize;
+    let cut = |v: &mut Vec<String>| {
+        if pop {
+            v.truncate(v.len() - num);
+        } else {
+            v.drain(..num);
         }
-        s.pos_params.drain(..n);
-        0
-    })
+    };
+    if args.is_empty() {
+        return with_shell(|s| {
+            if num > s.pos_params.len() {
+                builtin_err("shift", "shift count must be <= $#");
+                return 1;
+            }
+            cut(&mut s.pos_params);
+            0
+        });
+    }
+    let mut ret = 0;
+    for name in args {
+        if name == "argv" {
+            let ok = with_shell(|s| {
+                if num > s.pos_params.len() {
+                    return false;
+                }
+                cut(&mut s.pos_params);
+                true
+            });
+            if !ok {
+                builtin_err("shift", "shift count must be <= ${#argv}");
+                ret += 1;
+            }
+            continue;
+        }
+        let Some(mut items) = with_shell(|s| s.array(name).cloned()) else {
+            continue;
+        };
+        if num > items.len() {
+            builtin_err("shift", &format!("shift count must be <= ${{#{}}}", name));
+            ret += 1;
+            continue;
+        }
+        cut(&mut items);
+        crate::shell::array_set(name, items);
+    }
+    ret
 }
 
 // Declaration commands called with plain words (through `builtin`,
@@ -730,6 +1059,31 @@ pub fn functions_cmd(
             | crate::typeset::DeclArg::Array { name, .. } => name.clone(),
         })
         .collect();
+    // typeset -fu: autoload, as `autoload` does.
+    if minus.contains(&'u') && !names.is_empty() {
+        let mut words = vec!["autoload".to_string()];
+        words.extend(names.iter().cloned());
+        return builtin_autoload(&words);
+    }
+    // typeset -ft / -fT / +ft: the trace attributes.
+    let tflags: Vec<(char, bool)> = minus
+        .iter()
+        .filter(|c| matches!(c, 't' | 'T'))
+        .map(|&c| (c, true))
+        .chain(
+            plus.iter()
+                .filter(|c| matches!(c, 't' | 'T'))
+                .map(|&c| (c, false)),
+        )
+        .collect();
+    if !tflags.is_empty() {
+        for n in &names {
+            for &(c, on) in &tflags {
+                crate::shell::set_traced(n, on.then_some(c == 'T'));
+            }
+        }
+        return 0;
+    }
     functions_listing(&names, minus.contains(&'m'), !plus.is_empty(), None)
 }
 
@@ -850,6 +1204,35 @@ fn copy_function(words: &[String]) -> i32 {
 }
 
 fn builtin_functions(words: &[String]) -> i32 {
+    // `functions -t/-T/+t/+T name`: trace those functions.
+    if let Some(flag) = words.get(1).filter(|a| {
+        a.len() > 1
+            && (a.starts_with('-') || a.starts_with('+'))
+            && a[1..].chars().all(|c| c == 't' || c == 'T')
+    }) {
+        for n in &words[2..] {
+            if flag.starts_with('+') {
+                crate::shell::set_traced(n, None);
+            } else {
+                for c in flag[1..].chars() {
+                    crate::shell::set_traced(n, Some(c == 'T'));
+                }
+            }
+        }
+        return 0;
+    }
+    // `functions -W name` / `+W`: WARN_NESTED_VAR for those functions.
+    if let Some(flag) = words.get(1).filter(|a| *a == "-W" || *a == "+W") {
+        if let Ok(mut w) = crate::shell::WARN_NESTED_FUNCS.write() {
+            for n in &words[2..] {
+                w.retain(|x| x != n);
+                if flag == "-W" {
+                    w.push(n.clone());
+                }
+            }
+        }
+        return 0;
+    }
     if words.get(1).is_some_and(|a| a == "-c") {
         return copy_function(words);
     }
@@ -949,7 +1332,8 @@ fn builtin_read(words: &[String]) -> i32 {
     let mut yes_no = false;
     let mut raw = false;
     let mut prompt = None;
-    let mut delim = b'\n';
+    let mut delim: Vec<u8> = vec![b'\n'];
+    let mut from_stack = false;
     let mut array: Option<String> = None;
     // -e echoes the input instead of assigning it, -E does both.
     let (mut echo, mut echo_only) = (false, false);
@@ -975,8 +1359,18 @@ fn builtin_read(words: &[String]) -> i32 {
             match c {
                 'r' => raw = true,
                 's' => {}
-                'd' => delim = take_arg().and_then(|d| d.bytes().next()).unwrap_or(0),
-                'a' | 'A' => array = take_arg(),
+                // The whole (possibly multibyte) character ends the input.
+                'd' => {
+                    delim = take_arg()
+                        .and_then(|d| d.chars().next())
+                        .map(|c| c.to_string().into_bytes())
+                        .unwrap_or_else(|| vec![0]);
+                }
+                // -z: from the buffer stack that `print -z` pushes to.
+                'z' => from_stack = true,
+                // zsh -A: the first name is an array (default `reply`).
+                'A' => array = Some(String::new()),
+                'a' => array = take_arg(),
                 // zsh: -k [n] reads n characters, -q one y/n answer.
                 'k' => {
                     let rest: String = chars.by_ref().collect();
@@ -1023,7 +1417,14 @@ fn builtin_read(words: &[String]) -> i32 {
         }
         i += 1;
     }
-    let mut names: Vec<String> = words[i..].to_vec();
+    let mut names: Vec<String> = words[i.min(words.len())..].to_vec();
+    if array.as_deref() == Some("") {
+        array = Some(if names.is_empty() {
+            "reply".to_string()
+        } else {
+            names.remove(0)
+        });
+    }
     // zsh: `read 'name?prompt'` prompts on a terminal.
     if let Some(first) = names.first_mut() {
         if let Some((n, p)) = first.split_once('?') {
@@ -1075,31 +1476,53 @@ fn builtin_read(words: &[String]) -> i32 {
     let mut escaped: Vec<bool> = Vec::new();
     let mut got_delim = false;
     let mut pending_backslash = false;
-    loop {
-        match read_byte(fd) {
-            Ok(Some(b)) => {
-                if pending_backslash {
-                    pending_backslash = false;
-                    if b == b'\n' {
+    if from_stack {
+        match crate::print::pop_buffer_stack() {
+            Some(line) => {
+                bytes = line.into_bytes();
+                escaped = vec![false; bytes.len()];
+                got_delim = true;
+            }
+            None => return 1,
+        }
+    }
+    if !from_stack {
+        loop {
+            match read_byte(fd) {
+                Ok(Some(b)) => {
+                    if pending_backslash {
+                        pending_backslash = false;
+                        if b == b'\n' {
+                            continue;
+                        }
+                        bytes.push(b);
+                        escaped.push(true);
+                        continue;
+                    }
+                    if delim.len() == 1 && b == delim[0] {
+                        got_delim = true;
+                        break;
+                    }
+                    if delim.len() > 1
+                        && b == delim[delim.len() - 1]
+                        && bytes.ends_with(&delim[..delim.len() - 1])
+                    {
+                        let keep = bytes.len() + 1 - delim.len();
+                        bytes.truncate(keep);
+                        escaped.truncate(keep);
+                        got_delim = true;
+                        break;
+                    }
+                    if b == b'\\' && !raw {
+                        pending_backslash = true;
                         continue;
                     }
                     bytes.push(b);
-                    escaped.push(true);
-                    continue;
+                    escaped.push(false);
                 }
-                if b == delim {
-                    got_delim = true;
-                    break;
-                }
-                if b == b'\\' && !raw {
-                    pending_backslash = true;
-                    continue;
-                }
-                bytes.push(b);
-                escaped.push(false);
+                Ok(None) => break,
+                Err(_) => return 128 + libc::SIGINT,
             }
-            Ok(None) => break,
-            Err(_) => return 128 + libc::SIGINT,
         }
     }
 
@@ -1121,7 +1544,13 @@ fn builtin_read(words: &[String]) -> i32 {
     let ifs = var_get_opt("IFS").unwrap_or_else(|| " \t\n".to_string());
     if echo {
         let line: String = chars.iter().map(|(c, _)| *c).collect();
-        out(&format!("{}\n", line));
+        // With -A each word goes on its own line.
+        if array.is_some() {
+            let words = read_split(&chars, &ifs, 0);
+            out(&words.iter().map(|w| format!("{}\n", w)).collect::<String>());
+        } else {
+            out(&format!("{}\n", line));
+        }
         if echo_only {
             return if got_delim || !bytes.is_empty() { 0 } else { 1 };
         }
@@ -1140,7 +1569,7 @@ fn builtin_read(words: &[String]) -> i32 {
         names.iter().zip(fields).all(|(n, v)| var_set(n, &v, false))
     };
     if !ok {
-        return 2;
+        return 1;
     }
     if got_delim {
         0
@@ -1186,105 +1615,143 @@ fn read_chars(fd: i32, n: usize) -> Option<String> {
 
 // ---- getopts --------------------------------------------------------------
 
+// zsh's getopts (bin_getopts): OPTIND stays on an argument until all of
+// its option letters are used; `+x` options too unless POSIX_BUILTINS
+// (or -p).
 fn builtin_getopts(words: &[String]) -> i32 {
-    if words.len() < 3 {
-        return usage("getopts", "usage: getopts optstring name [arg ...]");
+    let mut i = 1;
+    let mut posix_flag = false;
+    while let Some(a) = words.get(i) {
+        let Some(body) = a.strip_prefix('-') else {
+            break;
+        };
+        i += 1;
+        if body.is_empty() || body == "-" {
+            break;
+        }
+        for c in body.chars() {
+            if c == 'p' {
+                posix_flag = true;
+            } else {
+                builtin_err("getopts", &format!("bad option: -{}", c));
+                return 1;
+            }
+        }
     }
-    let optstring = &words[1];
-    let name = &words[2];
-    let args: Vec<String> = if words.len() > 3 {
-        words[3..].to_vec()
+    if words.len() < i + 2 {
+        builtin_err("getopts", "not enough arguments");
+        return 1;
+    }
+    let optstring = &words[i];
+    let var = &words[i + 1];
+    let args: Vec<String> = if words.len() > i + 2 {
+        words[i + 2..].to_vec()
     } else {
         with_shell(|s| s.pos_params.clone())
     };
-    let silent = optstring.starts_with(':');
-    let spec: Vec<char> = optstring.trim_start_matches(':').chars().collect();
-    let mut optind: usize = var_get("OPTIND").trim().parse().unwrap_or(1).max(1);
-    let mut pos = with_shell(|s| s.getopts_pos);
-
-    let finish = |optind: usize, pos: usize| {
-        var_set("OPTIND", &optind.to_string(), false);
-        with_shell(|s| s.getopts_pos = pos);
+    let posix = posix_flag || crate::options::is_set("posixbuiltins");
+    let mut optind: i64 = var_get("OPTIND").trim().parse().unwrap_or(1);
+    let mut optcind = with_shell(|s| s.getopts_pos);
+    let finish = |optind: i64, optcind: usize| {
+        crate::shell::without_assign_warnings(|| var_set("OPTIND", &optind.to_string(), false));
+        with_shell(|s| s.getopts_pos = optcind);
     };
-
-    if optind > args.len() {
-        var_set(name, "?", false);
-        finish(optind, 0);
+    if optind < 1 {
+        optind = 1;
+        optcind = 0;
+    }
+    if (args.len() as i64) < optind {
+        finish(optind, optcind);
         return 1;
     }
-    let arg: Vec<char> = args[optind - 1].chars().collect();
-    if pos == 0 || pos >= arg.len() {
-        if args[optind - 1] == "--" {
-            var_set(name, "?", false);
-            finish(optind + 1, 0);
-            return 1;
-        }
-        if arg.len() < 2 || arg[0] != '-' {
-            var_set(name, "?", false);
-            finish(optind, 0);
-            return 1;
-        }
-        pos = 1;
+    let quiet = optstring.starts_with(':');
+    let spec: Vec<char> = optstring.chars().skip(usize::from(quiet)).collect();
+    let mut s: Vec<char> = args[optind as usize - 1].chars().collect();
+    if s.is_empty() {
+        finish(optind, optcind);
+        return 1;
     }
-    let c = arg[pos];
-    pos += 1;
-    let at_end = pos >= arg.len();
-    let idx = spec.iter().position(|&x| x == c && x != ':');
-    match idx {
-        None => {
-            if silent {
-                var_set("OPTARG", &c.to_string(), false);
-            } else {
-                err_line(&format!("meowsh: illegal option -- {}", c));
-                with_shell(|s| s.remove_param("OPTARG"));
-            }
-            var_set(name, "?", false);
-        }
-        Some(k) if spec.get(k + 1) == Some(&':') => {
-            let optarg = if !at_end {
-                let v: String = arg[pos..].iter().collect();
-                optind += 1;
-                pos = 0;
-                Some(v)
-            } else if optind < args.len() {
-                let v = args[optind].clone();
-                optind += 2;
-                pos = 0;
-                Some(v)
-            } else {
-                None
-            };
-            match optarg {
-                Some(v) => {
-                    var_set("OPTARG", &v, false);
-                    var_set(name, &c.to_string(), false);
-                }
-                None => {
-                    if silent {
-                        var_set("OPTARG", &c.to_string(), false);
-                        var_set(name, ":", false);
-                    } else {
-                        err_line(&format!("meowsh: option requires an argument -- {}", c));
-                        with_shell(|s| s.remove_param("OPTARG"));
-                        var_set(name, "?", false);
-                    }
-                    optind += 1;
-                    pos = 0;
-                }
-            }
-            finish(optind, pos);
-            return 0;
-        }
-        Some(_) => {
-            with_shell(|s| s.remove_param("OPTARG"));
-            var_set(name, &c.to_string(), false);
-        }
-    }
-    if at_end {
+    if optcind >= s.len() {
+        optcind = 0;
         optind += 1;
-        pos = 0;
+        match args.get(optind as usize - 1) {
+            Some(a) => s = a.chars().collect(),
+            None => {
+                finish(optind, optcind);
+                return 1;
+            }
+        }
     }
-    finish(optind, pos);
+    if optcind == 0 {
+        if s.len() < 2 || (s[0] != '-' && (posix || s[0] != '+')) {
+            finish(optind, optcind);
+            return 1;
+        }
+        if s.len() == 2 && s[0] == '-' && s[1] == '-' {
+            finish(optind + 1, optcind);
+            return 1;
+        }
+        optcind = 1;
+    }
+    let opch = s[optcind];
+    optcind += 1;
+    let optbuf = if s[0] == '+' {
+        format!("+{}", opch)
+    } else {
+        opch.to_string()
+    };
+    let sign = if s[0] == '+' { '+' } else { '-' };
+    let pos = spec.iter().position(|&c| c == opch).filter(|_| opch != ':');
+    let Some(p) = pos else {
+        if posix {
+            optcind = 0;
+            optind += 1;
+        }
+        var_set(var, "?", false);
+        if quiet {
+            var_set("OPTARG", &optbuf, false);
+        } else {
+            shell_err(&format!("bad option: {}{}", sign, opch));
+            var_set("OPTARG", "", false);
+        }
+        finish(optind, optcind);
+        return 0;
+    };
+    if spec.get(p + 1) == Some(&':') {
+        let optarg = if optcind == s.len() {
+            match args.get(optind as usize) {
+                None => {
+                    if posix {
+                        optcind = 0;
+                        optind += 1;
+                    }
+                    if quiet {
+                        var_set(var, ":", false);
+                        var_set("OPTARG", &optbuf, false);
+                    } else {
+                        var_set(var, "?", false);
+                        var_set("OPTARG", "", false);
+                        shell_err(&format!("argument expected after {}{} option", sign, opch));
+                    }
+                    finish(optind, optcind);
+                    return 0;
+                }
+                Some(a) => {
+                    optind += 1;
+                    a.clone()
+                }
+            }
+        } else {
+            s[optcind..].iter().collect()
+        };
+        optcind = 0;
+        optind += 1;
+        var_set("OPTARG", &optarg, false);
+    } else {
+        var_set("OPTARG", "", false);
+    }
+    var_set(var, &optbuf, false);
+    finish(optind, optcind);
     0
 }
 
@@ -1318,99 +1785,344 @@ fn chdir(path: &str) -> Result<(), i32> {
     Ok(())
 }
 
-fn builtin_cd(words: &[String]) -> i32 {
-    let mut physical = false;
-    let mut i = 1;
-    while i < words.len() && words[i].starts_with('-') && words[i].len() > 1 {
-        match words[i].as_str() {
-            "-L" => physical = false,
-            "-P" => physical = true,
-            "--" => {
-                i += 1;
-                break;
+#[derive(Clone, Copy, PartialEq)]
+enum CdKind {
+    Cd,
+    Pushd,
+    Popd,
+}
+
+// The directory stack with the current directory pushed in front, as
+// zsh's bin_cd works on it: index 0 is the newest entry.
+fn dir_list() -> Vec<String> {
+    with_shell(|s| s.dir_stack.clone())
+}
+
+fn set_dir_list(list: Vec<String>) {
+    with_shell(|s| s.dir_stack = list);
+}
+
+// A directory as zsh prints it: under $HOME as `~/...`.
+pub(crate) fn print_dir(d: &str) -> String {
+    let home = var_get("HOME");
+    if !home.is_empty() && home != "/" {
+        if d == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = d.strip_prefix(&home).filter(|r| r.starts_with('/')) {
+            return format!("~{}", rest);
+        }
+    }
+    d.to_string()
+}
+
+fn print_dirstack() {
+    let mut text = print_dir(&var_get("PWD"));
+    for d in dir_list() {
+        text.push(' ');
+        text.push_str(&print_dir(&d));
+    }
+    text.push('\n');
+    out(&text);
+}
+
+// zsh's cd_try_chdir: the full path (logical unless chasing links),
+// changed into.
+fn cd_try(prefix: Option<&str>, dest: &str, physical: bool) -> Result<String, i32> {
+    let pwd = var_get_opt("PWD")
+        .filter(|p| p.starts_with('/'))
+        .or_else(physical_cwd)
+        .unwrap_or_else(|| "/".to_string());
+    let full = match prefix.filter(|p| !p.is_empty()) {
+        Some(p) if p.starts_with('/') => format!("{}/{}", p.trim_end_matches('/'), dest),
+        Some(p) => format!("{}/{}/{}", pwd.trim_end_matches('/'), p, dest),
+        None if dest.starts_with('/') => dest.to_string(),
+        None => format!("{}/{}", pwd.trim_end_matches('/'), dest),
+    };
+    if physical {
+        chdir(&full)?;
+        return Ok(physical_cwd().unwrap_or(full));
+    }
+    let logical = normalize_path(&full);
+    if chdir(&logical).is_err() {
+        // The logical path may not exist (a renamed parent); try as given.
+        if prefix.is_some() || dest.starts_with('/') {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        }
+        chdir(dest)?;
+        return Ok(physical_cwd().unwrap_or(logical));
+    }
+    Ok(logical)
+}
+
+// zsh's cd_do_chdir: absolute paths, then the directory as given and
+// $cdpath entries, then CDABLE_VARS. Sets `printdir` when the result
+// should be shown.
+fn cd_do_chdir(cmd: &str, dest: &str, physical: bool, printdir: &mut bool) -> Option<String> {
+    let mut eno = libc::ENOENT;
+    if dest.starts_with('/') {
+        return match cd_try(None, dest, physical) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                builtin_err(cmd, &crate::exec::file_error(dest, e));
+                None
             }
-            o => return usage("cd", &format!("{}: invalid option", o)),
+        };
+    }
+    let nocdpath = dest == "." || dest == ".." || dest.starts_with("./") || dest.starts_with("../");
+    let posix = crate::options::is_set("posixcd");
+    let cdpath: Vec<String> = with_shell(|s| s.array("cdpath").cloned())
+        .or_else(|| var_get_opt("CDPATH").map(|c| c.split(':').map(|s| s.to_string()).collect()))
+        .unwrap_or_default();
+    let hasdot = !nocdpath && !posix && cdpath.iter().any(|p| p.is_empty() || p == ".");
+    if !hasdot && !posix {
+        match cd_try(None, dest, physical) {
+            Ok(r) => return Some(r),
+            Err(e) if e != libc::ENOENT => eno = e,
+            Err(_) => {}
+        }
+    }
+    if !nocdpath {
+        for p in &cdpath {
+            match cd_try(Some(p), dest, physical) {
+                Ok(r) => {
+                    if !p.is_empty() && p != "." {
+                        *printdir = true;
+                    }
+                    return Some(r);
+                }
+                Err(e) if e != libc::ENOENT => eno = e,
+                Err(_) => {}
+            }
+        }
+    }
+    if posix {
+        match cd_try(None, dest, physical) {
+            Ok(r) => return Some(r),
+            Err(e) if e != libc::ENOENT => eno = e,
+            Err(_) => {}
+        }
+    }
+    // CDABLE_VARS: `cd name/rest` with name a parameter holding a path.
+    if crate::options::is_set("cdablevars") {
+        let (name, rest) = match dest.find('/') {
+            Some(k) => (&dest[..k], &dest[k..]),
+            None => (dest, ""),
+        };
+        if let Some(v) = var_get_opt(name).filter(|v| v.starts_with('/')) {
+            match cd_try(None, &format!("{}{}", v, rest), physical) {
+                Ok(r) => {
+                    *printdir = true;
+                    return Some(r);
+                }
+                Err(e) if e != libc::ENOENT => eno = e,
+                Err(_) => {}
+            }
+        }
+    }
+    builtin_err(cmd, &crate::exec::file_error(dest, eno));
+    None
+}
+
+// zsh's bin_cd for cd, chdir, pushd and popd.
+fn cd_family(words: &[String], kind: CdKind) -> i32 {
+    let cmd = words[0].as_str();
+    let mut physical = crate::options::is_set("chaselinks");
+    let mut quiet = false;
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            break;
+        };
+        if flags.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        for c in flags.chars() {
+            match c {
+                'P' => physical = true,
+                'L' => physical = false,
+                'q' => quiet = true,
+                's' => {}
+                _ => return usage(cmd, &format!("bad option: -{}", c)),
+            }
         }
         i += 1;
     }
-    let mut print = false;
-    let target = match words.get(i).map(|s| s.as_str()) {
-        None => match var_get_opt("HOME").filter(|h| !h.is_empty()) {
-            Some(h) => h,
-            None => {
-                builtin_err("cd", "HOME not set");
-                return 1;
-            }
-        },
-        Some("-") => match var_get_opt("OLDPWD").filter(|h| !h.is_empty()) {
-            Some(d) => {
-                print = true;
-                d
-            }
-            None => {
-                builtin_err("cd", "OLDPWD not set");
-                return 1;
-            }
-        },
-        Some(d) => d.to_string(),
-    };
-    let mut dir = target.clone();
-    let relative_name = !target.starts_with('/')
-        && target != "."
-        && target != ".."
-        && !target.starts_with("./")
-        && !target.starts_with("../");
-    if relative_name {
-        if let Some(cdpath) = var_get_opt("CDPATH") {
-            for p in cdpath.split(':') {
-                let cand = if p.is_empty() {
-                    format!("./{}", target)
-                } else {
-                    format!("{}/{}", p.trim_end_matches('/'), target)
-                };
-                if std::path::Path::new(&cand).is_dir() {
-                    if !p.is_empty() {
-                        print = true;
-                    }
-                    dir = cand;
-                    break;
-                }
-            }
-        }
-    }
-    let old = var_get_opt("PWD")
+    let args = &words[i..];
+    let old_pwd = var_get_opt("PWD")
         .filter(|p| p.starts_with('/'))
         .or_else(physical_cwd)
         .unwrap_or_default();
-    let new = if physical {
-        if let Err(e) = chdir(&dir) {
-            builtin_err("cd", &crate::exec::file_error(&target, e));
-            return 1;
+    let mut list = dir_list();
+    list.insert(0, old_pwd.clone());
+    let interactive = with_shell(|s| s.interactive);
+    let mut printdir = false;
+
+    // cd_get_dest: the entry to change to.
+    let mut dir: Option<usize> = None;
+    match args {
+        [] => {
+            if kind == CdKind::Popd && list.len() < 2 {
+                builtin_err(cmd, "directory stack empty");
+                return 1;
+            }
+            if kind == CdKind::Pushd && !crate::options::is_set("pushdtohome") && list.len() > 1 {
+                // Swap the top two entries.
+                let pwd_entry = list.remove(0);
+                list.insert(1, pwd_entry);
+                dir = Some(0);
+            } else if kind != CdKind::Popd {
+                match var_get_opt("HOME").filter(|h| !h.is_empty()) {
+                    Some(h) => list.insert(0, h),
+                    None => {
+                        builtin_err(cmd, "HOME not set");
+                        return 1;
+                    }
+                }
+            }
         }
-        physical_cwd().unwrap_or(dir)
-    } else {
-        let logical = if dir.starts_with('/') {
-            normalize_path(&dir)
-        } else {
-            normalize_path(&format!("{}/{}", old, dir))
-        };
-        if let Err(e) = chdir(&logical) {
-            builtin_err("cd", &crate::exec::file_error(&target, e));
-            return 1;
+        [arg] => {
+            printdir = true;
+            let digits = arg
+                .strip_prefix('+')
+                .or_else(|| arg.strip_prefix('-'))
+                .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()));
+            if let Some(digits) = digits.filter(|_| !crate::options::is_set("posixcd")) {
+                let n: usize = digits.parse().unwrap_or(usize::MAX);
+                let from_top = arg.starts_with('+') != crate::options::is_set("pushdminus");
+                let idx = if from_top {
+                    Some(n)
+                } else {
+                    (list.len() - 1).checked_sub(n)
+                };
+                match idx.filter(|&k| k < list.len()) {
+                    Some(k) => dir = Some(k),
+                    None => {
+                        builtin_err(cmd, "no such entry in dir stack");
+                        return 1;
+                    }
+                }
+            }
+            if dir.is_none() {
+                if arg == "-" {
+                    match var_get_opt("OLDPWD") {
+                        Some(o) => list.insert(0, o),
+                        None => {
+                            builtin_err(cmd, "OLDPWD not set");
+                            return 1;
+                        }
+                    }
+                } else {
+                    printdir = false;
+                    list.insert(0, arg.clone());
+                }
+            }
         }
-        logical
-    };
-    var_set("OLDPWD", &old, false);
-    var_set("PWD", &new, false);
-    if print {
-        out(&format!("{}\n", new));
+        [from, to, ..] => {
+            let Some(k) = old_pwd.find(from.as_str()) else {
+                builtin_err(cmd, &format!("string not in pwd: {}", from));
+                return 1;
+            };
+            let d = format!("{}{}{}", &old_pwd[..k], to, &old_pwd[k + from.len()..]);
+            list.insert(0, d);
+            printdir = true;
+        }
     }
-    run_hooks("chpwd", &[]);
+    let mut target = dir;
+    if kind == CdKind::Popd {
+        match dir {
+            None => {
+                target = Some(0);
+                dir = Some(0);
+            }
+            Some(k) if k != 0 => {
+                return cd_new_pwd(kind, list, k, quiet, interactive, printdir);
+            }
+            _ => {}
+        }
+        dir = dir.map(|k| k + 1);
+    }
+    let d = dir.unwrap_or(0);
+    let Some(dest) = list.get(d).cloned() else {
+        return 1;
+    };
+    let Some(newdir) = cd_do_chdir(cmd, &dest, physical, &mut printdir) else {
+        return 1;
+    };
+    list[d] = newdir;
+    cd_new_pwd(
+        kind,
+        list,
+        target.unwrap_or(d),
+        quiet,
+        interactive,
+        printdir,
+    )
+}
+
+// zsh's cd_new_pwd: updates the stack, $PWD and $OLDPWD, prints, and
+// runs the chpwd hooks.
+fn cd_new_pwd(
+    kind: CdKind,
+    mut list: Vec<String>,
+    dir: usize,
+    quiet: bool,
+    interactive: bool,
+    printdir: bool,
+) -> i32 {
+    if kind == CdKind::Pushd {
+        list.rotate_left(dir);
+    }
+    let idx = if kind == CdKind::Pushd { 0 } else { dir };
+    let mut new_pwd = list.remove(idx);
+    if kind == CdKind::Popd && !list.is_empty() {
+        new_pwd = list.remove(0);
+    } else if kind == CdKind::Cd && !crate::options::is_set("autopushd") {
+        list.remove(0);
+    }
+    if crate::options::is_set("pushdignoredups") {
+        if let Some(k) = list.iter().position(|d| *d == new_pwd) {
+            list.remove(k);
+        }
+    }
+    if std::path::Path::new(&new_pwd).is_dir() {
+        let _ = chdir(&new_pwd);
+    }
+    let old = var_get("PWD");
+    var_set("OLDPWD", &old, false);
+    var_set("PWD", &new_pwd, false);
+    if let Some(size) = var_get_opt("DIRSTACKSIZE").and_then(|v| v.trim().parse::<usize>().ok()) {
+        if size > 0 {
+            list.truncate(size.max(2) - 1);
+        }
+    }
+    set_dir_list(list);
+    if interactive || crate::options::is_set("posixcd") {
+        if kind != CdKind::Cd && interactive {
+            if !crate::options::is_set("pushdsilent") && !quiet {
+                print_dirstack();
+            }
+        } else if !crate::options::is_set("cdsilent") && printdir {
+            out(&format!("{}\n", print_dir(&new_pwd)));
+        }
+    }
+    if !quiet {
+        run_hooks("chpwd", &[]);
+    }
     0
 }
 
+fn builtin_cd(words: &[String]) -> i32 {
+    cd_family(words, CdKind::Cd)
+}
+
 fn builtin_pwd(words: &[String]) -> i32 {
-    let physical = words.iter().skip(1).any(|a| a == "-P");
+    let physical = words.iter().skip(1).any(|a| a == "-P")
+        || (crate::options::is_set("chaselinks") && !words.iter().skip(1).any(|a| a == "-L"));
     let pwd = var_get_opt("PWD").filter(|p| p.starts_with('/'));
     let dir = match (physical, pwd) {
         (false, Some(p)) => p,
@@ -1430,49 +2142,52 @@ fn builtin_pwd(words: &[String]) -> i32 {
 }
 
 fn builtin_pushd(words: &[String]) -> i32 {
-    let mut popped = None;
-    let target = match words.get(1) {
-        Some(t) => t.clone(),
-        None => match with_shell(|s| s.dir_stack.pop()) {
-            Some(dir) => {
-                popped = Some(dir.clone());
-                dir
-            }
-            None => {
-                builtin_err("pushd", "directory stack empty");
-                return 1;
-            }
-        },
-    };
-    let old = var_get("PWD");
-    let status = builtin_cd(&["cd".to_string(), target]);
-    if status == 0 {
-        with_shell(|s| s.dir_stack.push(old));
-        print_dirs();
-    } else if let Some(dir) = popped {
-        with_shell(|s| s.dir_stack.push(dir));
-    }
-    status
+    cd_family(words, CdKind::Pushd)
 }
 
-fn builtin_popd() -> i32 {
-    let Some(target) = with_shell(|s| s.dir_stack.pop()) else {
-        builtin_err("popd", "directory stack empty");
-        return 1;
-    };
-    let status = builtin_cd(&["cd".to_string(), target.clone()]);
-    if status == 0 {
-        print_dirs();
-    } else {
-        with_shell(|s| s.dir_stack.push(target));
-    }
-    status
+fn builtin_popd(words: &[String]) -> i32 {
+    cd_family(words, CdKind::Popd)
 }
 
-fn print_dirs() {
-    let mut dirs = vec![var_get("PWD")];
-    dirs.extend(with_shell(|s| s.dir_stack.clone()).into_iter().rev());
-    out(&format!("{}\n", dirs.join(" ")));
+// `dirs [-c] [-l] [-p] [-v] [dir ...]`: lists the stack, or replaces it.
+fn builtin_dirs(words: &[String]) -> i32 {
+    let (mut clear, mut long, mut per_line, mut numbered) = (false, false, false, false);
+    let mut i = 1;
+    while let Some(a) = words.get(i).filter(|a| a.starts_with('-') && a.len() > 1) {
+        for c in a[1..].chars() {
+            match c {
+                'c' => clear = true,
+                'l' => long = true,
+                'p' => per_line = true,
+                'v' => numbered = true,
+                _ => return usage("dirs", &format!("bad option: -{}", c)),
+            }
+        }
+        i += 1;
+    }
+    let args = &words[i..];
+    if (args.is_empty() && !clear) || numbered || per_line {
+        let show = |d: &str| if long { d.to_string() } else { print_dir(d) };
+        let mut all = vec![var_get("PWD")];
+        all.extend(dir_list());
+        let text: String = if numbered {
+            all.iter()
+                .enumerate()
+                .map(|(k, d)| format!("{}\t{}\n", k, show(d)))
+                .collect()
+        } else if per_line {
+            all.iter().map(|d| format!("{}\n", show(d))).collect()
+        } else {
+            format!(
+                "{}\n",
+                all.iter().map(|d| show(d)).collect::<Vec<_>>().join(" ")
+            )
+        };
+        out(&text);
+        return 0;
+    }
+    set_dir_list(args.to_vec());
+    0
 }
 
 // ---- output ---------------------------------------------------------------
@@ -1480,7 +2195,8 @@ fn print_dirs() {
 fn builtin_echo(words: &[String]) -> i32 {
     let mut args = &words[1..];
     let mut newline = true;
-    let mut escapes = false;
+    // zsh's echo reads escapes unless BSD_ECHO (set in sh emulation).
+    let mut escapes = !crate::options::is_set("bsdecho");
     while let Some(a) = args.first() {
         let flags = a.strip_prefix('-').unwrap_or("");
         if !flags.is_empty() && flags.chars().all(|c| matches!(c, 'n' | 'e' | 'E')) {
@@ -1534,30 +2250,67 @@ fn builtin_history() -> i32 {
 
 // ---- aliases --------------------------------------------------------------
 
+// alias [+-gmrsL] [name[=value] ...]: -g global, -s suffix, -r regular
+// aliases; -L lists as commands, -m treats names as patterns.
 fn builtin_alias(words: &[String]) -> i32 {
     let mut args = &words[1..];
-    let mut global = false;
-    // -g global (zsh), -s suffix (accepted, treated as global), -L/-p list.
+    let (mut global, mut suffix, mut list_cmd, mut pattern) = (false, false, false, false);
     while let Some(a) = args.first() {
-        match a.as_str() {
-            "-g" | "-s" => global = true,
-            "-p" | "-L" | "-r" | "+g" => {}
-            "--" => {
-                args = &args[1..];
-                break;
+        if a == "--" {
+            args = &args[1..];
+            break;
+        }
+        let Some(flags) = a.strip_prefix(['-', '+']).filter(|f| !f.is_empty()) else {
+            break;
+        };
+        for c in flags.chars() {
+            match c {
+                'g' => global = true,
+                's' => suffix = true,
+                'L' => list_cmd = true,
+                'm' => pattern = true,
+                'r' => {}
+                _ => {
+                    builtin_err("alias", &format!("bad option: {}{}", &a[..1], c));
+                    return 1;
+                }
             }
-            _ => break,
         }
         args = &args[1..];
     }
-    let table = |s: &mut crate::types::Shell| s.alias_map(global).clone();
-    if args.is_empty() {
-        let mut all: Vec<(String, String)> = with_shell(|s| table(s).into_iter().collect());
-        all.sort();
-        let flag = if global { "-g " } else { "" };
+    let table_name = if suffix {
+        crate::types::SALIASES
+    } else if global {
+        crate::types::GALIASES
+    } else {
+        crate::types::ALIASES
+    };
+    let flag = if suffix {
+        "-s "
+    } else if global {
+        "-g "
+    } else {
+        ""
+    };
+    let table = || with_shell(|s| s.assoc(table_name).cloned().unwrap_or_default());
+    let show = |k: &str, v: &str| -> String {
+        if list_cmd {
+            format!(
+                "alias {}{}={}\n",
+                flag,
+                crate::builtins::shell_quote(k),
+                shell_quote(v)
+            )
+        } else {
+            format!("{}={}\n", k, shell_quote(v))
+        }
+    };
+    if args.is_empty() || pattern {
+        let all = table();
         let text: String = all
             .iter()
-            .map(|(k, v)| format!("alias {}{}={}\n", flag, k, shell_quote(v)))
+            .filter(|(k, _)| args.is_empty() || args.iter().any(|p| crate::pattern::matches(p, k)))
+            .map(|(k, v)| show(k, v))
             .collect();
         out(&text);
         return 0;
@@ -1567,11 +2320,11 @@ fn builtin_alias(words: &[String]) -> i32 {
         match a.find('=') {
             Some(i) => {
                 let (name, value) = (a[..i].to_string(), a[i + 1..].to_string());
-                with_shell(|s| s.alias_map(global).insert(name, value));
+                with_shell(|s| s.assoc_entry(table_name).insert(name, value));
             }
-            None => match with_shell(|s| table(s).get(a.as_str()).cloned()) {
+            None => match table().get(a.as_str()).cloned() {
                 Some(v) => {
-                    out(&format!("alias {}={}\n", a, shell_quote(&v)));
+                    out(&show(a, &v));
                 }
                 None => {
                     builtin_err("alias", &format!("{}: not found", a));
@@ -1585,23 +2338,53 @@ fn builtin_alias(words: &[String]) -> i32 {
 
 fn builtin_unalias(words: &[String]) -> i32 {
     let mut status = 0;
-    for a in &words[1..] {
-        if a == "-a" {
-            with_shell(|s| {
+    let (mut all, mut suffix, mut global) = (false, false, false);
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            break;
+        };
+        i += 1;
+        if flags == "-" {
+            break;
+        }
+        for c in flags.chars() {
+            match c {
+                'a' => all = true,
+                's' => suffix = true,
+                'g' => global = true,
+                'm' => {}
+                _ => {
+                    builtin_err("unalias", &format!("bad option: -{}", c));
+                    return 1;
+                }
+            }
+        }
+    }
+    if all {
+        with_shell(|s| {
+            if suffix {
+                s.assoc_entry(crate::types::SALIASES).clear();
+            } else {
                 s.alias_map(false).clear();
                 s.alias_map(true).clear();
-            });
-            continue;
-        }
-        if a.starts_with('-') {
-            continue;
-        }
+            }
+        });
+        return 0;
+    }
+    for a in &words[i..] {
         let removed = with_shell(|s| {
-            s.alias_map(false).remove(a.as_str()).is_some()
-                | s.alias_map(true).remove(a.as_str()).is_some()
+            if suffix {
+                s.assoc_entry(crate::types::SALIASES)
+                    .remove(a.as_str())
+                    .is_some()
+            } else {
+                (!global && s.alias_map(false).remove(a.as_str()).is_some())
+                    | s.alias_map(true).remove(a.as_str()).is_some()
+            }
         });
         if !removed {
-            builtin_err("unalias", &format!("{}: not found", a));
+            builtin_err("unalias", &format!("no such hash table element: {}", a));
             status = 1;
         }
     }
@@ -1734,6 +2517,29 @@ fn whence_one(name: &str, o: &Whence, out_text: &mut String) -> bool {
                 format!("{}: aliased to {}", name, v)
             } else if o.verbose {
                 format!("{} is an alias for {}", name, v)
+            } else {
+                v
+            });
+            found = true;
+            if !o.all {
+                return true;
+            }
+        }
+        if let Some((ext, v)) = name.rsplit_once('.').and_then(|(stem, ext)| {
+            (!stem.is_empty())
+                .then(|| {
+                    with_shell(|s| {
+                        s.assoc(crate::types::SALIASES)
+                            .and_then(|m| m.get(ext).cloned())
+                    })
+                })
+                .flatten()
+                .map(|v| (ext.to_string(), v))
+        }) {
+            line(if o.word {
+                format!("{}: suffix alias", ext)
+            } else if o.verbose {
+                format!("{} is a suffix alias for {}", ext, v)
             } else {
                 v
             });
@@ -1955,15 +2761,94 @@ fn builtin_command(words: &[String]) -> i32 {
     status
 }
 
+// hash [-dfmrvL] [name[=value]] ...: with -d the named directory table,
+// otherwise the command table (looked up through PATH here).
 fn builtin_hash(words: &[String]) -> i32 {
-    let mut status = 0;
-    for name in &words[1..] {
-        if name.starts_with('-') {
-            continue;
+    let mut flags = String::new();
+    let mut i = 1;
+    while let Some(a) = words.get(i) {
+        let Some(f) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            break;
+        };
+        i += 1;
+        if f == "-" {
+            break;
         }
-        if find_command(name).is_none() && !is_builtin(name) {
-            builtin_err("hash", &format!("{}: not found", name));
-            status = 1;
+        for c in f.chars() {
+            if !"dfmrvL".contains(c) {
+                builtin_err("hash", &format!("bad option: -{}", c));
+                return 1;
+            }
+        }
+        flags.push_str(f);
+    }
+    let has = |c| flags.contains(c);
+    let args = &words[i..];
+    if !has('d') {
+        let mut status = 0;
+        for name in args {
+            let name = name.split_once('=').map_or(name.as_str(), |(n, _)| n);
+            if find_command(name).is_none() && !is_builtin(name) {
+                builtin_err("hash", &format!("{}: not found", name));
+                status = 1;
+            }
+        }
+        return status;
+    }
+    let table = &crate::shell::NAMED_DIRS;
+    if has('r') || has('f') {
+        if has('r') {
+            if let Ok(mut t) = table.lock() {
+                t.clear();
+            }
+        }
+        if args.is_empty() {
+            return 0;
+        }
+    }
+    let line = |k: &str, v: &str| {
+        if has('L') {
+            format!("hash -d {}={}\n", k, v)
+        } else {
+            format!("{}={}\n", k, v)
+        }
+    };
+    let all: Vec<(String, String)> = table
+        .lock()
+        .map(|t| t.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    if args.is_empty() || has('m') {
+        let mut text = String::new();
+        for (k, v) in &all {
+            if args.is_empty() || args.iter().any(|p| crate::pattern::matches(p, k)) {
+                text.push_str(&line(k, v));
+            }
+        }
+        out(&text);
+        return 0;
+    }
+    let mut status = 0;
+    for a in args {
+        match a.split_once('=') {
+            Some((name, dir)) => {
+                if let Ok(mut t) = table.lock() {
+                    t.insert(name.to_string(), dir.to_string());
+                }
+                if has('v') {
+                    out(&line(name, dir));
+                }
+            }
+            None => match crate::shell::named_dir(a) {
+                Some(d) => {
+                    if has('v') {
+                        out(&line(a, &d));
+                    }
+                }
+                None => {
+                    builtin_err("hash", &format!("no such directory name: {}", a));
+                    status = 1;
+                }
+            },
         }
     }
     status
@@ -1971,88 +2856,214 @@ fn builtin_hash(words: &[String]) -> i32 {
 
 // ---- processes and signals ------------------------------------------------
 
+// zsh's kill (bin_kill): one signal option, then pids or %jobs; the
+// status counts the failures.
 fn builtin_kill(words: &[String]) -> i32 {
-    let args = &words[1..];
-    if args.is_empty() {
-        return usage(
-            "kill",
-            "usage: kill [-s sigspec | -signum] pid | jobspec ...",
-        );
-    }
-    if args[0] == "-l" || args[0] == "-L" {
-        if args.len() == 1 {
-            let names: Vec<&str> = SIGNALS.iter().map(|(n, _)| *n).collect();
-            out(&format!("{}\n", names.join(" ")));
-            return 0;
-        }
-        let mut status = 0;
-        for a in &args[1..] {
-            match a.parse::<i32>() {
-                Ok(n) => {
-                    let n = if n > 128 { n - 128 } else { n };
-                    out(&format!("{}\n", signal_name(n)));
-                }
-                Err(_) => match signal_number(a) {
-                    Some(n) => {
-                        out(&format!("{}\n", n));
-                    }
-                    None => {
-                        err_line(&format!(
-                            "meowsh: kill: {}: invalid signal specification",
-                            a
-                        ));
-                        status = 1;
-                    }
-                },
-            }
-        }
-        return status;
-    }
     let mut sig = libc::SIGTERM;
-    let mut i = 0;
-    if args[0] == "-s" || args[0] == "-n" {
-        let Some(spec) = args.get(1) else {
-            return usage("kill", "option requires an argument");
-        };
-        match signal_number(spec) {
-            Some(s) => sig = s,
-            None => return usage("kill", &format!("{}: invalid signal specification", spec)),
+    let mut i = 1;
+    let mut got_sig = false;
+    let upper_name = |s: &str| {
+        let u = s.to_uppercase();
+        u.strip_prefix("SIG").map(str::to_string).unwrap_or(u)
+    };
+    let lookup = |name: &str| -> Option<i32> {
+        if name == "0" {
+            return Some(0);
         }
-        i = 2;
-    } else if args[0].starts_with('-') && args[0] != "--" && args[0].len() > 1 {
-        match signal_number(&args[0][1..]) {
-            Some(s) => sig = s,
-            None => {
-                return usage(
-                    "kill",
-                    &format!("{}: invalid signal specification", &args[0][1..]),
-                )
+        SIGNALS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, s)| *s)
+            .or(match name {
+                "IOT" => Some(libc::SIGABRT),
+                "POLL" | "IO" => Some(libc::SIGIO),
+                "CLD" => Some(libc::SIGCHLD),
+                _ => None,
+            })
+    };
+    while let Some(a) = words.get(i) {
+        if !a.starts_with('-') || got_sig {
+            break;
+        }
+        let body = &a[1..];
+        if body.starts_with(|c: char| c.is_ascii_digit()) {
+            match body.parse::<i32>() {
+                Ok(n) => sig = n,
+                Err(_) => {
+                    builtin_err("kill", &format!("invalid signal number: {}", a));
+                    return 1;
+                }
+            }
+        } else if body != "-" {
+            if body == "l" {
+                if words.len() > i + 1 {
+                    let mut ret = 0;
+                    for arg in &words[i + 1..] {
+                        let digits: String =
+                            arg.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if digits.is_empty() {
+                            let name = upper_name(arg);
+                            match lookup(&name) {
+                                Some(n) => {
+                                    out(&format!("{}\n", n));
+                                }
+                                None => {
+                                    builtin_err("kill", &format!("unknown signal: SIG{}", name));
+                                    ret += 1;
+                                }
+                            }
+                        } else if digits.len() < arg.len() {
+                            builtin_err(
+                                "kill",
+                                &format!("unknown signal: SIG{}", arg.to_uppercase()),
+                            );
+                            ret += 1;
+                        } else {
+                            let status: i32 = digits.parse().unwrap_or(0);
+                            let n = status & !0o200;
+                            match SIGNALS.iter().find(|(_, s)| *s == n) {
+                                Some((name, _)) => {
+                                    out(&format!("{}\n", name));
+                                }
+                                None => {
+                                    out(&format!("{}\n", status));
+                                }
+                            }
+                        }
+                    }
+                    return ret;
+                }
+                let names: Vec<&str> = SIGNALS.iter().map(|(n, _)| *n).collect();
+                out(&format!("{}\n", names.join(" ")));
+                return 0;
+            }
+            if body == "L" {
+                let cols = var_get("COLUMNS").parse::<usize>().unwrap_or(80);
+                let cols = if cols >= 30 {
+                    if cols < 90 {
+                        cols / 15
+                    } else {
+                        6
+                    }
+                } else {
+                    1
+                };
+                let mut text = String::new();
+                for (k, (name, n)) in SIGNALS.iter().enumerate() {
+                    let sep = if (k + 1) % cols == 0 || k + 1 == SIGNALS.len() {
+                        '\n'
+                    } else {
+                        ' '
+                    };
+                    text.push_str(&format!("{:2} {:<10}{}", n, name, sep));
+                }
+                out(&text);
+                return 0;
+            }
+            if body == "n" {
+                i += 1;
+                let Some(n) = words.get(i) else {
+                    builtin_err("kill", "-n: argument expected");
+                    return 1;
+                };
+                match n.parse::<i32>() {
+                    Ok(v) => sig = v,
+                    Err(_) => {
+                        builtin_err("kill", &format!("invalid signal number: {}", n));
+                        return 1;
+                    }
+                }
+            } else {
+                let name = if body == "s" {
+                    i += 1;
+                    match words.get(i) {
+                        Some(n) => n.clone(),
+                        None => {
+                            builtin_err("kill", "-s: argument expected");
+                            return 1;
+                        }
+                    }
+                } else {
+                    body.to_string()
+                };
+                if name.is_empty() {
+                    builtin_err("kill", "-: signal name expected");
+                    return 1;
+                }
+                let name = upper_name(&name);
+                match lookup(&name) {
+                    Some(n) => sig = n,
+                    None => {
+                        builtin_err("kill", &format!("unknown signal: SIG{}", name));
+                        builtin_err("kill", "type kill -L for a list of signals");
+                        return 1;
+                    }
+                }
             }
         }
-        i = 1;
+        i += 1;
+        got_sig = true;
     }
-    if args.get(i).map(|s| s.as_str()) == Some("--") {
+    if words
+        .get(i)
+        .is_some_and(|a| a == "-" || a.starts_with("--"))
+    {
         i += 1;
     }
-    let mut status = 0;
-    for spec in &args[i..] {
-        match kill_targets(spec) {
-            Ok(pids) => {
-                for pid in pids {
-                    if unsafe { libc::kill(pid, sig) } != 0 {
-                        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                        builtin_err("kill", &format!("({}) - {}", pid, strerror(e)));
-                        status = 1;
+    if i >= words.len() {
+        builtin_err("kill", "not enough arguments");
+        return 1;
+    }
+    let mut ret = 0;
+    for spec in &words[i..] {
+        if spec.starts_with('%') {
+            match kill_targets(spec) {
+                Ok(pids) => {
+                    for pid in pids {
+                        if unsafe { libc::kill(pid, sig) } != 0 {
+                            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                            builtin_err(
+                                "kill",
+                                &format!("kill {} failed: {}", spec, strerror(e).to_lowercase()),
+                            );
+                            ret += 1;
+                        }
                     }
                 }
+                Err(e) => {
+                    builtin_err("kill", &e.to_string());
+                    ret += 1;
+                }
             }
-            Err(e) => {
-                builtin_err("kill", &e.to_string());
-                status = 1;
-            }
+            continue;
+        }
+        let num = spec.strip_prefix('-').unwrap_or(spec);
+        if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+            builtin_err("kill", &format!("invalid pid: {}", spec));
+            ret += 1;
+            continue;
+        }
+        // A pid too big for pid_t can't name a process; reading it as 0
+        // would signal the shell's own process group.
+        let Ok(pid) = spec.parse::<libc::pid_t>() else {
+            builtin_err("kill", &format!("kill {} failed: no such process", spec));
+            ret += 1;
+            continue;
+        };
+        if unsafe { libc::kill(pid, sig) } != 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            builtin_err(
+                "kill",
+                &format!("kill {} failed: {}", spec, strerror(e).to_lowercase()),
+            );
+            ret += 1;
         }
     }
-    status
+    if ret < 126 {
+        ret
+    } else {
+        1
+    }
 }
 
 fn builtin_trap(words: &[String]) -> i32 {
@@ -2238,63 +3249,368 @@ fn builtin_umask(words: &[String]) -> i32 {
     0
 }
 
-fn builtin_ulimit(words: &[String]) -> i32 {
-    let mut hard = false;
-    let mut resource = (libc::RLIMIT_FSIZE, 512u64, "file size");
-    let mut value = None;
-    for a in &words[1..] {
-        match a.as_str() {
-            "-H" => hard = true,
-            "-S" => hard = false,
-            "-f" => resource = (libc::RLIMIT_FSIZE, 512, "file size"),
-            "-n" => resource = (libc::RLIMIT_NOFILE, 1, "open files"),
-            "-c" => resource = (libc::RLIMIT_CORE, 512, "core file size"),
-            "-s" => resource = (libc::RLIMIT_STACK, 1024, "stack size"),
-            "-t" => resource = (libc::RLIMIT_CPU, 1, "cpu time"),
-            "-d" => resource = (libc::RLIMIT_DATA, 1024, "data seg size"),
-            "-v" => resource = (libc::RLIMIT_AS, 1024, "virtual memory"),
-            v if !v.starts_with('-') => value = Some(v.to_string()),
-            o => return usage("ulimit", &format!("{}: invalid option", o)),
-        }
-    }
-    let (res, unit, what) = resource;
+// zsh/rlimits: each resource with its `limit` name, `ulimit` letter,
+// unit and description, in RLIMIT_* order.
+#[derive(Clone, Copy, PartialEq)]
+enum LimKind {
+    Time,
+    Blocks,
+    Kbytes,
+    Number,
+    Micro,
+}
+
+const LIMITS: &[(&str, char, LimKind, &str)] = &[
+    ("cputime", 't', LimKind::Time, "cpu time (seconds)"),
+    ("filesize", 'f', LimKind::Blocks, "file size (blocks)"),
+    ("datasize", 'd', LimKind::Kbytes, "data seg size (kbytes)"),
+    ("stacksize", 's', LimKind::Kbytes, "stack size (kbytes)"),
+    (
+        "coredumpsize",
+        'c',
+        LimKind::Blocks,
+        "core file size (blocks)",
+    ),
+    (
+        "resident",
+        'm',
+        LimKind::Kbytes,
+        "resident set size (kbytes)",
+    ),
+    ("maxproc", 'u', LimKind::Number, "processes"),
+    ("descriptors", 'n', LimKind::Number, "file descriptors"),
+    (
+        "memorylocked",
+        'l',
+        LimKind::Kbytes,
+        "locked-in-memory size (kbytes)",
+    ),
+    (
+        "addressspace",
+        'v',
+        LimKind::Kbytes,
+        "address space (kbytes)",
+    ),
+    ("maxfilelocks", 'x', LimKind::Number, "file locks"),
+    ("sigpending", 'i', LimKind::Number, "pending signals"),
+    (
+        "msgqueue",
+        'q',
+        LimKind::Number,
+        "bytes in POSIX msg queues",
+    ),
+    ("nice", 'e', LimKind::Number, "max nice"),
+    ("rt_priority", 'r', LimKind::Number, "max rt priority"),
+    ("rt_time", 'N', LimKind::Micro, "rt cpu time (microseconds)"),
+];
+
+fn get_limit(res: usize, hard: bool) -> Option<u64> {
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrlimit(res as _, &mut lim) } != 0 {
-        builtin_err("ulimit", &format!("{}: cannot get limit", what));
-        return 1;
+        return None;
     }
-    match value {
-        None => {
-            let cur = if hard { lim.rlim_max } else { lim.rlim_cur };
-            if cur == libc::RLIM_INFINITY {
-                out("unlimited\n");
-            } else {
-                out(&format!("{}\n", cur as u64 / unit));
+    Some(if hard { lim.rlim_max } else { lim.rlim_cur } as u64)
+}
+
+fn set_limit(name: &str, res: usize, hard: bool, soft: bool, val: u64) -> bool {
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(res as _, &mut lim) } != 0 {
+        return false;
+    }
+    if hard {
+        lim.rlim_max = val as libc::rlim_t;
+    }
+    if soft {
+        lim.rlim_cur = val as libc::rlim_t;
+    }
+    if unsafe { libc::setrlimit(res as _, &lim) } != 0 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        builtin_err(
+            name,
+            &format!("setrlimit failed: {}", strerror(e).to_lowercase()),
+        );
+        return false;
+    }
+    true
+}
+
+// ulimit's unit for a resource (what one counted unit is in the raw limit).
+fn ulimit_unit(kind: LimKind) -> u64 {
+    match kind {
+        LimKind::Blocks => 512,
+        LimKind::Kbytes => 1024,
+        _ => 1,
+    }
+}
+
+fn ulimit_value(v: u64, kind: LimKind) -> String {
+    if v == libc::RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        (v / ulimit_unit(kind)).to_string()
+    }
+}
+
+// zsh's ulimit: options pick resources (several allowed), -H/-S hard or
+// soft, -a all; an argument after a resource sets it.
+fn builtin_ulimit(words: &[String]) -> i32 {
+    let (mut hard, mut soft, mut all) = (false, false, false);
+    let mut chosen: Vec<(usize, Option<String>)> = Vec::new();
+    let mut i = 1;
+    while let Some(w) = words.get(i) {
+        i += 1;
+        let Some(body) = w.strip_prefix('-').filter(|b| !b.is_empty()) else {
+            // A value for the last resource (or the default -f).
+            if chosen.is_empty() {
+                chosen.push((1, None));
             }
-            0
-        }
-        Some(v) => {
-            let new = if v == "unlimited" {
-                libc::RLIM_INFINITY
-            } else {
-                match v.parse::<u64>() {
-                    Ok(n) => (n.saturating_mul(unit)) as libc::rlim_t,
-                    Err(_) => return usage("ulimit", &format!("{}: invalid number", v)),
+            chosen.last_mut().unwrap().1 = Some(w.clone());
+            continue;
+        };
+        let chars: Vec<char> = body.chars().collect();
+        let mut k = 0;
+        while k < chars.len() {
+            let c = chars[k];
+            k += 1;
+            match c {
+                'H' => hard = true,
+                'S' => soft = true,
+                'a' => all = true,
+                'N' => {
+                    let rest: String = chars[k..].iter().collect();
+                    let spec = if !rest.is_empty() {
+                        k = chars.len();
+                        rest
+                    } else if let Some(n) = words.get(i) {
+                        i += 1;
+                        n.clone()
+                    } else {
+                        builtin_err("ulimit", "number required after -N");
+                        return 1;
+                    };
+                    match spec.parse::<usize>() {
+                        Ok(n) => chosen.push((n, None)),
+                        Err(_) => {
+                            builtin_err("ulimit", &format!("invalid number: {}", spec));
+                            return 1;
+                        }
+                    }
                 }
-            };
-            if hard {
-                lim.rlim_max = new;
-            } else {
-                lim.rlim_cur = new;
+                c => match LIMITS.iter().position(|l| l.1 == c) {
+                    Some(r) => chosen.push((r, None)),
+                    None => {
+                        builtin_err("ulimit", &format!("bad option: -{}", c));
+                        return 1;
+                    }
+                },
             }
-            if unsafe { libc::setrlimit(res as _, &lim) } != 0 {
-                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                builtin_err("ulimit", &format!("{}: {}", what, strerror(e)));
-                return 1;
-            }
-            0
         }
     }
+    if all {
+        if !chosen.is_empty() {
+            builtin_err("ulimit", "no limits allowed with -a");
+            return 1;
+        }
+        let mut text = String::new();
+        for (r, l) in LIMITS.iter().enumerate() {
+            let opt = if l.1 == 'N' {
+                format!("-N {}", r)
+            } else {
+                format!("-{}", l.1)
+            };
+            let head = format!("{}: {}", opt, l.3);
+            let v = get_limit(r, hard)
+                .map(|v| ulimit_value(v, l.2))
+                .unwrap_or_default();
+            text.push_str(&format!("{:<36}{}\n", head, v));
+        }
+        out(&text);
+        return 0;
+    }
+    if chosen.is_empty() {
+        chosen.push((1, None));
+    }
+    let many = chosen.len() > 1;
+    let mut ret = 0;
+    for (r, val) in chosen {
+        let (kind, desc) = LIMITS
+            .get(r)
+            .map_or((LimKind::Number, "unknown"), |l| (l.2, l.3));
+        match val {
+            None => {
+                let v = get_limit(r, hard)
+                    .map(|v| ulimit_value(v, kind))
+                    .unwrap_or_default();
+                if many {
+                    let opt = LIMITS
+                        .get(r)
+                        .map_or(format!("-N {}", r), |l| format!("-{}", l.1));
+                    out(&format!("{:<36}{}\n", format!("{}: {}", opt, desc), v));
+                } else {
+                    out(&format!("{}\n", v));
+                }
+            }
+            Some(v) => {
+                let new = if v == "unlimited" {
+                    libc::RLIM_INFINITY
+                } else {
+                    match v.parse::<u64>() {
+                        Ok(n) => n.saturating_mul(ulimit_unit(kind)),
+                        Err(_) => {
+                            builtin_err("ulimit", &format!("invalid number: {}", v));
+                            return 1;
+                        }
+                    }
+                };
+                let (h, s) = if hard || soft {
+                    (hard, soft)
+                } else {
+                    (true, true)
+                };
+                if !set_limit("ulimit", r, h, s, new) {
+                    ret = 1;
+                }
+            }
+        }
+    }
+    ret
+}
+
+// `limit` / `unlimit` value text: times as h:mm:ss, sizes in kB or MB.
+fn limit_text(v: u64, kind: LimKind) -> String {
+    if v == libc::RLIM_INFINITY {
+        return "unlimited".to_string();
+    }
+    match kind {
+        LimKind::Time => format!("{}:{:02}:{:02}", v / 3600, (v / 60) % 60, v % 60),
+        LimKind::Blocks | LimKind::Kbytes => {
+            if v >= 1024 * 1024 {
+                format!("{}MB", v / (1024 * 1024))
+            } else {
+                format!("{}kB", v / 1024)
+            }
+        }
+        LimKind::Micro => format!("{}us", v),
+        LimKind::Number => v.to_string(),
+    }
+}
+
+// limit [-hs] [resource [value]] ...
+fn builtin_limit(words: &[String]) -> i32 {
+    let mut hard = false;
+    let mut args = &words[1..];
+    while let Some(a) = args.first().filter(|a| a.starts_with('-') && a.len() > 1) {
+        if a.contains('h') {
+            hard = true;
+        }
+        args = &args[1..];
+    }
+    let lookup = |n: &str| {
+        LIMITS
+            .iter()
+            .position(|l| l.0.starts_with(n) && !n.is_empty())
+    };
+    if args.is_empty() {
+        let mut text = String::new();
+        for (r, l) in LIMITS.iter().enumerate() {
+            let v = get_limit(r, hard)
+                .map(|v| limit_text(v, l.2))
+                .unwrap_or_default();
+            text.push_str(&format!("{:<16}{}\n", l.0, v));
+        }
+        out(&text);
+        return 0;
+    }
+    let mut k = 0;
+    let mut ret = 0;
+    while k < args.len() {
+        let Some(r) = lookup(&args[k]) else {
+            builtin_err("limit", &format!("no such resource: {}", args[k]));
+            return 1;
+        };
+        let kind = LIMITS[r].2;
+        match args.get(k + 1) {
+            None => {
+                let v = get_limit(r, hard)
+                    .map(|v| limit_text(v, kind))
+                    .unwrap_or_default();
+                out(&format!("{:<16}{}\n", LIMITS[r].0, v));
+                k += 1;
+            }
+            Some(v) => {
+                let val = if v == "unlimited" {
+                    libc::RLIM_INFINITY
+                } else {
+                    let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    let n: u64 = match digits.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            builtin_err("limit", &format!("limit must be a number: {}", v));
+                            return 1;
+                        }
+                    };
+                    let suffix = v[digits.len()..].to_ascii_lowercase();
+                    match kind {
+                        LimKind::Time => match suffix.as_str() {
+                            "h" => n * 3600,
+                            "m" => n * 60,
+                            _ => n,
+                        },
+                        LimKind::Blocks | LimKind::Kbytes => match suffix.as_str() {
+                            "m" | "mb" => n * 1024 * 1024,
+                            "g" | "gb" => n * 1024 * 1024 * 1024,
+                            _ => n * 1024,
+                        },
+                        _ => n,
+                    }
+                };
+                if !set_limit("limit", r, hard, !hard, val) {
+                    ret = 1;
+                }
+                k += 2;
+            }
+        }
+    }
+    ret
+}
+
+// unlimit [-h] [resource ...]: back to unlimited (as far as allowed).
+fn builtin_unlimit(words: &[String]) -> i32 {
+    let mut hard = false;
+    let mut args = &words[1..];
+    while let Some(a) = args.first().filter(|a| a.starts_with('-') && a.len() > 1) {
+        if a.contains('h') {
+            hard = true;
+        }
+        args = &args[1..];
+    }
+    let targets: Vec<usize> = if args.is_empty() {
+        (0..LIMITS.len()).collect()
+    } else {
+        let mut v = Vec::new();
+        for a in args {
+            match LIMITS.iter().position(|l| l.0.starts_with(a.as_str())) {
+                Some(r) => v.push(r),
+                None => {
+                    builtin_err("unlimit", &format!("no such resource: {}", a));
+                    return 1;
+                }
+            }
+        }
+        v
+    };
+    let mut ret = 0;
+    for r in targets {
+        let to = if hard {
+            libc::RLIM_INFINITY
+        } else {
+            get_limit(r, true).unwrap_or(libc::RLIM_INFINITY)
+        };
+        if !set_limit("unlimit", r, hard, true, to) {
+            ret = 1;
+        }
+    }
+    ret
 }
 
 // ---- zsh compatibility ----------------------------------------------------
@@ -2346,6 +3662,8 @@ fn define_stub(name: &str, dir: Option<&str>, default_too: bool) {
                 },
             )
         });
+        // An autoloaded TRAPxxx sets its trap now, as a defined one does.
+        crate::trap::function_defined(name);
     }
 }
 
@@ -2461,9 +3779,25 @@ fn autoload_exec(dir: Option<&str>, default_too: bool) -> i32 {
     // Functions it defines come from its file.
     let origin = with_shell(|s| s.functions.get(&name).map(|f| f.origin.clone()));
     let saved = with_shell(|s| std::mem::replace(&mut s.source_file, origin));
-    let mut words = vec![name];
+    let mut words = vec![name.clone()];
     words.extend(args);
-    let st = call_function(&body, &words, line);
+    let st = if crate::options::is_set("kshautoload") {
+        // KSH_AUTOLOAD: the file is run, and should define the function,
+        // which is then called.
+        crate::exec::exec_node(&body);
+        let defined = with_shell(|s| {
+            s.functions
+                .get(&name)
+                .filter(|f| !Arc::ptr_eq(&f.body, &body))
+                .map(|f| (f.body.clone(), f.line))
+        });
+        match defined {
+            Some((b, l)) => call_function(&b, &words, l),
+            None => last_status(),
+        }
+    } else {
+        call_function(&body, &words, line)
+    };
     with_shell(|s| s.source_file = saved);
     st
 }
@@ -2499,8 +3833,9 @@ fn autoload_now(name: &str, dir: Option<&str>, fpath_too: bool) -> bool {
             return false;
         }
     };
+    let ksh = crate::options::is_set("kshautoload");
     let body = match nodes.as_slice() {
-        [Node::FuncDef { name: n, body, .. }] if n == name => (**body).clone(),
+        [Node::FuncDef { name: n, body, .. }] if n == name && !ksh => (**body).clone(),
         _ => Node::List(
             nodes
                 .into_iter()
@@ -2541,6 +3876,20 @@ fn builtin_setopt(words: &[String], value: bool) -> i32 {
         // name for setopt; with a `no` prefix for unsetopt.
         let emu = with_shell(|s| s.emulation);
         let mut text = String::new();
+        // KSH_OPTION_PRINT: every option with its state, as zsh's
+        // printoptionnodestate shows them.
+        if crate::options::is_set("kshoptionprint") {
+            for o in crate::options::names() {
+                let on = crate::options::is_set(o);
+                if crate::options::default_in(o, emu) {
+                    text.push_str(&format!("no{:<19} {}\n", o, if on { "off" } else { "on" }));
+                } else {
+                    text.push_str(&format!("{:<21} {}\n", o, if on { "on" } else { "off" }));
+                }
+            }
+            out(&text);
+            return 0;
+        }
         // setopt lists options changed from their defaults, unsetopt the
         // rest; either way an option that is off shows as `noname` when it
         // is on by default.
@@ -2846,182 +4195,490 @@ fn builtin_fc(words: &[String]) -> i32 {
     0
 }
 
-fn drop_unknown_escapes(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            if let Some(&n) = chars.peek() {
-                if !n.is_alphanumeric() {
-                    out.push(n);
-                    chars.next();
-                    continue;
-                }
-            }
-        }
-        out.push(c);
-    }
-    out
-}
-
 // zparseopts [-D] [-E] [-F] [-K] [-M] [-a array] [-A assoc] [--] spec...
 // Parses options from the positional parameters. A spec is
 // name[+][:|::][=array]; matched options are stored as `-name` (and the
 // argument) in the spec's array or the -a array, and as keys in -A.
+// zsh/zutil's zparseopts (bin_zparseopts): parses options described by
+// specs `name[+][:[:][-]][=array]` out of $argv (or -v array).
 fn builtin_zparseopts(words: &[String]) -> i32 {
-    struct Spec {
+    const ARG: u8 = 1;
+    const OPT: u8 = 2;
+    const SAME: u8 = 4;
+    const MULT: u8 = 8;
+    const GNUL: u8 = 16;
+    const GNUS: u8 = 32;
+    const MAP: u8 = 64;
+    struct Desc {
         name: String,
-        arg: u8, // 0 none, 1 required, 2 optional (attached only)
-        append: bool,
-        array: Option<String>,
+        flags: u8,
+        arr: Option<usize>,
+        // Indices into `vals` of this option's values.
+        vals: Vec<usize>,
     }
-    let (mut delete, mut extract, mut fail_unknown, mut keep) = (false, false, false, false);
-    let (mut def_array, mut assoc) = (None::<String>, None::<String>);
+    struct Val {
+        name: String,
+        arg: Option<String>,
+        // The single-element form (`-xarg`, `--long=arg`).
+        joined: Option<String>,
+    }
+    struct Arr {
+        name: String,
+        vals: Vec<usize>,
+        real: bool,
+    }
+    // Builtin option parsing for "a:A:DEFGKMn:v:".
+    let mut ops: std::collections::HashMap<char, String> = std::collections::HashMap::new();
     let mut i = 1;
-    while let Some(a) = words.get(i) {
-        match a.as_str() {
-            "-D" => delete = true,
-            "-E" => extract = true,
-            "-F" => fail_unknown = true,
-            "-K" => keep = true,
-            "-M" => {}
-            "-a" => {
-                i += 1;
-                def_array = words.get(i).cloned();
-            }
-            "-A" => {
-                i += 1;
-                assoc = words.get(i).cloned();
-            }
-            "--" => {
-                i += 1;
-                break;
-            }
-            _ => break,
-        }
-        i += 1;
-    }
-    let mut specs = Vec::new();
-    for raw in &words[i.min(words.len())..] {
-        let (body, array) = match raw.split_once('=') {
-            Some((b, a)) => (b, Some(a.to_string())),
-            None => (raw.as_str(), None),
+    'outer: while let Some(w) = words.get(i) {
+        let Some(body) = w.strip_prefix('-') else {
+            break;
         };
-        let mut name = body.to_string();
-        let mut arg = 0;
-        if let Some(n) = name.strip_suffix("::") {
-            name = n.to_string();
-            arg = 2;
-        } else if let Some(n) = name.strip_suffix(":-").or_else(|| name.strip_suffix(':')) {
-            name = n.to_string();
-            arg = 1;
-        }
-        let append = name.ends_with('+') && name.len() > 1;
-        if append {
-            name.pop();
-        }
-        specs.push(Spec {
-            name,
-            arg,
-            append,
-            array,
-        });
-    }
-    let params = with_shell(|s| s.pos_params.clone());
-    let mut results: Vec<(usize, Vec<String>)> = Vec::new();
-    let mut assoc_out: Vec<(String, String)> = Vec::new();
-    let mut kept = Vec::new();
-    let mut k = 0;
-    while k < params.len() {
-        let p = &params[k];
-        if p == "-" || p == "--" {
-            if !delete {
-                kept.push(p.clone());
-            }
-            kept.extend(params[k + 1..].iter().cloned());
+        i += 1;
+        if body.is_empty() || body == "-" {
             break;
         }
-        let Some(opt) = p.strip_prefix('-').filter(|o| !o.is_empty()) else {
-            kept.push(p.clone());
-            if !extract {
-                kept.extend(params[k + 1..].iter().cloned());
-                break;
+        let chars: Vec<char> = body.chars().collect();
+        let mut k = 0;
+        while k < chars.len() {
+            let c = chars[k];
+            match c {
+                'a' | 'A' | 'n' | 'v' => {
+                    let v = if k + 1 < chars.len() {
+                        chars[k + 1..].iter().collect()
+                    } else {
+                        match words.get(i) {
+                            Some(v) => {
+                                i += 1;
+                                v.clone()
+                            }
+                            None => {
+                                builtin_err("zparseopts", &format!("argument expected: -{}", c));
+                                return 1;
+                            }
+                        }
+                    };
+                    ops.insert(c, v);
+                    continue 'outer;
+                }
+                'D' | 'E' | 'F' | 'G' | 'K' | 'M' => {
+                    ops.insert(c, String::new());
+                }
+                _ => {
+                    builtin_err("zparseopts", &format!("bad option: -{}", c));
+                    return 1;
+                }
             }
             k += 1;
-            continue;
-        };
-        // Longest spec name that the option starts with.
-        let found = specs
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| opt == s.name || (s.arg > 0 && opt.starts_with(&s.name)))
-            .max_by_key(|(_, s)| s.name.len());
-        let Some((idx, spec)) = found else {
-            if fail_unknown {
-                builtin_err("zparseopts", &format!("bad option: {}", p));
+        }
+    }
+    let has = |c| ops.contains_key(&c);
+    let (del, extract, fail, gnu, keep) = (has('D'), has('E'), has('F'), has('G'), has('K'));
+    let map = has('M');
+    let mut arrs: Vec<Arr> = Vec::new();
+    let mut defarr = None;
+    if let Some(n) = ops.get(&'a') {
+        if n.is_empty() {
+            builtin_err("zparseopts", "missing array name for -a");
+            return 1;
+        }
+        arrs.push(Arr {
+            name: n.clone(),
+            vals: Vec::new(),
+            real: true,
+        });
+        defarr = Some(0);
+    }
+    let assoc = ops.get(&'A').cloned();
+    if assoc.as_deref() == Some("") {
+        builtin_err("zparseopts", "missing array name for -A");
+        return 1;
+    }
+    let progname = match ops.get(&'n') {
+        Some(n) if n.is_empty() => {
+            builtin_err("zparseopts", "missing program name for -n");
+            return 1;
+        }
+        Some(n) => n.clone(),
+        None => crate::shell::with_err_ctx(|e| e.name.clone()),
+    };
+    let paramsname = ops.get(&'v').cloned().unwrap_or_else(|| "argv".to_string());
+    let params: Vec<String> = if paramsname == "argv" {
+        with_shell(|s| s.pos_params.clone())
+    } else {
+        match with_shell(|s| s.array(&paramsname).cloned()) {
+            Some(p) => p,
+            None => {
+                builtin_err("zparseopts", &format!("no such array: {}", paramsname));
                 return 1;
             }
-            kept.push(p.clone());
-            if !extract {
-                kept.extend(params[k + 1..].iter().cloned());
-                break;
+        }
+    };
+    let mut specs: &[String] = &words[i.min(words.len())..];
+    if specs.len() == 1 && (specs[0].is_empty() || specs[0] == "-") {
+        specs = &[];
+    } else if specs.is_empty() {
+        builtin_err("zparseopts", "missing option descriptions");
+        return 1;
+    }
+    let mut descs: Vec<Desc> = Vec::new();
+    for spec in specs {
+        if spec.is_empty() {
+            builtin_err(
+                "zparseopts",
+                &format!("invalid option description: {}", spec),
+            );
+            return 1;
+        }
+        let ch: Vec<char> = spec.chars().collect();
+        let mut p = 0;
+        let mut f = 0u8;
+        let mut name_end = ch.len();
+        while p < ch.len() {
+            if ch[p] == '\\' && p + 1 < ch.len() {
+                p += 2;
+                continue;
             }
-            k += 1;
-            continue;
+            if p > 0 {
+                if ch[p] == '+' {
+                    f |= MULT;
+                    name_end = p;
+                    p += 1;
+                    break;
+                } else if ch[p] == ':' || ch[p] == '=' {
+                    name_end = p;
+                    break;
+                }
+            }
+            p += 1;
+        }
+        if name_end == ch.len() {
+            name_end = p.min(ch.len());
+        }
+        let raw_name: String = ch[..name_end].iter().collect();
+        if ch.get(p) == Some(&':') {
+            f |= ARG;
+            if gnu {
+                f |= if raw_name.chars().count() > 1 {
+                    GNUL
+                } else {
+                    GNUS
+                };
+            }
+            p += 1;
+            if ch.get(p) == Some(&':') {
+                p += 1;
+                f |= OPT;
+            }
+            if ch.get(p) == Some(&'-') {
+                p += 1;
+                f |= SAME;
+            }
+        }
+        let arr = if ch.get(p) == Some(&'=') {
+            let an: String = ch[p + 1..].iter().collect();
+            f |= if map { MAP } else { 0 };
+            Some(match arrs.iter().position(|x| x.name == an) {
+                Some(k) => k,
+                None => {
+                    arrs.push(Arr {
+                        name: an,
+                        vals: Vec::new(),
+                        real: true,
+                    });
+                    arrs.len() - 1
+                }
+            })
+        } else if p < ch.len() {
+            builtin_err(
+                "zparseopts",
+                &format!("invalid option description: {}", spec),
+            );
+            return 1;
+        } else if defarr.is_none() && assoc.is_none() {
+            builtin_err("zparseopts", &format!("no default array defined: {}", spec));
+            return 1;
+        } else {
+            defarr
         };
-        let mut vals = vec![format!("-{}", spec.name)];
-        let attached = &opt[spec.name.len()..];
-        let mut value = None;
-        if spec.arg > 0 {
-            if !attached.is_empty() {
-                value = Some(attached.to_string());
-            } else if spec.arg == 1 {
-                k += 1;
-                match params.get(k) {
-                    Some(v) => value = Some(v.clone()),
-                    None => {
-                        err_line(&format!(
-                            "meowsh: zparseopts: missing argument for option: {}",
-                            p
-                        ));
-                        return 1;
+        let mut name = String::new();
+        let mut it = raw_name.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                if let Some(n) = it.next() {
+                    name.push(n);
+                    continue;
+                }
+            }
+            name.push(c);
+        }
+        if descs.iter().any(|d| d.name == name) {
+            builtin_err(
+                "zparseopts",
+                &format!("option defined more than once: {}", name),
+            );
+            return 1;
+        }
+        descs.push(Desc {
+            name,
+            flags: f,
+            arr,
+            vals: Vec::new(),
+        });
+    }
+    // -M: an option whose array names another option is that option.
+    let resolve = |descs: &Vec<Desc>, arrs: &Vec<Arr>, d: usize| -> usize {
+        let mut cur = d;
+        for _ in 0..descs.len() + 1 {
+            if descs[cur].flags & MAP == 0 {
+                return cur;
+            }
+            let Some(a) = descs[cur].arr else {
+                return cur;
+            };
+            match descs.iter().position(|x| x.name == arrs[a].name) {
+                Some(n) if n != cur => cur = n,
+                _ => return cur,
+            }
+        }
+        cur
+    };
+    let mut vals: Vec<Val> = Vec::new();
+    let mut add = |descs: &mut Vec<Desc>, arrs: &mut Vec<Arr>, d0: usize, arg: Option<String>| {
+        let name = format!("-{}", descs[d0].name);
+        let d = resolve(descs, arrs, d0);
+        let flags = descs[d].flags;
+        let joined = if flags & ARG != 0 && flags & (OPT | SAME) == 0 {
+            None
+        } else if arg.is_some() || flags & GNUL != 0 {
+            let mut s = format!("-{}", descs[d].name);
+            if flags & GNUL != 0 {
+                s.push('=');
+            }
+            s.push_str(arg.as_deref().unwrap_or(""));
+            Some(s)
+        } else {
+            None
+        };
+        let v = Val { name, arg, joined };
+        if flags & MULT == 0 {
+            if let Some(&k) = descs[d].vals.first() {
+                vals[k] = v;
+                return;
+            }
+        }
+        vals.push(v);
+        let k = vals.len() - 1;
+        descs[d].vals.push(k);
+        if let Some(a) = descs[d].arr {
+            arrs[a].vals.push(k);
+        }
+    };
+    // Latest definitions are found first, as zsh's list is built.
+    let lookup = |descs: &Vec<Desc>, s: &str| -> Option<usize> {
+        (0..descs.len()).rev().find(|&k| {
+            let d = &descs[k];
+            if d.flags & GNUL != 0 {
+                s == d.name
+                    || (s.starts_with(d.name.as_str()) && s[d.name.len()..].starts_with('='))
+            } else if d.flags & ARG != 0 {
+                s.starts_with(d.name.as_str())
+            } else {
+                s == d.name
+            }
+        })
+    };
+    let short = |descs: &Vec<Desc>, c: char| -> Option<usize> {
+        (0..descs.len())
+            .rev()
+            .find(|&k| descs[k].name.chars().count() == 1 && descs[k].name.starts_with(c))
+    };
+    let mut kept_extract: Vec<String> = Vec::new();
+    let mut pp = 0;
+    while pp < params.len() {
+        let o = &params[pp];
+        if !o.starts_with('-') || (gnu && o == "-") {
+            if extract {
+                if del {
+                    kept_extract.push(o.clone());
+                }
+                pp += 1;
+                continue;
+            }
+            break;
+        }
+        if o == "-" || o == "--" {
+            if del && extract {
+                kept_extract.push(o.clone());
+            }
+            pp += 1;
+            break;
+        }
+        let body = &o[1..];
+        match lookup(&descs, body) {
+            Some(d) => {
+                if descs[d].flags & ARG != 0 {
+                    let e = &body[descs[d].name.len()..];
+                    let fl = descs[d].flags;
+                    if fl & GNUL != 0 && e.starts_with('=') {
+                        add(&mut descs, &mut arrs, d, Some(e[1..].to_string()));
+                    } else if !e.is_empty() {
+                        add(&mut descs, &mut arrs, d, Some(e.to_string()));
+                    } else if fl & OPT == 0
+                        || (fl & (GNUL | GNUS) == 0
+                            && params.get(pp + 1).is_some_and(|n| !n.starts_with('-')))
+                    {
+                        match params.get(pp + 1) {
+                            Some(n) => {
+                                pp += 1;
+                                add(&mut descs, &mut arrs, d, Some(n.clone()));
+                            }
+                            None => {
+                                err_line(&format!(
+                                    "{}: missing argument for option: -{}",
+                                    progname, descs[d].name
+                                ));
+                                return 1;
+                            }
+                        }
+                    } else {
+                        add(&mut descs, &mut arrs, d, None);
                     }
+                } else {
+                    add(&mut descs, &mut arrs, d, None);
+                }
+            }
+            None => {
+                let chars: Vec<char> = body.chars().collect();
+                let mut not_opt = false;
+                let mut k = 0;
+                while k < chars.len() {
+                    let c = chars[k];
+                    let Some(d) = short(&descs, c) else {
+                        if fail {
+                            if c != '-' || k > 0 {
+                                err_line(&format!("{}: bad option: -{}", progname, c));
+                            } else {
+                                err_line(&format!("{}: bad option: -{}", progname, body));
+                            }
+                            return 1;
+                        }
+                        not_opt = true;
+                        break;
+                    };
+                    let fl = descs[d].flags;
+                    if fl & ARG != 0 {
+                        if k + 1 < chars.len() {
+                            add(
+                                &mut descs,
+                                &mut arrs,
+                                d,
+                                Some(chars[k + 1..].iter().collect()),
+                            );
+                            break;
+                        } else if fl & OPT == 0
+                            || (fl & (GNUL | GNUS) == 0
+                                && params.get(pp + 1).is_some_and(|n| !n.starts_with('-')))
+                        {
+                            match params.get(pp + 1) {
+                                Some(n) => {
+                                    pp += 1;
+                                    add(&mut descs, &mut arrs, d, Some(n.clone()));
+                                }
+                                None => {
+                                    err_line(&format!(
+                                        "{}: missing argument for option: -{}",
+                                        progname, descs[d].name
+                                    ));
+                                    return 1;
+                                }
+                            }
+                        } else {
+                            add(&mut descs, &mut arrs, d, None);
+                        }
+                    } else {
+                        add(&mut descs, &mut arrs, d, None);
+                    }
+                    k += 1;
+                }
+                if not_opt {
+                    if extract {
+                        if del {
+                            kept_extract.push(o.clone());
+                        }
+                        pp += 1;
+                        continue;
+                    }
+                    break;
                 }
             }
         }
-        if let Some(v) = &value {
-            vals.push(v.clone());
-        }
-        assoc_out.push((format!("-{}", spec.name), value.unwrap_or_default()));
-        match results.iter_mut().find(|(j, _)| *j == idx) {
-            Some((_, existing)) if spec.append => existing.extend(vals),
-            Some((_, existing)) => *existing = vals,
-            None => results.push((idx, vals)),
-        }
-        k += 1;
+        pp += 1;
     }
-    let mut default_items = Vec::new();
-    for (idx, vals) in &results {
-        match &specs[*idx].array {
-            Some(arr) => {
-                array_set(arr, vals.clone());
+    if map {
+        for d in &descs {
+            if let Some(a) = d.arr {
+                if d.vals.is_empty()
+                    && d.flags & MAP != 0
+                    && arrs[a].vals.is_empty()
+                    && descs.iter().any(|x| x.name == arrs[a].name)
+                {
+                    arrs[a].real = false;
+                }
             }
-            None => default_items.extend(vals.iter().cloned()),
         }
     }
-    if let Some(arr) = def_array {
-        if !(keep && default_items.is_empty()) {
-            array_set(&arr, default_items);
+    if extract && del {
+        kept_extract.extend(params[pp.min(params.len())..].iter().cloned());
+    }
+    for a in &arrs {
+        if a.real && (!keep || !a.vals.is_empty()) {
+            let mut out = Vec::new();
+            for &k in &a.vals {
+                let v = &vals[k];
+                match &v.joined {
+                    Some(s) => out.push(s.clone()),
+                    None => {
+                        out.push(v.name.clone());
+                        if let Some(arg) = &v.arg {
+                            out.push(arg.clone());
+                        }
+                    }
+                }
+            }
+            array_set(&a.name, out);
         }
     }
     if let Some(name) = assoc {
-        assoc_declare(&name);
-        for (key, v) in assoc_out {
-            crate::shell::assoc_set(&name, &key, &v);
+        let used: Vec<&Desc> = descs.iter().filter(|d| !d.vals.is_empty()).collect();
+        if !keep || !used.is_empty() {
+            if !keep {
+                with_shell(|s| {
+                    s.remove_param(&name);
+                });
+            }
+            assoc_declare(&name);
+            for d in used.iter().rev() {
+                let text: Vec<String> = d
+                    .vals
+                    .iter()
+                    .map(|&k| vals[k].arg.clone().unwrap_or_default())
+                    .collect();
+                crate::shell::assoc_set(&name, &format!("-{}", d.name), &text.join(" "));
+            }
         }
     }
-    if delete {
-        with_shell(|s| s.pos_params = kept);
+    if del {
+        let rest = if extract {
+            kept_extract
+        } else {
+            params[pp.min(params.len())..].to_vec()
+        };
+        if paramsname == "argv" {
+            with_shell(|s| s.pos_params = rest);
+        } else {
+            array_set(&paramsname, rest);
+        }
     }
     0
 }
@@ -3119,9 +4776,36 @@ fn builtin_emulate(words: &[String]) -> i32 {
     let (mut reset_all, mut local) = (false, false);
     let mut mode = None;
     let mut cmd = None;
+    // `-o name` / `+o name` / `-x` after the emulation: extra options.
+    let mut extra: Vec<(String, bool)> = Vec::new();
     let mut i = 1;
     while let Some(a) = words.get(i) {
         match a.as_str() {
+            "-o" | "+o" if mode.is_some() => {
+                i += 1;
+                let Some(name) = words.get(i) else {
+                    return usage("emulate", "-o requires an argument");
+                };
+                if crate::options::resolve(name).is_none() {
+                    builtin_err("emulate", &format!("no such option: {}", name));
+                    return 1;
+                }
+                extra.push((name.clone(), a == "-o"));
+            }
+            a if mode.is_some()
+                && a.len() > 1
+                && (a.starts_with('-') || a.starts_with('+'))
+                && a != "-c" =>
+            {
+                for c in a[1..].chars() {
+                    match crate::options::letter(c) {
+                        Some((name, v)) => {
+                            extra.push((name.to_string(), if a.starts_with('-') { v } else { !v }))
+                        }
+                        None => return usage("emulate", &format!("bad option: {}{}", &a[..1], c)),
+                    }
+                }
+            }
             "-c" => {
                 i += 1;
                 cmd = words.get(i).cloned();
@@ -3159,8 +4843,16 @@ fn builtin_emulate(words: &[String]) -> i32 {
                 s.assoc("options").cloned(),
             )
         });
-        with_shell(|s| crate::options::emulate_in(s, mode, reset_all));
+        let sticky = (mode, reset_all, extra.clone());
+        crate::options::apply_sticky(&sticky);
+        let saved_sticky = crate::options::CUR_STICKY
+            .lock()
+            .ok()
+            .and_then(|mut c| c.replace(sticky));
         let st = run_string(&cmd);
+        if let Ok(mut c) = crate::options::CUR_STICKY.lock() {
+            *c = saved_sticky;
+        }
         with_shell(|s| {
             crate::options::restore_in(s, &saved.1);
             s.opts = saved.0;
@@ -3172,6 +4864,12 @@ fn builtin_emulate(words: &[String]) -> i32 {
         return st;
     }
     with_shell(|s| crate::options::emulate_in(s, mode, reset_all));
+    for (name, on) in &extra {
+        if !crate::options::set(name, *on) {
+            builtin_err("emulate", &format!("no such option: {}", name));
+            return 1;
+        }
+    }
     if local {
         for o in ["localoptions", "localtraps", "localpatterns"] {
             toggle_named_opt(o, true);
@@ -3212,115 +4910,6 @@ fn builtin_add_zsh_hook(words: &[String]) -> i32 {
 
 // zsh `print`: echo-style escapes unless -r; -n no newline, -l one
 // argument per line, -N NUL-separated, -P prompt escapes, -u fd.
-fn builtin_print(words: &[String]) -> i32 {
-    let mut i = 1;
-    let (mut raw, mut newline, mut lines, mut nul, mut prompt) = (false, true, false, false, false);
-    let (mut sort, mut icase) = (None::<bool>, false);
-    let mut fd = 1;
-    while let Some(a) = words.get(i) {
-        if a == "-" || a == "--" {
-            i += 1;
-            break;
-        }
-        let Some(flags) = a.strip_prefix('-').filter(|f| !f.is_empty()) else {
-            break;
-        };
-        if !flags
-            .chars()
-            .all(|c| "rRnlNPeEupoOisz0123456789".contains(c))
-        {
-            break;
-        }
-        let mut chars = flags.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                'r' | 'R' => raw = true,
-                'E' => raw = true,
-                'e' => raw = false,
-                'n' => newline = false,
-                'l' => lines = true,
-                'N' => nul = true,
-                'P' => prompt = true,
-                // -p: to the coprocess.
-                'p' => match with_shell(|s| s.coproc) {
-                    Some((w, _)) => fd = w,
-                    None => return usage("print", "-p: no coprocess"),
-                },
-                'o' => sort = Some(false),
-                'O' => sort = Some(true),
-                'i' => icase = true,
-                'u' => {
-                    let rest: String = chars.by_ref().collect();
-                    let spec = if rest.is_empty() {
-                        i += 1;
-                        words.get(i).cloned().unwrap_or_default()
-                    } else {
-                        rest
-                    };
-                    match spec.parse() {
-                        Ok(n) => fd = n,
-                        Err(_) => return usage("print", &format!("{}: bad file number", spec)),
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    let sep = if nul {
-        "\0"
-    } else if lines {
-        "\n"
-    } else {
-        " "
-    };
-    let mut cut = false;
-    let mut parts = Vec::new();
-    for a in &words[i.min(words.len())..] {
-        let mut t = a.clone();
-        if !raw {
-            if let Some(k) = t.find("\\c") {
-                t.truncate(k);
-                cut = true;
-            }
-            t = crate::expand::decode_escapes(&t);
-        }
-        if prompt {
-            // Backslashes that quoted prompt characters (as `${x:q}`
-            // leaves them) are dropped before prompt expansion.
-            if !raw {
-                t = drop_unknown_escapes(&t);
-            }
-            t = crate::shell::expand_prompt(&t);
-        }
-        parts.push(t);
-        if cut {
-            break;
-        }
-    }
-    if let Some(desc) = sort {
-        if icase {
-            parts.sort_by_key(|p| p.to_lowercase());
-        } else {
-            parts.sort();
-        }
-        if desc {
-            parts.reverse();
-        }
-    }
-    let mut text = parts.join(sep);
-    if newline && !cut {
-        text.push(if nul { '\0' } else { '\n' });
-    }
-    match crate::sys::write_fd(fd, text.as_bytes()) {
-        Ok(()) => 0,
-        Err(e) => {
-            builtin_err("print", &format!("write error: {}", e));
-            1
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

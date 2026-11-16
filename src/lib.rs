@@ -4,6 +4,7 @@ pub mod deparse;
 pub mod exec;
 pub mod expand;
 pub mod globber;
+pub mod history;
 pub mod jobs;
 pub mod lexer;
 pub mod lineedit;
@@ -12,12 +13,14 @@ pub mod options;
 pub mod params;
 pub mod parser;
 pub mod pattern;
+pub mod print;
 pub mod shell;
 pub mod sys;
 pub mod testexpr;
 pub mod trap;
 pub mod types;
 pub mod typeset;
+pub mod zpty;
 
 pub use exec::*;
 pub use expand::*;
@@ -111,6 +114,16 @@ pub fn display_width(s: &str) -> usize {
 }
 
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// For unit tests that depend on options: holds the test lock with the
+/// shell set up as zsh (other tests may leave sh options behind).
+#[cfg(test)]
+pub fn zsh_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    shell::shell_init();
+    shell::with_shell(|s| options::init(s, options::Emulation::Zsh));
+    guard
+}
 
 #[cfg(test)]
 mod tests {

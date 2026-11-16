@@ -142,7 +142,21 @@ def zsh_glob_to_regex(p):
         elif c == "?":
             out.append(".")
         elif c == "[":
-            j = p.find("]", i + 2)
+            # The closing bracket, skipping [:class:] names inside.
+            j = i + 1
+            # A `]` first in the set is literal.
+            if j < len(p) and p[j] in "!^":
+                j += 1
+            if j < len(p) and p[j] == "]":
+                j += 1
+            while j < len(p) and p[j] != "]":
+                if p.startswith("[:", j):
+                    k = p.find(":]", j + 2)
+                    j = k + 2 if k >= 0 else j + 1
+                else:
+                    j += 1
+            if j >= len(p):
+                j = -1
             if j < 0:
                 out.append(re.escape(c))
             else:
@@ -217,6 +231,22 @@ def build_driver(work, testdir, prep, tests, clean):
         "cd " + sq(testdir),
         "ZTST_work=" + sq(work),
     ]
+    # As Test/ztst.zsh: autoload from the source tree's function dirs.
+    src = os.path.dirname(testdir)
+    dirs = []
+    for base in ("Functions", "Completion"):
+        top = os.path.join(src, base)
+        if not os.path.isdir(top):
+            continue
+        if base == "Completion":
+            dirs.append(top)
+            subs = [os.path.join(top, a, b) for a in sorted(os.listdir(top)) if os.path.isdir(os.path.join(top, a))
+                    for b in sorted(os.listdir(os.path.join(top, a))) if os.path.isdir(os.path.join(top, a, b))]
+        else:
+            subs = [os.path.join(top, a) for a in sorted(os.listdir(top)) if os.path.isdir(os.path.join(top, a))]
+        dirs.extend(d for d in subs if not d.endswith("CVS"))
+    if dirs:
+        lines.append("fpath=( " + " ".join(sq(d) for d in dirs) + " )")
     for k, (code, _) in enumerate(prep):
         w(f"prep.{k}", code)
         lines.append(f'() {{ eval "$(<$ZTST_work/prep.{k})" }} >/dev/null; print -r -- $? >$ZTST_work/prepst.{k}')
@@ -387,6 +417,11 @@ def main():
         shutil.copytree(src_test, testdir, symlinks=True)
         os.makedirs(os.path.join(root, "Src"), exist_ok=True)
         os.symlink(meowsh, os.path.join(root, "Src", "zsh"))
+        # Some tests source helper scripts from Misc/ (globtests).
+        for extra in ("Misc", "Functions", "Completion"):
+            src_extra = os.path.join(args.zsh_src, extra)
+            if os.path.isdir(src_extra):
+                shutil.copytree(src_extra, os.path.join(root, extra), symlinks=True)
         # Build features some tests check before running.
         with open(os.path.join(root, "config.h"), "w") as f:
             f.write("#define PATH_DEV_FD 1\n#define HAVE_FIFOS 1\n#define MULTIBYTE_SUPPORT 1\n")

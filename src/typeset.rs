@@ -96,11 +96,94 @@ impl Opts {
     }
 }
 
+// zsh's checks for typeset on a special computed parameter (which has no
+// entry in the parameter table here). Some(result) when handled.
+fn special_typeset(
+    cmd: &str,
+    name: &str,
+    on: u32,
+    off: u32,
+    ops: &Opts,
+    level: usize,
+) -> Option<bool> {
+    if !crate::shell::DYNAMIC_NAMES.contains(&name) {
+        return None;
+    }
+    let autoload = name == "SRANDOM";
+    let global = on & LOCAL == 0 || level == 0;
+    if on & HIDE != 0 {
+        if global {
+            warn(cmd, &format!("{}: can't change parameter attribute", name));
+            crate::exec::abort_command(1);
+            return Some(false);
+        }
+        // A hidden local replaces the special in its scope.
+        return None;
+    }
+    let numeric = !matches!(name, "USERNAME" | "EPOCHREALTIME");
+    // An autoloaded parameter not loaded yet has no type of its own.
+    let unloaded = autoload && !SRANDOM_LOADED.load(std::sync::atomic::Ordering::Relaxed);
+    let own = if numeric && !unloaded { INTEGER } else { 0 };
+    let chflags =
+        ((off & own) | (on & !own)) & (INTEGER | FLOAT_E | FLOAT_F | K_ASSOC | K_ARRAY | NAMEREF);
+    if chflags != 0 && !(name == "SECONDS" && chflags & (FLOAT_E | FLOAT_F) != 0) {
+        if autoload {
+            if global {
+                warn(
+                    cmd,
+                    &format!("{}: can't change type of autoloaded parameter", name),
+                );
+                crate::exec::abort_command(1);
+                return Some(false);
+            }
+            return None;
+        }
+        warn(
+            cmd,
+            &format!("{}: can't change type of a special parameter", name),
+        );
+        crate::exec::abort_command(1);
+        return Some(false);
+    }
+    // An autoloaded parameter not yet loaded is replaced by a local.
+    if autoload && !global && !SRANDOM_LOADED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if ops.isset('p') {
+        let v = crate::shell::var_get(name);
+        let g = if level > 0 { "-g " } else { "" };
+        out(&if numeric {
+            format!("typeset {}-i10 {}={}\n", g, name, v)
+        } else {
+            format!(
+                "typeset {}{}={}\n",
+                g,
+                name,
+                crate::builtins::shell_quote(&v)
+            )
+        });
+    }
+    Some(true)
+}
+
+// Scalar parameters zsh treats as special.
+const SCALAR_SPECIALS: &[&str] = &[
+    "HOME", "PWD", "OLDPWD", "IFS", "TERM", "PS1", "PS2", "PS3", "PS4",
+];
+
+/// Set once $SRANDOM has been read: its module counts as loaded.
+pub static SRANDOM_LOADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn warn(cmd: &str, msg: &str) {
     builtin_err(cmd, msg);
 }
 
 pub fn typeset(cmd: &str, args: &[DeclArg]) -> i32 {
+    crate::shell::without_assign_warnings(|| typeset_inner(cmd, args))
+}
+
+fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
     let (allowed, implied) = spec(cmd);
     let mut ops = Opts::default();
     for c in implied.chars() {
@@ -192,13 +275,28 @@ pub fn typeset(cmd: &str, args: &[DeclArg]) -> i32 {
 
     let mut on = 0u32;
     let mut off = 0u32;
+    let mut bad_ref = false;
     for c in "aiEFALRZlurtxUhHTn".chars() {
         let bit = letter_bit(c).unwrap();
         if ops.minus(c) {
             on |= bit;
         } else if ops.plus(c) {
             off |= bit;
+        } else {
+            continue;
         }
+        // A nameref takes only -r, -u, -H and -h.
+        if ops.minus('n') && c != 'n' && bit & !(READONLY | UPPER | HIDEVAL | HIDE) != 0 {
+            warn(cmd, &format!("-{} not allowed with -n", c));
+            bad_ref = true;
+        }
+    }
+    if bad_ref {
+        return 1;
+    }
+    if ops.minus('n') && ops.minus('m') && !ops.isset('p') {
+        builtin_err(cmd, "-m not allowed with -n");
+        return 1;
     }
     let roff = off;
     if on & FLOAT_F != 0 {
@@ -345,6 +443,28 @@ pub fn typeset(cmd: &str, args: &[DeclArg]) -> i32 {
                 Some(p) => {
                     out(&print_param(&name, &p, &pf, locallevel()));
                 }
+                // zsh's $argv: the positional parameters.
+                None if name == "argv" && !crate::exec::sh_emulation_pub() => {
+                    let pos = with_shell(|s| s.pos_params.clone());
+                    out(&print_param(
+                        &name,
+                        &Param::with(Value::Array(pos)),
+                        &pf,
+                        locallevel(),
+                    ));
+                }
+                None if crate::shell::DYNAMIC_NAMES.contains(&name.as_str())
+                    && !crate::exec::sh_emulation_pub()
+                    && crate::shell::var_exists(&name) =>
+                {
+                    let g = if locallevel() > 0 { "-g " } else { "" };
+                    out(&format!(
+                        "typeset {}-i10 {}={}\n",
+                        g,
+                        name,
+                        crate::shell::var_get(&name)
+                    ));
+                }
                 None => {
                     warn(cmd, &format!("no such variable: {}", name));
                     status = 1;
@@ -434,6 +554,42 @@ fn typeset_single(
         base_name
     };
     let existing = with_shell(|s| s.param(base_name).cloned());
+    // A placeholder reference (one referring to nothing yet) can't become
+    // an array or a number.
+    if on & NAMEREF == 0
+        && on & (K_ARRAY | K_ASSOC | INTEGER | FLOAT_E | FLOAT_F) != 0
+        && existing
+            .as_ref()
+            .is_some_and(|p| p.attrs & NAMEREF != 0 && (p.level == level || on & LOCAL == 0))
+    {
+        warn(
+            cmd,
+            &format!("{}: can't change type of a named reference", base_name),
+        );
+        return false;
+    }
+    if existing.is_none() && subscript.is_none() && !crate::exec::sh_emulation_pub() {
+        if let Some(done) = special_typeset(cmd, base_name, on, off, ops, level) {
+            return done;
+        }
+    }
+    // A scalar special (HOME, IFS, ...) keeps its type unless hidden.
+    if subscript.is_none()
+        && on & HIDE == 0
+        && SCALAR_SPECIALS.contains(&base_name)
+        && existing
+            .as_ref()
+            .is_some_and(|p| p.level == 0 && p.attrs & HIDE == 0)
+        && !crate::exec::sh_emulation_pub()
+        && (on & (INTEGER | FLOAT_E | FLOAT_F | K_ASSOC | K_ARRAY | NAMEREF)) != 0
+    {
+        warn(
+            cmd,
+            &format!("{}: can't change type of a special parameter", base_name),
+        );
+        crate::exec::abort_command(1);
+        return false;
+    }
 
     // Array elements: `typeset a[2]=x`.
     if let Some(sub) = subscript {
@@ -451,8 +607,17 @@ fn typeset_single(
             );
             return false;
         }
+        let is_slice = sub.contains(',');
         let value = match asg {
             DeclArg::Assign { value, .. } => value.clone().unwrap_or_default(),
+            // A slice takes a list: `typeset a[2,4]=(x y)`.
+            DeclArg::Array { items, .. } if is_slice => {
+                return crate::shell::array_splice(
+                    base_name,
+                    sub,
+                    crate::shell::plain_items(items),
+                );
+            }
             _ => {
                 warn(
                     cmd,
@@ -461,6 +626,13 @@ fn typeset_single(
                 return false;
             }
         };
+        // A scalar's characters, or a slice: as an ordinary assignment.
+        let is_scalar = existing
+            .as_ref()
+            .is_some_and(|p| matches!(p.value, crate::params::Value::Scalar(_)));
+        if is_scalar || is_slice {
+            return crate::exec::set_subscripted(base_name, sub, &value, false).unwrap_or(false);
+        }
         return crate::shell::array_set_subscript(base_name, sub, value, false);
     }
 
@@ -525,7 +697,9 @@ fn typeset_single(
         }
         on &= !LOCAL;
         if on == 0 && roff == 0 && !has_value(asg) {
-            if ops.isset('p') {
+            // Re-tying an existing pair (typeset -T) prints nothing.
+            if tie.is_some() {
+            } else if ops.isset('p') {
                 out(&print_param(
                     pname,
                     &pm,
@@ -550,8 +724,19 @@ fn typeset_single(
             }
             return true;
         }
+        // A read-only nameref can't be redeclared (zsh checks this only
+        // for namerefs).
+        if pm.attrs & READONLY != 0
+            && off & READONLY == 0
+            && pm.attrs & NAMEREF != 0
+            && !ops.isset('p')
+        {
+            warn(cmd, &format!("{}: read-only reference", pname));
+            return false;
+        }
         if pm.attrs & READONLY != 0 && off & READONLY == 0 && has_value(asg) {
-            warn(cmd, &format!("read-only variable: {}", pname));
+            // zsh reports this as a shell error, without the command name.
+            crate::shell::shell_err(&format!("read-only variable: {}", pname));
             return false;
         }
         if ops.isset('p') {
@@ -582,6 +767,21 @@ fn typeset_single(
             if let Some((other, sep)) = &tie {
                 p.tie = Some((other.clone(), sep.clone()));
             }
+            // -U on a tied scalar uniquifies the array it is tied to.
+            let tied_array = match (&p.value, &p.tie) {
+                (Value::Scalar(_), Some((other, _))) if on & UNIQUE != 0 => Some(other.clone()),
+                _ => None,
+            };
+            if let Some(other) = tied_array {
+                if let Some(items) = s.array(&other).cloned() {
+                    let mut seen = std::collections::HashSet::new();
+                    let items: Vec<String> = items
+                        .into_iter()
+                        .filter(|x| seen.insert(x.clone()))
+                        .collect();
+                    s.store(&other, Value::Array(items));
+                }
+            }
         });
         if !assign_value(base_name, asg) {
             return false;
@@ -603,6 +803,20 @@ fn typeset_single(
     } {
         warn(cmd, &format!("{}: inconsistent type for assignment", pname));
         return false;
+    }
+    // A local special array (path, fpath, ...) stays an array: a scalar
+    // value becomes its one element.
+    if on & (K_ARRAY | K_ASSOC | INTEGER | FLOAT_E | FLOAT_F | HIDE) == 0
+        && on & LOCAL != 0
+        && level > 0
+        && crate::params::DEFAULT_TIES
+            .iter()
+            .any(|(_, a)| *a == base_name)
+        && existing
+            .as_ref()
+            .is_some_and(|p| p.attrs & HIDE == 0 && kind_bits(p) & K_ARRAY != 0)
+    {
+        on |= K_ARRAY;
     }
 
     // A new parameter, a new local, or a type conversion.
@@ -783,6 +997,59 @@ fn typeset_tied(cmd: &str, on: u32, off: u32, roff: u32, ops: &Opts, rest: &[Dec
     };
     let level = locallevel();
     let existing = with_shell(|s| s.param(&sname).cloned());
+    // The special tied pairs (PATH/path, ...) stay as they are, unless a
+    // hidden local (-h) stands in for one of them.
+    let special = |name: &str| with_shell(|s| s.param(name).is_none_or(|p| p.attrs & HIDE == 0));
+    if let Some((_, arr)) = crate::params::DEFAULT_TIES
+        .iter()
+        .find(|(sc, _)| *sc == sname)
+    {
+        if special(&sname) {
+            if *arr != aname || !special(&aname) {
+                warn(
+                    cmd,
+                    &format!(
+                        "{} special parameter can only be tied to special parameter {}",
+                        sname, arr
+                    ),
+                );
+                return 1;
+            }
+            if sep != ":" {
+                warn(
+                    cmd,
+                    "cannot change the join character of special tied parameters",
+                );
+                return 1;
+            }
+        }
+    }
+    if let Some((sc, _)) = crate::params::DEFAULT_TIES
+        .iter()
+        .find(|(_, a)| *a == aname)
+    {
+        if special(&aname) && (*sc != sname || !special(&sname)) {
+            warn(
+                cmd,
+                &format!(
+                    "{} special parameter can only be tied to special parameter {}",
+                    aname, sc
+                ),
+            );
+            return 1;
+        }
+    }
+    // Re-tying a pair with a new join character re-splits the value.
+    let resplit = existing
+        .as_ref()
+        .and_then(|p| p.tie.as_ref())
+        .is_some_and(|(o, old)| o == &aname && old != &sep)
+        && !has_value(s_asg)
+        && !has_value(a_asg);
+    if resplit && with_shell(|s| s.param(&aname).is_some_and(|p| p.attrs & READONLY != 0)) {
+        crate::shell::shell_err(&format!("read-only variable: {}", aname));
+        return 1;
+    }
     // Keep an existing scalar's value and export attribute.
     let mut on = on;
     let mut old_value = None;
@@ -808,7 +1075,7 @@ fn typeset_tied(cmd: &str, on: u32, off: u32, roff: u32, ops: &Opts, rest: &[Dec
         cmd,
         &aname,
         (on | K_ARRAY) & !EXPORT & !TIED,
-        off,
+        off & !K_ARRAY,
         roff,
         &a_plain,
         ops,
@@ -840,9 +1107,23 @@ fn typeset_tied(cmd: &str, on: u32, off: u32, roff: u32, ops: &Opts, rest: &[Dec
     ) {
         return 1;
     }
+    if resplit {
+        let joined = with_shell(|s| {
+            for (n, other) in [(&sname, &aname), (&aname, &sname)] {
+                if let Some(p) = s.param_mut(n) {
+                    p.tie = Some((other.clone(), sep.clone()));
+                }
+            }
+            s.array(&aname).map(|a| a.join(&sep)).unwrap_or_default()
+        });
+        return i32::from(!crate::shell::var_set(&sname, &joined, false));
+    }
     match a_asg {
         DeclArg::Array { items, .. } => {
-            crate::shell::array_assign_items(&aname, items.clone(), false);
+            // As zsh's assignment error, a failure aborts the command line.
+            if !crate::shell::array_assign_items(&aname, items.clone(), false) {
+                return crate::exec::abort_command(1);
+            }
         }
         _ => {
             if let Some(v) = old_value {
@@ -1109,7 +1390,8 @@ pub fn print_param(name: &str, p: &Param, pf: &PrintFlags, locallevel: usize) ->
         if let Some((_, sep)) = &p.tie {
             if sep != ":" {
                 out.push(' ');
-                out.push_str(&quote_value(sep));
+                // zsh keeps the separator as a C string, so NUL shows as ''.
+                out.push_str(&quote_value(sep.split('\0').next().unwrap_or("")));
             }
         }
     }
@@ -1136,6 +1418,10 @@ fn list_params(flags: u32, exclude: u32, pf: &PrintFlags, pattern: Option<&str>)
             continue;
         }
         if f & exclude != 0 {
+            continue;
+        }
+        // Unset parameters (as after `unset`) are not listed.
+        if p.attrs & UNSET != 0 && p.attrs & DECLARED == 0 {
             continue;
         }
         if let Some(pat) = pattern {

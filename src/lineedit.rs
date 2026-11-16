@@ -716,6 +716,24 @@ fn primary_prompt() -> String {
     build_prompt()
 }
 
+/// NOTIFY: while waiting for input on `fd`, reports jobs as they finish.
+fn wait_input_notify(fd: i32) {
+    if !crate::options::is_set("notify") {
+        return;
+    }
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 50) } != 0 {
+            break;
+        }
+        crate::jobs::reap_jobs(true);
+    }
+}
+
 /// Reads commands from `fd` until end of input. Prompts go to standard
 /// error when `prompts` is set (an interactive shell without a terminal).
 pub fn run_fd(fd: i32, prompts: bool) -> i32 {
@@ -730,6 +748,9 @@ pub fn run_fd(fd: i32, prompts: bool) -> i32 {
                 };
                 let _ = crate::sys::write_fd(2, p.as_bytes());
             }
+            if prompts {
+                wait_input_notify(fd);
+            }
             match reader.read_line() {
                 Some(l) => InputLine::Line(l),
                 None => InputLine::Eof,
@@ -741,7 +762,10 @@ pub fn run_fd(fd: i32, prompts: bool) -> i32 {
 
 /// The interactive read-eval loop with line editing and history.
 pub fn run_interactive() -> i32 {
-    if unsafe { libc::isatty(0) } != 1 {
+    // A terminal without cursor control gets plain line reading: the
+    // prompt, then the line as the terminal's own line discipline edits it.
+    let dumb = std::env::var("TERM").map_or(true, |t| t.is_empty() || t == "dumb");
+    if unsafe { libc::isatty(0) } != 1 || dumb {
         return run_fd(0, true);
     }
     let mut rl: Editor<MeowshHelper, FileHistory> = match Editor::new() {

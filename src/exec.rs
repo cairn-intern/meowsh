@@ -1,8 +1,8 @@
 //! Command execution.
 
 use crate::expand::{
-    expand_assign_value, expand_heredoc, expand_pattern, expand_prompt_string, expand_string,
-    expand_words, ExpError, ExpResult,
+    expand_assign_value, expand_heredoc, expand_pattern, expand_string, expand_words, ExpError,
+    ExpResult,
 };
 use crate::jobs::{add_job, reap_jobs, status_to_exit, wait_foreground, TTY_FD};
 use crate::lexer::assignment_split;
@@ -50,6 +50,7 @@ fn interactive() -> bool {
 fn suppress_errexit(delta: isize) {
     with_shell(|s| {
         s.errexit_suppressed = (s.errexit_suppressed as isize + delta).max(0) as usize;
+        s.errreturn_suppressed = (s.errreturn_suppressed as isize + delta).max(0) as usize;
     });
 }
 
@@ -60,22 +61,65 @@ fn set_error_exit(status: i32) {
     });
 }
 
+/// zsh's `donetrap`: set once the ZERR trap (or ERR_EXIT handling) has
+/// acted on a failure, so the same failure seen again by an enclosing
+/// command (a function call's status) doesn't trigger it twice. Cleared
+/// before each command of a list.
+static DONE_TRAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn check_errexit(status: i32) {
-    if status == 0 {
+    use std::sync::atomic::Ordering;
+    if status == 0 || DONE_TRAP.load(Ordering::Relaxed) {
         return;
     }
-    let zerr = with_shell(|s| {
-        let live = s.errexit_suppressed == 0 && s.flow == Flow::None;
+    // `return 1` counts as a failing command too.
+    let (live, idle, trapped) = with_shell(|s| {
+        (
+            s.errexit_suppressed == 0,
+            matches!(s.flow, Flow::None | Flow::Return(_)),
+            s.traps
+                .get(&crate::trap::SIG_ZERR)
+                .is_some_and(|a| !a.is_empty()),
+        )
+    });
+    if !idle {
+        return;
+    }
+    // zsh's ZERR trap runs first, then ERR_EXIT or ERR_RETURN act.
+    if live && trapped {
+        let pending = with_shell(|s| std::mem::replace(&mut s.flow, Flow::None));
+        crate::trap::run_pseudo(crate::trap::SIG_ZERR);
+        // After the trap: running it (a TRAPZERR function) clears the flag.
+        DONE_TRAP.store(true, Ordering::Relaxed);
+        with_shell(|s| {
+            s.last_status = status;
+            if s.flow == Flow::None {
+                s.flow = pending;
+            }
+        });
+    }
+    with_shell(|s| {
+        if !matches!(s.flow, Flow::None | Flow::Return(_)) {
+            return;
+        }
         if live && s.opts & OPT_ERREXIT != 0 {
             s.flow = Flow::Exit(status);
+        } else if s.errreturn_suppressed == 0
+            && s.func_depth > 0
+            && crate::options::is_set_in(s, "errreturn")
+        {
+            // ERR_RETURN: leave the function with the failing status.
+            if s.flow == Flow::None {
+                s.flow = Flow::Return(status);
+            }
         }
-        live
     });
-    // zsh's ZERR trap runs where ERR_EXIT would act.
-    if zerr {
-        crate::trap::run_pseudo(crate::trap::SIG_ZERR);
-        with_shell(|s| s.last_status = status);
-    }
+}
+
+/// A fatal error (zsh's errflag): abort the command line, as an
+/// expansion error does.
+pub fn abort_command(status: i32) -> i32 {
+    expansion_failed(ExpError { status })
 }
 
 // An expansion error aborts the current command line in an interactive
@@ -147,12 +191,23 @@ pub fn fork_process(kind: ForkKind) -> i32 {
                 ForkKind::Inline => {}
             }
         }
+        crate::shell::SUBSHELL_LEVEL.fetch_add(1, Ordering::Relaxed);
+        with_shell(|s| {
+            s.subshell_loop_depth += s.loop_depth;
+            s.loop_depth = 0;
+        });
         crate::trap::reset_in_child(matches!(kind, ForkKind::Background) && !jc);
         with_shell(|s| {
             s.in_subshell = true;
             s.interactive = false;
             s.job_control = false;
-            s.jobs.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            // The parent's jobs stay visible to `jobs` and $jobstates.
+            let old = std::mem::take(&mut *s.jobs.lock().unwrap_or_else(|e| e.into_inner()));
+            if !old.is_empty() {
+                if let Ok(mut o) = crate::jobs::OLD_JOBS.lock() {
+                    *o = old;
+                }
+            }
         });
         TTY_FD.store(-1, Ordering::SeqCst);
     } else if jc {
@@ -192,7 +247,7 @@ static EQ_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new(
 /// zsh's `=(cmd)`: the output of cmd in a temporary file, whose name is
 /// the result.
 pub fn output_file_subst(src: &str) -> Option<String> {
-    let (out, _) = command_subst(src);
+    let (out, _) = crate::shell::in_eval_context("equalsubst", || command_subst_in(src));
     let dir = std::env::var("TMPDIR")
         .ok()
         .filter(|d| !d.is_empty())
@@ -234,6 +289,7 @@ pub fn exit_shell(status: i32) -> ! {
     if interactive() {
         crate::builtins::run_hooks("zshexit", &[]);
         with_shell(|s| s.flow = Flow::None);
+        crate::jobs::hup_jobs();
     }
     crate::trap::run_exit_trap();
     let status = match flow() {
@@ -253,8 +309,32 @@ pub fn exec_external(words: &[String], env: &[(String, String)]) -> ! {
 /// argument zero instead of the command name.
 pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, String)]) -> ! {
     let name = &words[0];
+    // `UID=n cmd` (and EUID, GID, EGID) runs the command with that id; if
+    // it can't be changed, the command doesn't run.
+    for (k, v) in env {
+        if matches!(k.as_str(), "UID" | "EUID" | "GID" | "EGID")
+            && !sh_emulation_pub()
+            && !crate::shell::var_set(k, v, false)
+        {
+            exit_child(1);
+        }
+    }
     // `PATH=dirs cmd` searches the PATH given for the command.
-    let path = if name.contains('/') {
+    // PATH_DIRS: `dir/cmd` (not `./`, `../` or absolute) missing here
+    // is looked for under each $PATH directory.
+    let path_dirs = name.contains('/')
+        && !name.starts_with('/')
+        && !name.starts_with("./")
+        && !name.starts_with("../")
+        && !std::path::Path::new(name).exists()
+        && crate::options::is_set("pathdirs");
+    let path = if path_dirs {
+        var_get("PATH")
+            .split(':')
+            .map(|d| format!("{}/{}", if d.is_empty() { "." } else { d }, name))
+            .find(|p| std::path::Path::new(p).is_file())
+            .or_else(|| Some(name.clone()))
+    } else if name.contains('/') {
         Some(name.clone())
     } else if let Some((_, p)) = env.iter().find(|(k, _)| k == "PATH") {
         crate::shell::find_command_in(name, p)
@@ -332,7 +412,14 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
         // No interpreter line: run the file as a shell script.
         if let Ok(exe) = std::env::current_exe() {
             if let Some(c_exe) = to_c(&exe.to_string_lossy()) {
-                let mut args: Vec<*const libc::c_char> = vec![c_exe.as_ptr(), c_path.as_ptr()];
+                // `--` keeps a path starting with - or + from being read
+                // as options.
+                let dashdash = to_c("--");
+                let mut args: Vec<*const libc::c_char> = vec![c_exe.as_ptr()];
+                if let Some(d) = dashdash.as_ref().filter(|_| path.starts_with(['-', '+'])) {
+                    args.push(d.as_ptr());
+                }
+                args.push(c_path.as_ptr());
                 args.extend(argv.iter().skip(1).map(|c| c.as_ptr()));
                 args.push(std::ptr::null());
                 unsafe {
@@ -341,7 +428,7 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
             }
         }
     }
-    err_line(&format!("meowsh: {}: {}", name, strerror(e)));
+    shell_err(&file_error(name, e));
     unsafe { libc::_exit(if e == libc::ENOENT { 127 } else { 126 }) }
 }
 
@@ -362,6 +449,19 @@ fn shebang(path: &str) -> Option<(String, Option<String>)> {
 }
 
 // ---- redirections ---------------------------------------------------------
+
+// zsh gives 1 for a parse error, sh (bash) 2.
+fn parse_error_status() -> i32 {
+    if sh_emulation() {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn sh_emulation_pub() -> bool {
+    sh_emulation()
+}
 
 fn sh_emulation() -> bool {
     with_shell(|s| matches!(s.emulation, crate::options::Emulation::Sh))
@@ -443,12 +543,22 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
         }
         RedirOp::Read => file(libc::O_RDONLY),
         RedirOp::Write if opt_set(OPT_NOCLOBBER) => match std::fs::metadata(&target) {
+            // CLOBBER_EMPTY: an empty file may still be overwritten.
+            Ok(m) if m.is_file() && m.len() == 0 && crate::options::is_set("clobberempty") => {
+                file(libc::O_WRONLY | libc::O_TRUNC)
+            }
             Ok(m) if m.is_file() => Err(Some(format!("file exists: {}", target))),
             Ok(_) => file(libc::O_WRONLY),
             Err(_) => file(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL),
         },
         RedirOp::Write | RedirOp::Clobber => file(libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC),
-        RedirOp::Append => file(libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND),
+        // NO_CLOBBER: `>>` needs the file to exist (unless APPEND_CREATE).
+        RedirOp::Append if opt_set(OPT_NOCLOBBER) && !crate::options::is_set("appendcreate") => {
+            file(libc::O_WRONLY | libc::O_APPEND)
+        }
+        RedirOp::Append | RedirOp::AppendClobber => {
+            file(libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND)
+        }
         RedirOp::ReadWrite => file(libc::O_RDWR | libc::O_CREAT),
         RedirOp::HereDoc | RedirOp::HereStr => unreachable!(),
     }
@@ -461,11 +571,91 @@ pub type SavedFds = Vec<(i32, i32)>;
 #[derive(Debug)]
 pub struct RedirError;
 
+// In a pipeline stage: whether its standard input / output is the
+// pipe, which MULTIOS joins with the stage's own redirections.
+static PIPE_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PIPE_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// A redirection's direction, for MULTIOS.
+fn redir_output(op: RedirOp) -> Option<bool> {
+    match op {
+        RedirOp::Write
+        | RedirOp::Clobber
+        | RedirOp::Append
+        | RedirOp::AppendClobber
+        | RedirOp::DupOut => Some(true),
+        RedirOp::Read | RedirOp::HereDoc | RedirOp::HereStr | RedirOp::DupIn => Some(false),
+        RedirOp::ReadWrite => None,
+    }
+}
+
+// The targets of a file redirection: with MULTIOS a pattern or a word
+// that splits may name several files, each a target of its own.
+fn redir_words(r: &Redir) -> Vec<Redir> {
+    let plain = matches!(
+        r.op,
+        RedirOp::Write
+            | RedirOp::Clobber
+            | RedirOp::Append
+            | RedirOp::AppendClobber
+            | RedirOp::Read
+    );
+    if !plain || !crate::options::is_set("multios") {
+        return vec![r.clone()];
+    }
+    match crate::expand::expand_words(std::slice::from_ref(&r.target)) {
+        Ok(words) if words.len() > 1 => words
+            .into_iter()
+            .map(|w| Redir {
+                target: format!("'{}'", w.replace('\'', "'\\''")),
+                ..r.clone()
+            })
+            .collect(),
+        _ => vec![r.clone()],
+    }
+}
+
+// Copies `from` into every one of `to` (an output multio) or each of
+// `from` in turn into `to[0]` (an input multio), in a child process.
+fn multio_worker(sources: &[i32], sinks: &[i32], keep: &[i32]) -> i32 {
+    let pid = unsafe { libc::fork() };
+    if pid != 0 {
+        return pid;
+    }
+    // The worker keeps only its own descriptors.
+    for fd in 0..256 {
+        if !sources.contains(&fd) && !sinks.contains(&fd) && !keep.contains(&fd) {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+    let mut buf = [0u8; 8192];
+    for &src in sources {
+        loop {
+            let n = unsafe { libc::read(src, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            for &dst in sinks {
+                let _ = crate::sys::write_fd(dst, &buf[..n as usize]);
+            }
+        }
+    }
+    unsafe { libc::_exit(0) }
+}
+
 /// Applies redirections. With `save`, the previous descriptors are kept
-/// so `restore_redirs` can undo them.
+/// so `restore_redirs` can undo them. With MULTIOS, several output (or
+/// input) redirections of one descriptor all take effect, through a
+/// copying process.
 pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError> {
     let mut saved = Vec::new();
-    for r in redirs {
+    let multios = crate::options::is_set("multios");
+    // Per descriptor: direction and the targets so far (owned copies).
+    let mut multi: Vec<(i32, bool, Vec<i32>)> = Vec::new();
+    let expanded: Vec<Redir> = redirs.iter().flat_map(redir_words).collect();
+    for r in &expanded {
         if let Some(var) = &r.var {
             if let Err(e) = redir_to_var(r, var) {
                 restore_redirs(saved);
@@ -474,7 +664,7 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
             continue;
         }
         let fd = r.fd;
-        if save {
+        if save && !saved.iter().any(|&(f, _)| f == fd) {
             saved.push((fd, dup_high(fd)));
         }
         let target = match open_redir(r) {
@@ -483,10 +673,55 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
                 if let Some(m) = msg {
                     shell_err(&m);
                 }
+                for (_, _, t) in &multi {
+                    t.iter().for_each(|&f| close(f));
+                }
                 restore_redirs(saved);
                 return Err(RedirError);
             }
         };
+        // Track the target for MULTIOS before installing it.
+        let dir = redir_output(r.op);
+        if multios {
+            let owned = match &target {
+                Target::Opened(t) | Target::Both(t) => unsafe {
+                    libc::fcntl(*t, libc::F_DUPFD_CLOEXEC, 10)
+                },
+                Target::Dup(src) => unsafe { libc::fcntl(*src, libc::F_DUPFD_CLOEXEC, 10) },
+                Target::Close => -1,
+            };
+            let pos = multi.iter().position(|(f, _, _)| *f == fd);
+            match (pos, dir) {
+                (Some(k), Some(d)) if multi[k].1 == d && owned >= 0 => multi[k].2.push(owned),
+                (_, Some(d)) if owned >= 0 => {
+                    if let Some(k) = pos {
+                        let (_, _, old) = multi.remove(k);
+                        old.iter().for_each(|&f| close(f));
+                    }
+                    let mut targets = Vec::new();
+                    // A pipeline stage's pipe is the first target.
+                    let piped = match (fd, d) {
+                        (1, true) => PIPE_OUT.swap(false, std::sync::atomic::Ordering::SeqCst),
+                        (0, false) => PIPE_IN.swap(false, std::sync::atomic::Ordering::SeqCst),
+                        _ => false,
+                    };
+                    if piped {
+                        targets.push(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) });
+                    }
+                    targets.push(owned);
+                    multi.push((fd, d, targets));
+                }
+                _ => {
+                    if owned >= 0 {
+                        close(owned);
+                    }
+                    if let Some(k) = pos {
+                        let (_, _, old) = multi.remove(k);
+                        old.iter().for_each(|&f| close(f));
+                    }
+                }
+            }
+        }
         let ok = match target {
             Target::Opened(newfd) => {
                 let ok = newfd == fd || unsafe { libc::dup2(newfd, fd) } >= 0;
@@ -519,7 +754,80 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
             return Err(RedirError);
         }
     }
+    // Descriptors with several targets get a copying process.
+    for (fd, output, targets) in multi {
+        if targets.len() < 2 {
+            targets.iter().for_each(|&f| close(f));
+            continue;
+        }
+        let Ok((pr, pw)) = pipe_cloexec() else {
+            targets.iter().for_each(|&f| close(f));
+            continue;
+        };
+        let pid = if output {
+            multio_worker(&[pr], &targets, &[])
+        } else {
+            multio_worker(&targets, &[pw], &[])
+        };
+        let mine = if output { pw } else { pr };
+        unsafe {
+            libc::dup2(mine, fd);
+        }
+        close(pr);
+        close(pw);
+        targets.iter().for_each(|&f| close(f));
+        if pid > 0 {
+            if save {
+                saved.push((-2, pid));
+            } else if let Ok(mut p) = MULTIO_PIDS.lock() {
+                p.push(pid);
+            }
+        }
+    }
     Ok(saved)
+}
+
+// Copying processes started without saved descriptors (in a child about
+// to run a command); it waits for them before exiting.
+static MULTIO_PIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+// Runs the command in place, or, when MULTIOS copiers serve it, as a
+// child, so the copiers can be waited for before exiting.
+fn exec_with_multios(words: &[String], argv0: Option<&str>, env: &[(String, String)]) -> ! {
+    let workers = take_multio_pids();
+    if workers.is_empty() {
+        exec_external_as(words, argv0, env);
+    }
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        exec_external_as(words, argv0, env);
+    }
+    let mut st = 0;
+    unsafe {
+        libc::waitpid(pid, &mut st, 0);
+        for fd in 0..10 {
+            libc::close(fd);
+        }
+    }
+    for w in workers {
+        let mut ws = 0;
+        unsafe {
+            libc::waitpid(w, &mut ws, 0);
+        }
+    }
+    let code = if libc::WIFEXITED(st) {
+        libc::WEXITSTATUS(st)
+    } else {
+        128 + libc::WTERMSIG(st)
+    };
+    unsafe { libc::_exit(code) }
+}
+
+fn take_multio_pids() -> Vec<i32> {
+    MULTIO_PIDS
+        .lock()
+        .map(|mut p| std::mem::take(&mut *p))
+        .unwrap_or_default()
 }
 
 // `{name}>file`: opens on a new descriptor (10 or above, kept open
@@ -572,7 +880,12 @@ fn redir_to_var(r: &Redir, var: &str) -> Result<(), RedirError> {
 }
 
 pub fn restore_redirs(saved: SavedFds) {
+    let mut workers = Vec::new();
     for (fd, copy) in saved.into_iter().rev() {
+        if fd == -2 {
+            workers.push(copy);
+            continue;
+        }
         if copy >= 0 {
             unsafe {
                 libc::dup2(copy, fd);
@@ -580,6 +893,13 @@ pub fn restore_redirs(saved: SavedFds) {
             close(copy);
         } else {
             close(fd);
+        }
+    }
+    // MULTIOS copiers finish once every writer has closed.
+    for pid in workers {
+        let mut st = 0;
+        unsafe {
+            libc::waitpid(pid, &mut st, 0);
         }
     }
 }
@@ -671,20 +991,130 @@ fn is_readonly(name: &str) -> bool {
 
 /// `name[sub]=value` (`sub` not yet expanded): one element or key, a
 /// `[a,b]` range, or characters of a scalar.
+// The kind of the parameter `name` (after namerefs) for `+=` rules.
+#[derive(PartialEq)]
+enum ParamKind {
+    Unset,
+    Scalar,
+    Numeric,
+    Array,
+    Assoc,
+}
+
+fn param_kind(name: &str) -> ParamKind {
+    let target = crate::shell::split_target_pub(&crate::shell::resolve_ref(name));
+    with_shell(|s| match s.param(&target) {
+        None => ParamKind::Unset,
+        Some(p) if p.attrs & crate::params::UNSET != 0 => ParamKind::Unset,
+        Some(p) if p.is_assoc() => ParamKind::Assoc,
+        Some(p) if p.is_array() => ParamKind::Array,
+        Some(p) if p.attrs & crate::params::NUMERIC != 0 => ParamKind::Numeric,
+        Some(_) => ParamKind::Scalar,
+    })
+}
+
+// The 1-based index a subscript (or the end of a `[a,b]` range) names,
+// counted from the end when negative.
+fn subscript_end(name: &str, sub: &str) -> Result<i64, i32> {
+    let text = expand_string(sub).map_err(|e| e.status)?;
+    let last = text.rsplit(',').next().unwrap_or(&text);
+    let mut e = match crate::arith::eval(last) {
+        Ok(n) => n,
+        Err(err) => {
+            shell_err(&err);
+            return Err(1);
+        }
+    };
+    if e >= 0 && crate::options::quick("ksharrays") {
+        e += 1;
+    }
+    if e < 0 {
+        let len = with_shell(|s| {
+            s.array(name)
+                .map(|a| a.len())
+                .or_else(|| s.scalar(name).map(|v| v.chars().count()))
+                .unwrap_or(0)
+        }) as i64;
+        e = (len + e + 1).max(0);
+    }
+    Ok(e)
+}
+
+// `name[sub]+=value`: after the subscript's end, the text goes into a
+// scalar or onto an array element.
+fn append_subscripted(name: &str, sub: &str, v: &str) -> Result<bool, i32> {
+    match param_kind(name) {
+        ParamKind::Numeric => {
+            shell_err("attempt to add to slice of a numeric variable");
+            Err(1)
+        }
+        ParamKind::Assoc => {
+            if sub.starts_with('(') {
+                shell_err(&format!(
+                    "{}: attempt to set slice of associative array",
+                    name
+                ));
+                return Err(1);
+            }
+            let key = crate::expand::assoc_key(sub).map_err(|e| e.status)?;
+            Ok(array_set_subscript(name, &key, v.to_string(), true))
+        }
+        ParamKind::Scalar => {
+            let e = subscript_end(name, sub)?;
+            Ok(crate::shell::array_splice(
+                name,
+                &format!("{},{}", e + 1, e),
+                vec![v.to_string()],
+            ))
+        }
+        ParamKind::Array | ParamKind::Unset if matches!(sub, "@" | "*") => {
+            Ok(array_append(name, vec![v.to_string()]))
+        }
+        ParamKind::Array | ParamKind::Unset => {
+            let mut e = subscript_end(name, sub)?;
+            // array_set_subscript counts from 0 itself with KSH_ARRAYS.
+            if crate::options::quick("ksharrays") {
+                e -= 1;
+            }
+            Ok(array_set_subscript(
+                name,
+                &e.to_string(),
+                v.to_string(),
+                true,
+            ))
+        }
+    }
+}
+
 pub fn set_subscripted(name: &str, sub: &str, v: &str, append: bool) -> Result<bool, i32> {
+    let _swap = crate::shell::RefSwap::enter(name);
+    if append {
+        return append_subscripted(name, sub, v);
+    }
     let is_assoc = with_shell(|s| s.assoc(name).is_some());
     if sub.contains(',') && !is_assoc {
         let sub = expand_string(sub).map_err(|e| e.status)?;
         return Ok(crate::shell::array_splice(name, &sub, vec![v.to_string()]));
     }
     let key = if is_assoc {
-        expand_string(sub).map_err(|e| e.status)?
+        if sub == "@" || sub == "*" {
+            shell_err(&format!(
+                "{}: attempt to set slice of associative array",
+                name
+            ));
+            return Err(1);
+        }
+        // (e): the text is the key exactly.
+        match sub.strip_prefix("(e)") {
+            Some(k) => crate::expand::assoc_key(k).map_err(|e| e.status)?,
+            None => crate::expand::assoc_key(sub).map_err(|e| e.status)?,
+        }
     } else {
         let idx = expand_string(sub).map_err(|e| e.status)?;
         match crate::arith::eval(&idx) {
             Ok(n) => n.to_string(),
             Err(e) => {
-                err_line(&format!("meowsh: {}: {}", idx, e));
+                shell_err(&e);
                 return Err(1);
             }
         }
@@ -709,12 +1139,58 @@ fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
     }
     let ok = match (&a.subscript, &a.value) {
         (Some(sub), Value::Scalar(v)) => set_subscripted(&a.name, sub, v, a.append)?,
-        (Some(sub), Value::Array(items)) => {
-            let sub = expand_string(sub).map_err(|e| e.status)?;
-            crate::shell::array_splice(&a.name, &sub, crate::shell::plain_items(items))
-        }
+        (Some(sub), Value::Array(items)) => match param_kind(&a.name) {
+            ParamKind::Assoc => {
+                shell_err(&format!(
+                    "{}: attempt to set slice of associative array",
+                    a.name
+                ));
+                return Err(1);
+            }
+            ParamKind::Scalar | ParamKind::Numeric if a.append => {
+                shell_err(&format!(
+                    "{}: attempt to assign array value to non-array",
+                    a.name
+                ));
+                return Err(1);
+            }
+            _ if a.append => {
+                // `a[i]+=(x y)` inserts after element i.
+                let e = subscript_end(&a.name, sub)?;
+                crate::shell::array_splice(
+                    &a.name,
+                    &format!("{},{}", e + 1, e),
+                    crate::shell::plain_items(items),
+                )
+            }
+            _ => {
+                let sub = expand_string(sub).map_err(|e| e.status)?;
+                crate::shell::array_splice(&a.name, &sub, crate::shell::plain_items(items))
+            }
+        },
         (None, Value::Array(items)) => {
             crate::shell::array_assign_items(&a.name, items.clone(), a.append)
+        }
+        (None, Value::Scalar(v)) if a.append && param_kind(&a.name) == ParamKind::Numeric => {
+            // Numeric parameters add.
+            let cur = var_get(&a.name);
+            match crate::arith::eval_num(&format!("({})+({})", cur, v)) {
+                Ok(n) => var_set(&a.name, &n.to_string(), export),
+                Err(e) => {
+                    shell_err(&e);
+                    return Err(1);
+                }
+            }
+        }
+        (None, Value::Scalar(v)) if a.append && param_kind(&a.name) == ParamKind::Assoc => {
+            with_shell(|s| s.remove_param(&a.name));
+            var_set(&a.name, v, export)
+        }
+        (None, Value::Scalar(v))
+            if a.append && is_array(&a.name) && crate::options::quick("ksharrays") =>
+        {
+            // KSH_ARRAYS: `a+=x` appends to the first element.
+            array_set_subscript(&a.name, "0", v.clone(), true)
         }
         (None, Value::Scalar(v)) => {
             if a.append && is_array(&a.name) {
@@ -742,7 +1218,7 @@ fn assign_text(a: &Expanded) -> String {
         .unwrap_or_default();
     let op = if a.append { "+=" } else { "=" };
     match &a.value {
-        Value::Scalar(v) => format!("{}{}{}{}", a.name, sub, op, v),
+        Value::Scalar(v) => format!("{}{}{}{}", a.name, sub, op, crate::builtins::shell_quote(v)),
         Value::Array(items) => format!(
             "{}{}{}({})",
             a.name,
@@ -758,6 +1234,12 @@ struct TempVars(Vec<(String, Option<crate::params::Param>)>);
 
 impl TempVars {
     fn set(assigns: &[Expanded]) -> Result<TempVars, i32> {
+        Self::set_as(assigns, true)
+    }
+
+    // zsh exports prefix assignments only for what may run a program;
+    // for other builtins they are plain temporary values.
+    fn set_as(assigns: &[Expanded], export: bool) -> Result<TempVars, i32> {
         let mut saved = TempVars(Vec::new());
         for a in assigns {
             let Value::Scalar(v) = &a.value else { continue };
@@ -771,7 +1253,10 @@ impl TempVars {
             }
             let prev = with_shell(|s| s.param(&a.name).cloned());
             saved.0.push((a.name.clone(), prev));
-            var_set(&a.name, v, true);
+            if !crate::shell::without_assign_warnings(|| var_set(&a.name, v, export)) {
+                saved.restore();
+                return Err(1);
+            }
         }
         Ok(saved)
     }
@@ -793,13 +1278,71 @@ impl TempVars {
     }
 }
 
-fn xtrace(parts: &[String]) {
-    if !opt_set(OPT_XTRACE) || parts.is_empty() {
+// XTRACE: the command as zsh shows it, assignments first (each followed
+// by a space) then the words, quoted where needed.
+fn xtrace_cmd(assigns: &[Expanded], words: &[String]) {
+    if !opt_set(OPT_XTRACE) || (assigns.is_empty() && words.is_empty()) {
+        return;
+    }
+    let mut line: String = assigns
+        .iter()
+        .map(|a| format!("{} ", assign_text(a)))
+        .collect();
+    line.push_str(
+        &words
+            .iter()
+            .map(|w| crate::builtins::shell_quote(w))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    xtrace_line(&line);
+}
+
+// `[[ ... ]]` as XTRACE shows it: operands expanded and quoted,
+// patterns with their quoted characters backslashed, no parentheses.
+fn dbracket_trace(words: &[String]) -> String {
+    let mut out = vec!["[[".to_string()];
+    let mut prev = "";
+    for w in words {
+        let text = match w.as_str() {
+            "(" | ")" => {
+                prev = w;
+                continue;
+            }
+            "&&" | "||" | "!" | "==" | "=" | "!=" | "=~" | "<" | ">" => w.clone(),
+            op if op.starts_with('-')
+                && op.len() == 2
+                && op[1..].chars().all(|c| c.is_ascii_alphabetic()) =>
+            {
+                w.clone()
+            }
+            op if op.starts_with('-')
+                && matches!(
+                    op,
+                    "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" | "-nt" | "-ot" | "-ef"
+                ) =>
+            {
+                w.clone()
+            }
+            _ if matches!(prev, "==" | "=" | "!=") => {
+                crate::expand::pattern_for_trace(w).unwrap_or_else(|_| w.clone())
+            }
+            _ => crate::builtins::shell_quote(&expand_string(w).unwrap_or_else(|_| w.clone())),
+        };
+        prev = w;
+        out.push(text);
+    }
+    out.push("]]".to_string());
+    out.join(" ")
+}
+
+fn xtrace_line(text: &str) {
+    if !opt_set(OPT_XTRACE) {
         return;
     }
     let ps4 = var_get_opt("PS4").unwrap_or_else(|| "+ ".to_string());
-    let ps4 = expand_prompt_string(&ps4).unwrap_or(ps4);
-    err_line(&format!("{}{}", ps4, parts.join(" ")));
+    let ps4 = crate::shell::render_prompt(&ps4);
+    err_line(&format!("{}{}", ps4, text));
 }
 
 // Declaration utilities take assignment arguments, which expand like
@@ -872,8 +1415,17 @@ pub fn exec_node(node: &Node) -> i32 {
     let mark = procsub_mark();
     let st = exec_node_inner(node);
     procsub_close_from(mark);
+    // A `break` inside `${| ... }` takes effect once the command that
+    // expanded it has run.
+    if let Some(f) = DEFERRED_FLOW.lock().ok().and_then(|mut d| d.take()) {
+        with_shell(|s| s.flow = f);
+    }
     st
 }
+
+/// Loop control raised inside a non-forking substitution, applied after
+/// the command using it completes.
+pub static DEFERRED_FLOW: std::sync::Mutex<Option<Flow>> = std::sync::Mutex::new(None);
 
 fn exec_node_inner(node: &Node) -> i32 {
     if flow_pending() {
@@ -909,22 +1461,63 @@ fn exec_node_inner(node: &Node) -> i32 {
             let st = exec_node(body);
             // The cleanup runs even after break, return or an error; a
             // pending flow resumes afterwards unless the cleanup sets one.
-            let pending = flow();
+            let mut pending = flow();
             set_flow(Flow::None);
+            // TRY_BLOCK_ERROR: 1 in the cleanup after an error; setting it
+            // to 0 there cancels the error.
+            let is_error = matches!(pending, Flow::Exit(_)) && with_shell(|s| s.error_exit);
+            let saved = crate::shell::var_get_opt("TRY_BLOCK_ERROR");
+            crate::shell::without_assign_warnings(|| {
+                crate::shell::var_set("TRY_BLOCK_ERROR", if is_error { "1" } else { "0" }, false)
+            });
             exec_node(always);
+            if is_error && crate::shell::var_get("TRY_BLOCK_ERROR").trim() == "0" {
+                pending = Flow::None;
+                with_shell(|s| s.error_exit = false);
+            }
+            crate::shell::without_assign_warnings(|| match &saved {
+                Some(v) => {
+                    crate::shell::var_set("TRY_BLOCK_ERROR", v, false);
+                }
+                None => {
+                    crate::shell::var_set("TRY_BLOCK_ERROR", "-1", false);
+                }
+            });
             if flow() == Flow::None {
                 set_flow(pending);
             }
             st
         }
-        Node::AnonFunc { body, args, line } => match expand_words(args) {
+        Node::AnonFunc {
+            body,
+            args,
+            line,
+            traced,
+        } => match expand_words(args) {
             Ok(mut words) => {
                 words.insert(0, "(anon)".to_string());
-                call_function(body, &words, *line)
+                set_lineno(*line);
+                xtrace_cmd(&[], &words);
+                let saved = traced.then(|| with_shell(|s| s.opts & OPT_XTRACE != 0));
+                if *traced {
+                    with_shell(|s| crate::options::set_in(s, "xtrace", true));
+                }
+                let st = call_function(body, &words, *line);
+                if let Some(x) = saved {
+                    with_shell(|s| crate::options::set_in(s, "xtrace", x));
+                }
+                set_last_arg(if words.len() > 1 {
+                    words.last().map_or("", |w| w.as_str())
+                } else {
+                    ""
+                });
+                check_errexit(st);
+                st
             }
             Err(e) => expansion_failed(e),
         },
-        Node::Arith(expr) => {
+        Node::Arith(expr, line) => {
+            set_lineno(*line);
             let st = arith_status(expr);
             check_errexit(st);
             st
@@ -932,6 +1525,7 @@ fn exec_node_inner(node: &Node) -> i32 {
         Node::Repeat { count, body } => exec_repeat(count, body),
         Node::Select { var, words, body } => exec_select(var, words.as_deref(), body),
         Node::Coproc(body) => exec_coproc(body),
+        Node::Time(body) => exec_time(body),
         Node::ForArith {
             init,
             cond,
@@ -939,7 +1533,12 @@ fn exec_node_inner(node: &Node) -> i32 {
             body,
         } => exec_for_arith(init, cond, step, body),
         Node::Case { word, items } => exec_case(word, items),
-        Node::FuncDef { name, body, line } => {
+        Node::FuncDef {
+            name,
+            body,
+            line,
+            traced,
+        } => {
             // zsh expands the name: `function f$$ { ... }`.
             let name = &if name.contains(['$', '`', '\'', '"', '\\']) {
                 match expand_string(name) {
@@ -959,10 +1558,22 @@ fn exec_node_inner(node: &Node) -> i32 {
                     },
                 )
             });
+            // A new definition starts untraced, unless the function is
+            // redefining itself as it runs.
+            if *traced {
+                crate::shell::set_traced(name, Some(true));
+            } else if !crate::shell::with_err_ctx(|e| e.stack.iter().any(|c| c.0 == *name)) {
+                crate::shell::set_traced(name, None);
+            }
+            crate::options::set_sticky(name);
             crate::trap::function_defined(name);
             0
         }
-        Node::DBracket(words) => {
+        Node::DBracket(words, line) => {
+            set_lineno(*line);
+            if opt_set(OPT_XTRACE) {
+                xtrace_line(&dbracket_trace(words));
+            }
             let st = crate::testexpr::eval_dbracket(words);
             check_errexit(st);
             st
@@ -994,28 +1605,223 @@ fn exec_in_child(node: &Node) -> ! {
     exit_child(st)
 }
 
+// Records the line of the command running (not inside traps or a
+// NO_EVAL_LINENO eval).
+fn set_lineno(line: usize) {
+    if !crate::trap::in_trap() {
+        crate::shell::with_err_ctx(|e| {
+            if e.frozen == 0 {
+                e.lineno = line;
+            }
+        });
+    }
+}
+
 fn exec_simple(cmd: &SimpleCmd, in_child: bool) -> i32 {
     // A trap runs with the line of the command that triggered it.
     if !crate::trap::in_trap() {
-        crate::shell::with_err_ctx(|e| e.lineno = cmd.line);
+        crate::shell::with_err_ctx(|e| {
+            if e.frozen == 0 {
+                e.lineno = cmd.line;
+            }
+        });
     }
-    // zsh's DEBUG trap: before each command with DEBUG_BEFORE_CMD,
-    // otherwise after it.
-    let has_debug = with_shell(|s| s.traps.contains_key(&crate::trap::SIG_DEBUG));
-    if !has_debug {
-        return exec_simple_inner(cmd, in_child);
+    // A command other than `exit` resets the CHECK_JOBS warning.
+    if cmd.words.first().is_some_and(|w| w != "exit") {
+        crate::jobs::EXIT_WARNED.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-    let before = crate::options::is_set("debugbeforecmd");
-    if before {
-        crate::trap::run_pseudo(crate::trap::SIG_DEBUG);
+    exec_simple_inner(cmd, in_child)
+}
+
+// The line a command starts on, where the parser kept one.
+fn node_line(node: &Node) -> Option<usize> {
+    match node {
+        Node::Simple(c) => Some(c.line),
+        Node::Arith(_, l) | Node::DBracket(_, l) => Some(*l),
+        Node::FuncDef { line, .. } | Node::AnonFunc { line, .. } => Some(*line),
+        Node::AndOr { first, .. } => node_line(first),
+        Node::Pipeline { cmds, .. } => cmds.first().and_then(node_line),
+        Node::Redirected { node, .. } | Node::Time(node) => node_line(node),
+        _ => None,
     }
-    let st = exec_simple_inner(cmd, in_child);
-    if !before {
-        crate::shell::with_err_ctx(|e| e.lineno = cmd.line);
+}
+
+/// Runs one sublist with zsh's DEBUG trap: before it with
+/// DEBUG_BEFORE_CMD (`$ZSH_DEBUG_CMD` holding its text; setting ERR_EXIT
+/// in the trap skips it), otherwise after it.
+pub fn exec_with_debug(node: &Node) -> i32 {
+    DONE_TRAP.store(false, std::sync::atomic::Ordering::Relaxed);
+    let debug_set =
+        || with_shell(|s| s.traps.contains_key(&crate::trap::SIG_DEBUG)) && !crate::trap::in_trap();
+    if matches!(node, Node::List(_)) {
+        return exec_node(node);
+    }
+    // Without DEBUG_BEFORE_CMD the trap runs after the command, so one
+    // set by the command itself runs too.
+    if !crate::options::is_set("debugbeforecmd") {
+        let st = exec_node(node);
+        if !debug_set() {
+            return st;
+        }
+        if let Some(l) = node_line(node) {
+            crate::shell::with_err_ctx(|e| e.lineno = l);
+        }
         crate::trap::run_pseudo(crate::trap::SIG_DEBUG);
         with_shell(|s| s.last_status = st);
+        return st;
     }
-    st
+    if !debug_set() {
+        return exec_node(node);
+    }
+    if let Some(l) = node_line(node) {
+        crate::shell::with_err_ctx(|e| {
+            if e.frozen == 0 {
+                e.lineno = l;
+            }
+        });
+    }
+    {
+        let text = crate::deparse::Deparser::new(None).body_text(node);
+        let errexit_before = opt_set(OPT_ERREXIT);
+        with_shell(|s| s.store("ZSH_DEBUG_CMD", crate::params::Value::Scalar(text)));
+        // $LINENO in the trap is the command's line.
+        crate::shell::with_err_ctx(|e| e.frozen += 1);
+        crate::trap::run_pseudo(crate::trap::SIG_DEBUG);
+        crate::shell::with_err_ctx(|e| e.frozen -= 1);
+        with_shell(|s| {
+            s.remove_param("ZSH_DEBUG_CMD");
+        });
+        // `return` in the trap leaves the function; ERR_EXIT set by the
+        // trap skips the command.
+        if flow_pending() {
+            return last_status();
+        }
+        if !errexit_before && opt_set(OPT_ERREXIT) {
+            with_shell(|s| crate::options::set_in(s, "errexit", false));
+            return 1;
+        }
+    }
+    exec_node(node)
+}
+
+/// RM_STAR_SILENT unset: an interactive `rm *` or `rm dir/*` asks first.
+/// False when the answer is no.
+fn rm_star_ok(raw: &[String]) -> bool {
+    if raw.first().map(String::as_str) != Some("rm")
+        || !interactive()
+        || crate::options::is_set("rmstarsilent")
+        || !crate::options::is_set("shinstdin")
+    {
+        return true;
+    }
+    for w in &raw[1..] {
+        let dir = if w == "*" {
+            crate::shell::var_get("PWD")
+        } else if let Some(d) = w
+            .strip_suffix("/*")
+            .filter(|d| !d.contains(['\'', '"', '\\', '$', '`']))
+        {
+            if d.is_empty() {
+                "/".to_string()
+            } else if d.starts_with('/') {
+                d.to_string()
+            } else {
+                format!(
+                    "{}/{}",
+                    crate::shell::var_get("PWD").trim_end_matches('/'),
+                    d
+                )
+            }
+        } else {
+            continue;
+        };
+        if !check_rm_all(&dir) {
+            return false;
+        }
+    }
+    true
+}
+
+// zsh's checkrmall(): the query for deleting every file in `dir`.
+fn check_rm_all(dir: &str) -> bool {
+    let dots = crate::options::is_set("globdots");
+    let count = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| dots || !e.file_name().to_string_lossy().starts_with('.'))
+                .take(101)
+                .count()
+        })
+        .unwrap_or(0);
+    let what = match count {
+        n if n > 100 => "more than 100 files in ".to_string(),
+        1 => "the only file in ".to_string(),
+        0 => "all the files in ".to_string(),
+        n => format!("all {} files in ", n),
+    };
+    let mut msg = format!("zsh: sure you want to delete {}{}", what, dir);
+    if crate::options::is_set("rmstarwait") {
+        msg.push_str("? (waiting ten seconds)\x07");
+        let _ = crate::sys::write_fd(2, msg.as_bytes());
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        msg = "\n".to_string();
+    }
+    msg.push_str(" [yn]? \x07");
+    let _ = crate::sys::write_fd(2, msg.as_bytes());
+    get_query()
+}
+
+// zsh's getquery("ny", purge): typeahead counts as no; otherwise one
+// key, without echo, y or n (newline means n).
+fn get_query() -> bool {
+    let fd = 0;
+    let mut pending: libc::c_int = 0;
+    unsafe {
+        libc::ioctl(fd, libc::FIONREAD, &mut pending);
+    }
+    if pending > 0 {
+        let mut b = vec![0u8; pending as usize];
+        unsafe {
+            libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, b.len());
+        }
+        let _ = crate::sys::write_fd(2, b"n\n");
+        return false;
+    }
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    let tty = unsafe { libc::tcgetattr(fd, &mut old) } == 0;
+    if tty {
+        let mut t = old;
+        t.c_lflag &= !(libc::ECHO | libc::ICANON);
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &t);
+        }
+    }
+    let mut answer = b'n';
+    loop {
+        let mut c = [0u8; 1];
+        if unsafe { libc::read(fd, c.as_mut_ptr() as *mut libc::c_void, 1) } != 1 {
+            break;
+        }
+        match c[0].to_ascii_lowercase() {
+            b'\n' => break,
+            b @ (b'y' | b'n') => {
+                answer = b;
+                break;
+            }
+            _ => {
+                let _ = crate::sys::write_fd(2, b"\x07");
+            }
+        }
+    }
+    if tty {
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &old);
+        }
+    }
+    let _ = crate::sys::write_fd(2, &[answer, b'\n']);
+    answer == b'y'
 }
 
 fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
@@ -1034,6 +1840,9 @@ fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
         skip += 1;
     }
     let raw = &cmd.words[skip..];
+    if !rm_star_ok(raw) {
+        return 1;
+    }
     let arrays: Vec<(usize, Vec<String>)> = cmd
         .decl_arrays
         .iter()
@@ -1061,8 +1870,27 @@ fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
         return last_status();
     }
 
+    // zsh's null command: `>file` runs $NULLCMD (cat), `<file` alone
+    // $READNULLCMD (more); SH_NULLCMD makes it `:`, CSH_NULLCMD an error.
+    if cmd.words.is_empty() && cmd.assigns.is_empty() && !cmd.redirs.is_empty() {
+        if crate::options::is_set("cshnullcmd") {
+            shell_err("redirection with no command");
+            return 1;
+        }
+        if !crate::options::is_set("shnullcmd") {
+            let reading = cmd.redirs.len() == 1 && cmd.redirs[0].op == RedirOp::Read;
+            let name = if reading {
+                var_get_opt("READNULLCMD").unwrap_or_else(|| "more".to_string())
+            } else {
+                var_get_opt("NULLCMD").unwrap_or_else(|| "cat".to_string())
+            };
+            if !name.is_empty() {
+                return run_command(vec![name], None, &[], &cmd.redirs, in_child, dash);
+            }
+        }
+    }
     if words.is_empty() {
-        xtrace(&assigns.iter().map(assign_text).collect::<Vec<_>>());
+        xtrace_cmd(&assigns, &[]);
         for a in &assigns {
             if let Err(st) = apply_assign(a, false) {
                 if !interactive() {
@@ -1078,10 +1906,24 @@ fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
         return with_shell(|s| s.last_cmdsub_status).unwrap_or(0);
     }
 
-    let mut trace: Vec<String> = assigns.iter().map(assign_text).collect();
-    trace.extend(words.iter().cloned());
-    xtrace(&trace);
-    run_command(words, decl, &assigns, &cmd.redirs, in_child, dash)
+    xtrace_cmd(&assigns, &words);
+    // $_: the last word of the previous command.
+    let last = words.last().cloned();
+    let st = run_command(words, decl, &assigns, &cmd.redirs, in_child, dash);
+    if let Some(l) = last {
+        set_last_arg(&l);
+    }
+    st
+}
+
+fn set_last_arg(v: &str) {
+    with_shell(|s| {
+        let p = s
+            .params
+            .entry("_".to_string())
+            .or_insert_with(|| crate::params::Param::scalar(""));
+        p.value = crate::params::Value::Scalar(v.to_string());
+    });
 }
 
 // Runs builtin `name`, giving declaration commands their typed arguments.
@@ -1105,7 +1947,13 @@ fn run_command(
     // the command instead; -p searches the default PATH.
     let mut skip_functions = false;
     let mut default_path = false;
-    if words[0] == "command" {
+    // `command name`: without POSIX_BUILTINS zsh runs only external
+    // commands; with it, builtins too, special ones losing their
+    // special assignment rules.
+    let mut via_command = false;
+    // A function named `command` or `builtin` overrides the builtin.
+    let shadowed = |w: &str| with_shell(|s| s.functions.contains_key(w));
+    if words[0] == "command" && !shadowed("command") {
         let mut i = 1;
         let mut describe = None;
         while i < words.len() && words[i].starts_with('-') && words[i] != "-" {
@@ -1137,23 +1985,22 @@ fn run_command(
         } else {
             words.drain(..i);
             skip_functions = true;
+            via_command = true;
         }
         decl = None;
     }
+    let external_only = via_command && !crate::options::is_set("posixbuiltins");
     // zsh/bash `builtin name ...` runs the builtin even if a function or
     // alias shadows it.
     let mut builtin_only = false;
-    if words[0] == "builtin" {
+    if words[0] == "builtin" && !shadowed("builtin") {
         words.remove(0);
         decl = None;
         if words.is_empty() {
             return 0;
         }
         if !crate::builtins::is_builtin(&words[0]) {
-            err_line(&format!(
-                "meowsh: builtin: {}: not a shell builtin",
-                words[0]
-            ));
+            crate::shell::builtin_err("builtin", &format!("no such builtin: {}", words[0]));
             return 1;
         }
         builtin_only = true;
@@ -1165,7 +2012,7 @@ fn run_command(
         return exec_builtin(&words[1..], assigns, redirs);
     }
 
-    if crate::builtins::is_special_builtin(&name) {
+    if crate::builtins::is_special_builtin(&name) && !via_command {
         for a in assigns {
             if let Err(st) = apply_assign(a, false) {
                 if !interactive() {
@@ -1206,8 +2053,12 @@ fn run_command(
         return st;
     }
 
-    if builtin_only || crate::builtins::is_builtin(&name) {
-        let tmp = match TempVars::set(assigns) {
+    if builtin_only || (crate::builtins::is_builtin(&name) && !external_only) {
+        let export = matches!(
+            name.as_str(),
+            "exec" | "command" | "builtin" | "nocorrect" | "noglob"
+        );
+        let tmp = match TempVars::set_as(assigns, export) {
             Ok(t) => t,
             Err(st) => return st,
         };
@@ -1271,14 +2122,14 @@ fn run_external(
         if apply_redirs(redirs, false).is_err() {
             exit_child(1);
         }
-        exec_external_as(words, argv0, env);
+        exec_with_multios(words, argv0, env);
     }
     let pid = fork_process(ForkKind::Foreground(0));
     if pid == 0 {
         if apply_redirs(redirs, false).is_err() {
             exit_child(1);
         }
-        exec_external_as(words, argv0, env);
+        exec_with_multios(words, argv0, env);
     }
     if pid < 0 {
         return 1;
@@ -1348,6 +2199,14 @@ fn exec_builtin(args: &[String], assigns: &[Expanded], redirs: &[Redir]) -> i32 
     if apply_redirs(redirs, false).is_err() {
         return 1;
     }
+    // Without POSIX_BUILTINS, `exec name` runs a function or builtin of
+    // that name, then exits.
+    let shell_cmd =
+        with_shell(|s| s.functions.contains_key(&args[0])) || crate::builtins::is_builtin(&args[0]);
+    if shell_cmd && !crate::options::is_set("posixbuiltins") {
+        let st = run_command(args.to_vec(), None, assigns, &[], false, false);
+        exit_shell(st);
+    }
     let overrides: Vec<(String, String)> = assigns
         .iter()
         .filter_map(|a| match &a.value {
@@ -1371,17 +2230,48 @@ type Frame = (
     std::collections::HashMap<i32, String>,
     u32,
     std::collections::HashMap<String, bool>,
+    crate::options::Emulation,
+    TrapFuncs,
 );
+
+// The TRAPxxx functions defined when a function was entered.
+type TrapFuncs = Vec<(String, Option<crate::types::FuncDef>)>;
+
+fn trap_funcs() -> TrapFuncs {
+    with_shell(|s| {
+        s.functions
+            .iter()
+            .filter(|(n, _)| n.starts_with("TRAP"))
+            .map(|(n, f)| (n.clone(), Some(f.clone())))
+            .collect()
+    })
+}
 
 // zsh function scoping: an EXIT trap set inside a function runs when it
 // returns; with LOCAL_TRAPS / LOCAL_OPTIONS (also set by `emulate -L`)
 // traps / options go back to their values at entry.
-fn restore_function_frame(entry: Frame, status: i32) {
-    let (traps, opts, named) = entry;
+/// Returns the status the function ends with: a `return` in its EXIT
+/// trap replaces it (and makes the caller return too, as in zsh).
+fn restore_function_frame(entry: Frame, status: i32, posix_traps: bool) -> i32 {
+    let mut status = status;
+    let (traps, opts, named, emulation, funcs) = entry;
     let (local_traps, local_opts, exit_action) = with_shell(|s| {
         let on = |k: &str| s.named_opts.get(k).copied().unwrap_or(false);
         let exit = s.traps.get(&0).cloned();
-        let changed = exit != traps.get(&0).cloned();
+        // A TRAPEXIT defined in the function is a new EXIT trap even
+        // when one of that name was set on entry.
+        let before = funcs
+            .iter()
+            .find(|(n, _)| n == "TRAPEXIT")
+            .and_then(|(_, f)| f.as_ref());
+        let now = s.functions.get("TRAPEXIT");
+        let func_changed = match (before, now) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(&a.body, &b.body),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        let changed =
+            !posix_traps && (exit != traps.get(&0).cloned() || (func_changed && exit.is_some()));
         (
             on("localtraps"),
             on("localoptions"),
@@ -1395,7 +2285,10 @@ fn restore_function_frame(entry: Frame, status: i32) {
         sigs.dedup();
         for sig in sigs {
             let before = traps.get(&sig).cloned();
-            if (local_traps || sig == 0) && current.get(&sig) != before.as_ref() {
+            if (sig == 0 && posix_traps) || (sig != 0 && !local_traps) {
+                continue;
+            }
+            if current.get(&sig) != before.as_ref() {
                 crate::trap::set_trap(sig, before);
             }
         }
@@ -1404,6 +2297,7 @@ fn restore_function_frame(entry: Frame, status: i32) {
         with_shell(|s| {
             crate::options::restore_in(s, &named);
             s.opts = opts;
+            s.emulation = emulation;
         });
     }
     if let Some(action) = exit_action {
@@ -1411,13 +2305,41 @@ fn restore_function_frame(entry: Frame, status: i32) {
         let pending = flow();
         set_flow(Flow::None);
         crate::trap::run_action(&action);
-        if flow() == Flow::None || matches!(flow(), Flow::Return(_)) {
+        if let Flow::Return(n) = flow() {
+            status = n;
+        } else if flow() == Flow::None {
             set_flow(pending);
         }
     }
+    // LOCAL_TRAPS: TRAPxxx functions go back to those at entry.
+    if local_traps {
+        with_shell(|s| {
+            let keep = |n: &str| posix_traps && n == "TRAPEXIT";
+            s.functions.retain(|n, _| {
+                !n.starts_with("TRAP") || keep(n) || funcs.iter().any(|(m, _)| m == n)
+            });
+            for (n, f) in &funcs {
+                if keep(n) {
+                    continue;
+                }
+                if let Some(f) = f {
+                    s.functions.insert(n.clone(), f.clone());
+                }
+            }
+        });
+    }
+    status
 }
 
+// Set while XTRACE comes from a `functions -T` function.
+static TRACE_FROM_T: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
+    // A pending `break` from `${ ... }` in the arguments skips the call.
+    if let Some(f) = DEFERRED_FLOW.lock().ok().and_then(|mut d| d.take()) {
+        with_shell(|s| s.flow = f);
+        return last_status();
+    }
     let depth = with_shell(|s| s.func_depth);
     // $FUNCNEST limits the depth (zsh's default is 500).
     let limit = var_get_opt("FUNCNEST")
@@ -1436,38 +2358,158 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
         e.stack.push((words[0].clone(), line));
         e.lineno
     });
+    // Traced functions (functions -t / -T) run with XTRACE; a named
+    // function called from a -T one does not.
+    use std::sync::atomic::Ordering;
+    let kind = if words[0] == "(anon)" {
+        None
+    } else {
+        crate::shell::trace_kind(&words[0])
+    };
+    let saved_trace = (
+        with_shell(|s| s.opts & OPT_XTRACE != 0),
+        TRACE_FROM_T.load(Ordering::SeqCst),
+    );
+    match kind {
+        Some(t) => {
+            with_shell(|s| crate::options::set_in(s, "xtrace", true));
+            TRACE_FROM_T.store(t, Ordering::SeqCst);
+        }
+        None if saved_trace.1 && words[0] != "(anon)" => {
+            with_shell(|s| crate::options::set_in(s, "xtrace", false));
+            TRACE_FROM_T.store(false, Ordering::SeqCst);
+        }
+        None => {}
+    }
     // zsh (FUNCTION_ARGZERO): $0 is the function name while it runs.
     let (saved_params, saved_loops, saved_argv0) = with_shell(|s| {
         s.func_depth += 1;
-        let loops = std::mem::replace(&mut s.loop_depth, 0);
+        s.errreturn_stack
+            .push(std::mem::take(&mut s.errreturn_suppressed));
+        // zsh: `break` in a function can leave the caller's loop, unless
+        // the caller has LOCAL_LOOPS.
+        let loops = s.loop_depth;
         (
             std::mem::replace(&mut s.pos_params, words[1..].to_vec()),
             loops,
-            std::mem::replace(&mut s.argv0, words[0].clone()),
+            if crate::options::is_set_in(s, "functionargzero") {
+                std::mem::replace(&mut s.argv0, words[0].clone())
+            } else {
+                s.argv0.clone()
+            },
         )
     });
-    let entry = with_shell(|s| (s.traps.clone(), s.opts, s.named_opts.clone()));
+    // Without POSIX_BUILTINS each function call parses options afresh:
+    // OPTIND is 1 inside and restored afterwards.
+    let saved_getopts = (!crate::options::is_set("posixbuiltins")).then(|| {
+        let saved = (
+            crate::shell::var_get_opt("OPTIND"),
+            with_shell(|s| s.getopts_pos),
+        );
+        crate::shell::without_assign_warnings(|| var_set("OPTIND", "1", false));
+        with_shell(|s| s.getopts_pos = 0);
+        saved
+    });
+    let local_loops = crate::options::is_set("localloops");
+    let tf = trap_funcs();
+    let entry = with_shell(|s| {
+        (
+            s.traps.clone(),
+            s.opts,
+            s.named_opts.clone(),
+            s.emulation,
+            tf,
+        )
+    });
+    // A function with a different sticky emulation runs in it, and its
+    // option changes do not leak out.
+    let sticky = crate::options::sticky_of(&words[0]);
+    let cur_sticky = crate::options::CUR_STICKY
+        .lock()
+        .ok()
+        .and_then(|c| c.clone());
+    let switch_sticky = sticky.is_some() && sticky != cur_sticky;
+    if let Some(st) = sticky.as_ref().filter(|_| switch_sticky) {
+        crate::options::apply_sticky(st);
+        if let Ok(mut c) = crate::options::CUR_STICKY.lock() {
+            *c = sticky.clone();
+        }
+    }
     push_scope();
-    let mut st = exec_node(body);
+    // A `{ cmd }` body: the trap sees cmd, as zsh's body is the list.
+    let inner = match body.as_ref() {
+        Node::Brace(b) => b.as_ref(),
+        b => b,
+    };
+    let mut st = crate::shell::in_eval_context("shfunc", || exec_with_debug(inner));
     with_shell(|s| {
         if let Flow::Return(n) = s.flow {
             st = n;
             s.flow = Flow::None;
         }
     });
-    restore_function_frame(entry, st);
+    // LOCAL_LOOPS (as the caller had it): a break or continue stops at
+    // the end of the function.
+    let stray = local_loops
+        && with_shell(|s| {
+            let f = matches!(s.flow, Flow::Break(_) | Flow::Continue(_));
+            if f {
+                s.flow = Flow::None;
+            }
+            f
+        });
+    if stray {
+        crate::shell::with_err_ctx(|e| e.lineno = line);
+        shell_err("`break' active at end of function scope");
+    }
+    // POSIX_TRAPS (as in force when the function ends): EXIT traps
+    // belong to the shell, not the function.
+    let posix_traps = crate::options::is_set("posixtraps");
+    if switch_sticky {
+        with_shell(|s| {
+            crate::options::restore_in(s, &entry.2);
+            s.opts = entry.1;
+            s.emulation = entry.3;
+        });
+        if let Ok(mut c) = crate::options::CUR_STICKY.lock() {
+            *c = cur_sticky;
+        }
+    }
+    // The EXIT trap runs with the caller's positional parameters (zgetopt
+    // sets the caller's argv from one).
+    // Its locals are gone by then too.
     pop_scope();
+    let own_params = with_shell(|s| std::mem::replace(&mut s.pos_params, saved_params.clone()));
+    st = restore_function_frame(entry, st, posix_traps);
+    let trap_params = with_shell(|s| std::mem::replace(&mut s.pos_params, own_params));
+    let saved_params = trap_params;
+    if let Some((optind, pos)) = saved_getopts {
+        match optind {
+            Some(v) => {
+                crate::shell::without_assign_warnings(|| var_set("OPTIND", &v, false));
+            }
+            None => with_shell(|s| {
+                s.remove_param("OPTIND");
+            }),
+        }
+        with_shell(|s| s.getopts_pos = pos);
+    }
     with_shell(|s| {
         s.pos_params = saved_params;
         s.loop_depth = saved_loops;
         s.argv0 = saved_argv0;
         s.func_depth -= 1;
+        s.errreturn_suppressed = s.errreturn_stack.pop().unwrap_or(0);
         s.last_status = st;
     });
     crate::shell::with_err_ctx(|e| {
         e.stack.pop();
         e.lineno = saved_line;
     });
+    if kind.is_some() || saved_trace.1 {
+        with_shell(|s| crate::options::set_in(s, "xtrace", saved_trace.0));
+        TRACE_FROM_T.store(saved_trace.1, Ordering::SeqCst);
+    }
     st
 }
 
@@ -1531,8 +2573,45 @@ fn run_pipeline(cmds: &[Node]) -> i32 {
     let mut pids = Vec::new();
     let mut pgid = 0;
     let mut prev_read = -1;
+    // zsh runs the last stage in the shell itself (so `... | read x`
+    // sets x), unless it is an external command. Not under job control,
+    // where the stages' process group owns the terminal.
+    let in_shell = with_shell(|s| {
+        !s.job_control
+            && matches!(
+                s.emulation,
+                crate::options::Emulation::Zsh | crate::options::Emulation::Csh
+            )
+    }) && cmds.len() > 1
+        && runs_in_shell(&cmds[cmds.len() - 1]);
     for (k, cmd) in cmds.iter().enumerate() {
         let last = k + 1 == cmds.len();
+        if last && in_shell {
+            let saved = unsafe { libc::dup(0) };
+            unsafe {
+                libc::dup2(prev_read, 0);
+            }
+            close(prev_read);
+            PIPE_IN.store(true, std::sync::atomic::Ordering::SeqCst);
+            let st = exec_node(cmd);
+            PIPE_IN.store(false, std::sync::atomic::Ordering::SeqCst);
+            unsafe {
+                libc::dup2(saved, 0);
+                libc::close(saved);
+            }
+            let mut codes = if pids.is_empty() {
+                Vec::new()
+            } else {
+                wait_foreground(&pids, pgid, &text)
+            };
+            codes.push(st);
+            set_pipestatus(&codes);
+            return if opt_set(OPT_PIPEFAIL) {
+                codes.iter().rev().find(|&&c| c != 0).copied().unwrap_or(0)
+            } else {
+                st
+            };
+        }
         let (r, w) = if last {
             (-1, -1)
         } else {
@@ -1546,6 +2625,9 @@ fn run_pipeline(cmds: &[Node]) -> i32 {
         };
         let pid = fork_process(ForkKind::Foreground(pgid));
         if pid == 0 {
+            // MULTIOS joins a stage's redirections with its pipes.
+            PIPE_IN.store(prev_read >= 0, std::sync::atomic::Ordering::SeqCst);
+            PIPE_OUT.store(w >= 0, std::sync::atomic::Ordering::SeqCst);
             unsafe {
                 if prev_read >= 0 {
                     libc::dup2(prev_read, 0);
@@ -1583,6 +2665,152 @@ fn run_pipeline(cmds: &[Node]) -> i32 {
     } else {
         *codes.last().unwrap_or(&0)
     }
+}
+
+// Whether a pipeline's last stage can run in the shell: anything but a
+// simple command naming an external program.
+fn runs_in_shell(node: &Node) -> bool {
+    match node {
+        Node::Simple(c) => match c.words.first() {
+            None => true,
+            Some(w) if w.contains(['$', '`', '"', '\'', '\\']) => false,
+            Some(w) => {
+                crate::builtins::is_builtin(w)
+                    || with_shell(|s| s.functions.contains_key(w.as_str()))
+            }
+        },
+        Node::Redirected { node, .. } => runs_in_shell(node),
+        Node::Subshell(_) => false,
+        _ => true,
+    }
+}
+
+fn rusage(who: i32) -> libc::rusage {
+    let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::getrusage(who, &mut r);
+    }
+    r
+}
+
+fn tv_secs(tv: libc::timeval) -> f64 {
+    tv.tv_sec as f64 + tv.tv_usec as f64 / 1_000_000.0
+}
+
+// zsh's printtime: one line of TIMEFMT for `desc`.
+fn print_time(desc: &str, elapsed: f64, user: f64, sys: f64, maxrss: i64) {
+    let fmt = crate::shell::var_get_opt("TIMEFMT")
+        .unwrap_or_else(|| "%J  %U user %S system %P cpu %*E total".to_string());
+    let hhmmss = |secs: f64| {
+        let mins = secs as i64 / 60;
+        let hours = mins / 60;
+        let secs = secs - 60.0 * mins as f64;
+        let mins = mins - 60 * hours;
+        if hours > 0 {
+            format!("{}:{:02}:{:05.2}", hours, mins, secs)
+        } else if mins > 0 {
+            format!("{}:{:05.2}", mins, secs)
+        } else {
+            format!("{:.3}", secs)
+        }
+    };
+    let pick = |c: char| match c {
+        'E' => Some(elapsed),
+        'U' => Some(user),
+        'S' => Some(sys),
+        _ => None,
+    };
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&c) = chars.get(i) else {
+            break;
+        };
+        i += 1;
+        match c {
+            'E' | 'U' | 'S' => out.push_str(&format!("{:4.2}s", pick(c).unwrap())),
+            'm' | 'u' | 'n' | '*' => match chars.get(i).and_then(|&x| pick(x)) {
+                Some(v) => {
+                    i += 1;
+                    out.push_str(&match c {
+                        'm' => format!("{:.0}ms", v * 1e3),
+                        'u' => format!("{:.0}us", v * 1e6),
+                        'n' => format!("{:.0}ns", v * 1e9),
+                        _ => hhmmss(v),
+                    });
+                }
+                None => {
+                    out.push('%');
+                    out.push(c);
+                }
+            },
+            'P' => {
+                let pct = if elapsed > 0.0 {
+                    (100.0 * (user + sys) / elapsed) as i64
+                } else {
+                    0
+                };
+                out.push_str(&format!("{}%", pct));
+            }
+            'M' => out.push_str(&maxrss.to_string()),
+            'J' => out.push_str(desc),
+            '%' => out.push('%'),
+            c => {
+                out.push('%');
+                out.push(c);
+            }
+        }
+    }
+    out.push('\n');
+    let _ = crate::sys::write_fd(2, out.as_bytes());
+}
+
+// `time pipeline`: a forked job reports its children's times under its
+// command text; work done in the shell reports `shell` and `children`.
+fn exec_time(body: &Node) -> i32 {
+    let start = std::time::Instant::now();
+    let (self0, kids0) = (rusage(libc::RUSAGE_SELF), rusage(libc::RUSAGE_CHILDREN));
+    let st = exec_node(body);
+    let elapsed = start.elapsed().as_secs_f64();
+    let (self1, kids1) = (rusage(libc::RUSAGE_SELF), rusage(libc::RUSAGE_CHILDREN));
+    let d = |a: libc::timeval, b: libc::timeval| (tv_secs(b) - tv_secs(a)).max(0.0);
+    let job = match body {
+        Node::Pipeline { .. } | Node::Subshell(_) => true,
+        Node::Simple(_) => !runs_in_shell(body),
+        _ => false,
+    };
+    if job {
+        print_time(
+            &describe(body),
+            elapsed,
+            d(kids0.ru_utime, kids1.ru_utime),
+            d(kids0.ru_stime, kids1.ru_stime),
+            kids1.ru_maxrss,
+        );
+    } else {
+        print_time(
+            "shell",
+            elapsed,
+            d(self0.ru_utime, self1.ru_utime),
+            d(self0.ru_stime, self1.ru_stime),
+            self1.ru_maxrss,
+        );
+        print_time(
+            "children",
+            elapsed,
+            d(kids0.ru_utime, kids1.ru_utime),
+            d(kids0.ru_stime, kids1.ru_stime),
+            kids1.ru_maxrss,
+        );
+    }
+    st
 }
 
 fn exec_subshell(body: &Node) -> i32 {
@@ -1632,7 +2860,7 @@ fn exec_list(items: &[ListItem]) -> i32 {
         status = if item.background {
             exec_background(&item.node)
         } else {
-            exec_node(&item.node)
+            exec_with_debug(&item.node)
         };
         with_shell(|s| s.last_status = status);
         crate::trap::run_pending();
@@ -1672,20 +2900,36 @@ fn exec_background(node: &Node) -> i32 {
     0
 }
 
+/// zsh's command stack, which `%_` shows: the constructs being run.
+pub static CMD_STACK: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+fn in_cmd<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+    if let Ok(mut c) = CMD_STACK.lock() {
+        c.push(name);
+    }
+    let r = f();
+    if let Ok(mut c) = CMD_STACK.lock() {
+        c.pop();
+    }
+    r
+}
+
 fn exec_if(branches: &[(Node, Node)], else_body: Option<&Node>) -> i32 {
-    for (cond, body) in branches {
+    for (k, (cond, body)) in branches.iter().enumerate() {
         suppress_errexit(1);
-        let st = exec_node(cond);
+        let st = in_cmd(if k == 0 { "if" } else { "elif" }, || exec_node(cond));
         suppress_errexit(-1);
         if flow_pending() {
             return st;
         }
         if st == 0 {
-            return exec_node(body);
+            return in_cmd(if k == 0 { "then" } else { "elif-then" }, || {
+                exec_node(body)
+            });
         }
     }
     match else_body {
-        Some(b) => exec_node(b),
+        Some(b) => in_cmd("else", || exec_node(b)),
         None => 0,
     }
 }
@@ -1693,7 +2937,14 @@ fn exec_if(branches: &[(Node, Node)], else_body: Option<&Node>) -> i32 {
 // After a loop body: Some(true) leaves the loop, Some(false) starts the
 // next iteration, None continues normally.
 fn exec_repeat(count: &str, body: &Node) -> i32 {
-    let n = match expand_string(count).map(|c| crate::arith::eval(&c)) {
+    // zsh reads a bare `?` count as $?.
+    let n = match expand_string(count).map(|c| {
+        if c.trim() == "?" {
+            Ok(last_status() as i64)
+        } else {
+            crate::arith::eval(&c)
+        }
+    }) {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             err_line(&format!("meowsh: {}", e));
@@ -1893,6 +3144,7 @@ fn exec_loop(cond: &Node, body: &Node, until: bool) -> i32 {
 }
 
 fn exec_for(vars: &[String], words: Option<&[String]>, body: &Node) -> i32 {
+    with_shell(|s| s.last_cmdsub_status = None);
     let items = match words {
         Some(ws) => match expand_words(ws) {
             Ok(v) => v,
@@ -1900,15 +3152,37 @@ fn exec_for(vars: &[String], words: Option<&[String]>, body: &Node) -> i32 {
         },
         None => with_shell(|s| s.pos_params.clone()),
     };
+    // A command substitution in the words sets $? for the first pass.
+    with_shell(|s| {
+        if let Some(st) = s.last_cmdsub_status.take() {
+            s.last_status = st;
+        }
+    });
     let mut status = 0;
     with_shell(|s| s.loop_depth += 1);
     for chunk in items.chunks(vars.len().max(1)) {
-        let ok = vars
-            .iter()
-            .enumerate()
-            .all(|(k, v)| var_set(v, chunk.get(k).map(|s| s.as_str()).unwrap_or(""), false));
+        // A reference as the loop variable is pointed at each word.
+        let ok = vars.iter().enumerate().all(|(k, v)| {
+            let word = chunk.get(k).map(|s| s.as_str()).unwrap_or("");
+            let is_ref = with_shell(|s| {
+                s.param(v).map(|p| {
+                    (
+                        p.attrs & crate::params::NAMEREF != 0,
+                        p.attrs & crate::params::READONLY != 0,
+                    )
+                })
+            });
+            match is_ref {
+                Some((true, true)) => {
+                    shell_err(&format!("read-only reference: {}", v));
+                    false
+                }
+                Some((true, false)) => crate::shell::set_ref_target(v, word),
+                _ => var_set(v, word, false),
+            }
+        });
         if !ok {
-            status = 1;
+            status = abort_command(1);
             break;
         }
         status = exec_node(body);
@@ -2016,9 +3290,15 @@ pub fn run_string(src: &str) -> i32 {
 /// Like `run_string`, with errors naming `ctx` (`(eval)`, a sourced
 /// file) and counting lines from the start of `src`.
 pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
+    // NO_EVAL_LINENO: an eval keeps its caller's name and line.
+    let frozen = ctx == Some("(eval)") && !crate::options::is_set("evallineno");
+    let ctx = ctx.filter(|_| !frozen);
     let saved_line = crate::shell::with_err_ctx(|e| {
         if let Some(c) = ctx {
             e.stack.push((c.to_string(), 0));
+        }
+        if frozen {
+            e.frozen += 1;
         }
         e.lineno
     });
@@ -2034,6 +3314,9 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
     crate::shell::with_err_ctx(|e| {
         if ctx.is_some() {
             e.stack.pop();
+        }
+        if frozen {
+            e.frozen -= 1;
         }
         e.lineno = saved_line;
     });
@@ -2052,10 +3335,17 @@ fn run_whole(src: &str) -> i32 {
                     ParseError::Syntax(m) => m,
                     ParseError::Incomplete => "syntax error: unexpected end of file".to_string(),
                 };
-                crate::shell::with_err_ctx(|e| e.lineno = parser.line());
+                // An unclosed quote is reported where the input ends.
+                let line = if msg.starts_with("unmatched") {
+                    src.matches('\n').count() + 1
+                } else {
+                    parser.line()
+                };
+                crate::shell::with_err_ctx(|e| e.lineno = line);
                 shell_err(&msg);
-                with_shell(|s| s.last_status = 2);
-                return 2;
+                let st = parse_error_status();
+                with_shell(|s| s.last_status = st);
+                return st;
             }
         }
     }
@@ -2064,7 +3354,7 @@ fn run_whole(src: &str) -> i32 {
         if flow_pending() {
             break;
         }
-        status = exec_node(node);
+        status = exec_with_debug(node);
         crate::trap::run_pending();
     }
     status
@@ -2088,10 +3378,16 @@ fn run_parsed(src: &str) -> i32 {
                     ParseError::Syntax(m) => m,
                     ParseError::Incomplete => "syntax error: unexpected end of file".to_string(),
                 };
-                crate::shell::with_err_ctx(|e| e.lineno = parser.line());
+                // An unclosed quote is reported where the input ends.
+                let line = if msg.starts_with("unmatched") {
+                    src.matches('\n').count() + 1
+                } else {
+                    parser.line()
+                };
+                crate::shell::with_err_ctx(|e| e.lineno = line);
                 shell_err(&msg);
-                status = 2;
-                with_shell(|s| s.last_status = 2);
+                status = parse_error_status();
+                with_shell(|s| s.last_status = status);
                 break;
             }
         }
@@ -2125,6 +3421,10 @@ pub fn history_add(line: &str) {
 /// Runs the output of `src` in a subshell and returns its standard output
 /// and exit status.
 pub fn command_subst(src: &str) -> (String, i32) {
+    crate::shell::in_eval_context("cmdsubst", || command_subst_in(src))
+}
+
+fn command_subst_in(src: &str) -> (String, i32) {
     let (r, w) = match pipe_cloexec() {
         Ok(p) => p,
         Err(e) => {
@@ -2187,6 +3487,12 @@ fn procsub_close_from(mark: usize) {
 /// `<(src)` (`read` true) or `>(src)`: runs `src` in the background
 /// connected to a pipe and returns a `/dev/fd` path for the other end.
 pub fn process_subst(src: &str, read: bool) -> Option<String> {
+    crate::shell::in_eval_context(if read { "outsubst" } else { "insubst" }, || {
+        process_subst_in(src, read)
+    })
+}
+
+fn process_subst_in(src: &str, read: bool) -> Option<String> {
     let (r, w) = match pipe_cloexec() {
         Ok(p) => p,
         Err(e) => {
@@ -2246,7 +3552,27 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
             reap_jobs(true);
         }
         let eof = match next(!buf.is_empty()) {
-            InputLine::Line(l) => {
+            InputLine::Line(mut l) => {
+                // BANG_HIST: `!` history references, in interactive input.
+                if is_interactive && l.contains(['!', '^']) && crate::options::is_set("banghist") {
+                    let hist =
+                        with_shell(|s| s.history.lock().map(|h| h.clone()).unwrap_or_default());
+                    match crate::history::expand(&l, &hist) {
+                        Ok(new) => {
+                            // The expanded line is shown at a terminal.
+                            if new != l && unsafe { libc::isatty(0) } == 1 {
+                                let _ = crate::sys::write_fd(2, new.as_bytes());
+                            }
+                            l = new;
+                        }
+                        Err(e) => {
+                            shell_err(&e);
+                            buf.clear();
+                            with_shell(|s| s.last_status = 1);
+                            continue;
+                        }
+                    }
+                }
                 if opt_set(OPT_VERBOSE) {
                     let _ = crate::sys::write_fd(2, l.as_bytes());
                 }
@@ -2282,7 +3608,12 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                         on_command(&text);
                         crate::builtins::run_hooks("preexec", &[text.clone(), text.clone(), text]);
                     }
-                    exec_node(&node);
+                    let st = exec_with_debug(&node);
+                    // PRINT_EXIT_VALUE: report a command line's failure.
+                    if st != 0 && crate::options::is_set("printexitvalue") {
+                        let name = crate::shell::with_err_ctx(|e| e.name.clone());
+                        err_line(&format!("{}: exit {}", name, st));
+                    }
                     crate::trap::run_pending();
                     match flow() {
                         Flow::Exit(n) => return n,
@@ -2304,12 +3635,18 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                 }
                 Err(ParseError::Incomplete) => break,
                 Err(ParseError::Syntax(msg)) => {
-                    crate::shell::with_err_ctx(|e| e.lineno = parser.line());
+                    let line = if msg.starts_with("unmatched") {
+                        lines_done + buf.matches('\n').count() + 1
+                    } else {
+                        parser.line()
+                    };
+                    crate::shell::with_err_ctx(|e| e.lineno = line);
                     shell_err(&msg);
-                    with_shell(|s| s.last_status = 2);
+                    let st = parse_error_status();
+                    with_shell(|s| s.last_status = st);
                     buf.clear();
                     if !is_interactive {
-                        return 2;
+                        return st;
                     }
                     break;
                 }

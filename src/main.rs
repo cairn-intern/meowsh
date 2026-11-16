@@ -31,7 +31,24 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut i = 1;
     // `--emulate mode` is handled before parsing (it decides the letters).
     if args.get(1).map(|a| a.as_str()) == Some("--emulate") {
+        if args.len() < 3 {
+            eprintln!("{}: --emulate: argument required", args[0]);
+            std::process::exit(1);
+        }
         i = 3;
+    } else if args
+        .iter()
+        .skip(2)
+        .position(|a| a == "--emulate")
+        .is_some_and(|p| {
+            // Only among the leading options, not in a command or script args.
+            args[1..p + 2].iter().all(|a| {
+                (a.starts_with('-') || a.starts_with('+')) && a != "--" && !a.contains('c')
+            })
+        })
+    {
+        eprintln!("{}: --emulate: must precede other options", args[0]);
+        std::process::exit(1);
     }
     while i < args.len() {
         let a = &args[i];
@@ -41,6 +58,31 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         }
         if a == "--login" {
             out.login = true;
+            i += 1;
+            continue;
+        }
+        // zsh: --version, --help, and --option-name for any option.
+        if a == "--version" {
+            let name = args
+                .first()
+                .map(|a0| a0.rsplit('/').next().unwrap_or(a0).trim_start_matches('-'))
+                .unwrap_or("meowsh");
+            println!(
+                "{} 5.9-meowsh ({}-unknown-{})",
+                name,
+                std::env::consts::ARCH,
+                std::env::consts::OS
+            );
+            std::process::exit(0);
+        }
+        if a == "--help" {
+            println!("Usage: meowsh [<options>] [<argument> ...]");
+            std::process::exit(0);
+        }
+        if let Some(long) = a.strip_prefix("--").filter(|l| !l.is_empty()) {
+            let (opt, v) =
+                options::resolve(long).ok_or_else(|| format!("no such option: {}", long))?;
+            out.options.push((opt, v));
             i += 1;
             continue;
         }
@@ -104,6 +146,17 @@ fn main() {
         if matches!(emu, Emulation::Sh | Emulation::Ksh) {
             s.drop_default_ties();
         }
+        // zsh's default PS4 names the function and line.
+        if !matches!(emu, Emulation::Sh | Emulation::Ksh) && std::env::var_os("PS4").is_none() {
+            s.store("PS4", meowsh::params::Value::Scalar("+%N:%i> ".to_string()));
+        }
+        // zsh's two built-in aliases.
+        if !matches!(emu, Emulation::Sh | Emulation::Ksh) {
+            s.alias_map(false)
+                .insert("run-help".to_string(), "man".to_string());
+            s.alias_map(false)
+                .insert("which-command".to_string(), "whence".to_string());
+        }
     });
     let args = match parse_args(&argv) {
         Ok(a) => a,
@@ -141,6 +194,16 @@ fn main() {
             options::set_in(s, opt, *on);
         }
         options::set_in(s, "interactive", interactive);
+        // $ZSH_ARGZERO: $0 as the shell started.
+        let a0 = args.script.clone().unwrap_or_else(|| s.argv0.clone());
+        s.store("ZSH_ARGZERO", meowsh::params::Value::Scalar(a0));
+        if let Ok(mut c) = meowsh::shell::EVAL_CONTEXT.lock() {
+            c.push(if args.command.is_some() {
+                "cmdarg"
+            } else {
+                "toplevel"
+            });
+        }
         let name = s.script_name.clone();
         meowsh::shell::with_err_ctx(|e| {
             e.name = name;
@@ -169,7 +232,13 @@ fn main() {
         match open_script(path) {
             Ok(fd) => run_fd(fd, false),
             Err(e) => {
-                eprintln!("meowsh: {}: {}", path, strerror(e));
+                // zsh's wording, naming the shell as it was invoked.
+                let argv0 = env::args().next().unwrap_or_else(|| "meowsh".to_string());
+                if e == libc::ENOENT {
+                    eprintln!("{}: can't open input file: {}", argv0, path);
+                } else {
+                    eprintln!("{}: {}: {}", argv0, path, strerror(e).to_lowercase());
+                }
                 exit_shell(if e == libc::ENOENT { 127 } else { 126 });
             }
         }

@@ -45,11 +45,50 @@ fn wide_names() -> bool {
 }
 
 pub fn is_valid_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if is_name_start(c) => chars.all(is_name_char),
-        _ => false,
+    let chars: Vec<char> = s.chars().collect();
+    name_end(&chars, 0) == Some(chars.len())
+}
+
+/// End of a parameter name at `i`, with zsh's namespaces: `name`,
+/// `.ns.name`, `.ns`, `ns.name`, `ns.` and `ns.2` (a part that starts
+/// with a digit is all digits). Namespaces do not nest.
+pub fn name_end(c: &[char], i: usize) -> Option<usize> {
+    let mut j = i;
+    let dotted = c.get(j) == Some(&'.');
+    if dotted {
+        j += 1;
     }
+    if !c.get(j).is_some_and(|&x| is_name_start(x)) {
+        return None;
+    }
+    j += 1;
+    while c.get(j).is_some_and(|&x| is_name_char(x)) {
+        j += 1;
+    }
+    if c.get(j) == Some(&'.') {
+        let k = j + 1;
+        let mut e = k;
+        if c.get(e).is_some_and(char::is_ascii_digit) {
+            while c.get(e).is_some_and(char::is_ascii_digit) {
+                e += 1;
+            }
+            if c.get(e).is_some_and(|&x| is_name_char(x)) {
+                return None;
+            }
+        } else if c.get(e).is_some_and(|&x| is_name_start(x)) {
+            while c.get(e).is_some_and(|&x| is_name_char(x)) {
+                e += 1;
+            }
+        }
+        if e == k && dotted {
+            return None;
+        }
+        if c.get(e) == Some(&'.') {
+            return None;
+        }
+        j = e;
+    }
+    Some(j)
 }
 
 /// True if `s` has the form `name=...`, `name+=...`, or `name[sub]=...`.
@@ -60,12 +99,31 @@ pub fn is_assignment(s: &str) -> bool {
 /// Splits an assignment word into (name, optional subscript, append, value).
 pub fn assignment_split(s: &str) -> Option<(String, Option<String>, bool, String)> {
     let chars: Vec<char> = s.chars().collect();
-    if chars.is_empty() || !is_name_start(chars[0]) {
+    // zsh: `2=x` / `2+=x` assign a positional parameter.
+    let digits = chars.iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0
+        && wide_names()
+        && matches!(chars.get(digits), Some('=') | Some('+'))
+        && chars[0] != '0'
+    {
+        let append = chars[digits] == '+';
+        let eq = digits + usize::from(append);
+        if chars.get(eq) == Some(&'=') {
+            return Some((
+                chars[..digits].iter().collect(),
+                None,
+                append,
+                chars[eq + 1..].iter().collect(),
+            ));
+        }
+    }
+    let mut i = name_end(&chars, 0)?;
+    // A plain name stops at a dot that does not make a namespace.
+    if chars.get(i) == Some(&'.') {
         return None;
     }
-    let mut i = 1;
-    while i < chars.len() && is_name_char(chars[i]) {
-        i += 1;
+    if i == 0 {
+        return None;
     }
     let name: String = chars[..i].iter().collect();
     let mut subscript = None;
@@ -75,6 +133,8 @@ pub fn assignment_split(s: &str) -> Option<(String, Option<String>, bool, String
         let mut j = i;
         while j < chars.len() {
             match chars[j] {
+                // A backslash-escaped bracket does not count.
+                '\\' => j += 1,
                 '[' => depth += 1,
                 ']' => {
                     depth -= 1;
@@ -197,7 +257,9 @@ pub fn scan_brace(chars: &[char], i: usize, in_dq: bool) -> Option<usize> {
 pub fn scan_paren(chars: &[char], i: usize) -> Option<usize> {
     let mut j = i + 1;
     let mut depth = 1;
-    let mut case_depth = 0usize;
+    // The paren depth of each open `case`: its patterns' `)` close
+    // nothing.
+    let mut cases: Vec<usize> = Vec::new();
     while j < chars.len() {
         let c = chars[j];
         let at_word_start = j == i + 1
@@ -216,7 +278,11 @@ pub fn scan_paren(chars: &[char], i: usize) -> Option<usize> {
             }
             // As in the lexer: `#` right after a parenthesis is glob
             // syntax such as `(#e)`, not a comment.
-            '#' if at_word_start && !(j > i + 1 && matches!(chars[j - 1], '(' | ')')) => {
+            // ... unless the `(` opens a command substitution: `$(# x`.
+            '#' if at_word_start
+                && (!matches!(chars[j - 1], '(' | ')')
+                    || (j == i + 1 && i > 0 && chars[i - 1] == '$')) =>
+            {
                 while j < chars.len() && chars[j] != '\n' {
                     j += 1;
                 }
@@ -227,7 +293,7 @@ pub fn scan_paren(chars: &[char], i: usize) -> Option<usize> {
             }
             ')' => {
                 j += 1;
-                if case_depth > 0 && depth == 1 {
+                if cases.last() == Some(&depth) {
                     continue;
                 }
                 depth -= 1;
@@ -243,11 +309,11 @@ pub fn scan_paren(chars: &[char], i: usize) -> Option<usize> {
                 let word: String = chars[start..j].iter().collect();
                 let ends_word = j >= chars.len()
                     || matches!(chars[j], ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')');
-                if ends_word {
+                if ends_word && command_position(&chars[i + 1..start]) {
                     if word == "case" {
-                        case_depth += 1;
+                        cases.push(depth);
                     } else if word == "esac" {
-                        case_depth = case_depth.saturating_sub(1);
+                        cases.pop();
                     }
                 }
             }
@@ -255,6 +321,25 @@ pub fn scan_paren(chars: &[char], i: usize) -> Option<usize> {
         }
     }
     None
+}
+
+// Whether a word after `before` is in command position: at the start,
+// after a separator, or after a reserved word that takes a command.
+fn command_position(before: &[char]) -> bool {
+    let text: String = before.iter().collect();
+    let mut t = text.trim_end_matches([' ', '\t']);
+    // A backslash-newline continues the line.
+    while let Some(r) = t.strip_suffix("\\\n") {
+        t = r.trim_end_matches([' ', '\t']);
+    }
+    if t.is_empty() || t.ends_with(['(', ';', '&', '|', '\n', '{', '!']) {
+        return true;
+    }
+    let last = t.rsplit([' ', '\t', '\n', ';', '(']).next().unwrap_or("");
+    matches!(
+        last,
+        "do" | "then" | "else" | "elif" | "time" | "if" | "while" | "until" | "always"
+    )
 }
 
 /// `$((...))` with `i` at the first `(`: returns the index after `))`, or
@@ -334,11 +419,39 @@ pub fn unquote_delimiter(raw: &str) -> (String, bool) {
                 }
                 i += 2;
             }
-            '\'' | '"' => {
+            // `$'...'` is decoded, the one expansion a delimiter gets.
+            '$' if chars.get(i + 1) == Some(&'\'') => {
                 quoted = true;
-                let q = chars[i];
+                let start = i + 2;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '\'' {
+                    if chars[j] == '\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                let inner: String = chars[start..j.min(chars.len())].iter().collect();
+                out.push_str(&crate::expand::decode_escapes(&inner));
+                i = j + 1;
+            }
+            '\'' => {
+                quoted = true;
                 i += 1;
-                while i < chars.len() && chars[i] != q {
+                while i < chars.len() && chars[i] != '\'' {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+            }
+            // In double quotes a backslash quotes only $ ` " \.
+            '"' => {
+                quoted = true;
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && matches!(chars.get(i + 1), Some('$' | '`' | '"' | '\\'))
+                    {
+                        i += 1;
+                    }
                     out.push(chars[i]);
                     i += 1;
                 }
@@ -357,6 +470,8 @@ struct PendingHeredoc {
     id: usize,
     delim: String,
     strip_tabs: bool,
+    // Unquoted delimiter: a backslash-newline joins lines.
+    expands: bool,
 }
 
 pub struct Lexer {
@@ -372,6 +487,8 @@ pub struct Lexer {
     line_cache: std::cell::Cell<(usize, usize)>,
     // Lines of the same input read before this text.
     pub line_offset: usize,
+    // Where the last token started, for its line number.
+    tok_start: usize,
     // Whether `#` at the start of a word starts a comment.
     pub comments: bool,
 }
@@ -387,6 +504,7 @@ impl Lexer {
             next_heredoc_id: 0,
             line_cache: std::cell::Cell::new((0, 1)),
             line_offset: 0,
+            tok_start: 0,
             comments: true,
         }
     }
@@ -469,6 +587,7 @@ impl Lexer {
             id,
             delim,
             strip_tabs,
+            expands: !quoted,
         });
         (id, !quoted)
     }
@@ -481,6 +600,9 @@ impl Lexer {
         let pending = std::mem::take(&mut self.pending);
         for hd in pending {
             let mut body = String::new();
+            // The previous line ended in a backslash that joins this one:
+            // no tab stripping and no delimiter here.
+            let mut continued = false;
             loop {
                 if self.pos >= self.chars.len() {
                     if !self.final_input {
@@ -501,13 +623,15 @@ impl Lexer {
                     return Err(LexError::Incomplete);
                 }
                 let mut line: String = self.chars[start..end].iter().collect();
-                if hd.strip_tabs {
+                if hd.strip_tabs && !continued {
                     line = line.trim_start_matches('\t').to_string();
                 }
                 self.pos = (end + 1).min(self.chars.len());
-                if line == hd.delim {
+                if !continued && line == hd.delim {
                     break;
                 }
+                let trailing = line.chars().rev().take_while(|&c| c == '\\').count();
+                continued = hd.expands && trailing % 2 == 1;
                 body.push_str(&line);
                 body.push('\n');
             }
@@ -516,7 +640,21 @@ impl Lexer {
         Ok(())
     }
 
+    /// The line the last token read started on.
+    pub fn tok_line(&self) -> usize {
+        let pos = self.tok_start.min(self.chars.len());
+        self.chars[..pos].iter().filter(|&&c| c == '\n').count() + 1 + self.line_offset
+    }
+
     pub fn next_token(&mut self) -> Result<Tok, LexError> {
+        while self.pos < self.chars.len() && matches!(self.chars[self.pos], ' ' | '\t') {
+            self.pos += 1;
+        }
+        self.tok_start = self.pos;
+        self.next_token_inner()
+    }
+
+    fn next_token_inner(&mut self) -> Result<Tok, LexError> {
         loop {
             while self.pos < self.chars.len() && matches!(self.chars[self.pos], ' ' | '\t') {
                 self.pos += 1;
@@ -621,6 +759,19 @@ impl Lexer {
             }
         }
 
+        // zsh: `{` starting a word in command position is a word of its
+        // own, so `{cmd}` is a brace group.
+        if c == '{'
+            && self
+                .chars
+                .get(self.pos + 1)
+                .is_some_and(|n| !matches!(n, ' ' | '\t' | '\n'))
+            && !crate::options::is_set("ignorebraces")
+            && command_position(&self.chars[..self.pos])
+        {
+            self.pos += 1;
+            return Ok(Tok::Word("{".to_string()));
+        }
         self.read_word().map(Tok::Word)
     }
 
@@ -645,7 +796,11 @@ impl Lexer {
             match c {
                 ' ' | '\t' | '\n' => break,
                 // Process substitution `<(...)` / `>(...)` at word start.
-                '<' | '>' if out.is_empty() && self.chars.get(self.pos + 1) == Some(&'(') => {
+                // Process substitution, also inside a word as in zsh.
+                '<' | '>'
+                    if self.chars.get(self.pos + 1) == Some(&'(')
+                        && (out.is_empty() || !out.chars().all(|c| c.is_ascii_digit())) =>
+                {
                     let end = scan_paren(&self.chars, self.pos + 1).ok_or_else(|| {
                         self.incomplete("unexpected end of file while looking for matching `)'")
                     })?;
@@ -687,23 +842,20 @@ impl Lexer {
                     }
                 }
                 '\'' => {
-                    let end = scan_squote(&self.chars, self.pos).ok_or_else(|| {
-                        self.incomplete("unexpected end of file while looking for matching `''")
-                    })?;
+                    let end = scan_squote(&self.chars, self.pos)
+                        .ok_or_else(|| self.incomplete("unmatched '"))?;
                     out.extend(&self.chars[self.pos..end]);
                     self.pos = end;
                 }
                 '"' => {
-                    let end = scan_dquote(&self.chars, self.pos).ok_or_else(|| {
-                        self.incomplete("unexpected end of file while looking for matching `\"'")
-                    })?;
+                    let end = scan_dquote(&self.chars, self.pos)
+                        .ok_or_else(|| self.incomplete("unmatched \""))?;
                     out.extend(&self.chars[self.pos..end]);
                     self.pos = end;
                 }
                 '`' => {
-                    let end = scan_bquote(&self.chars, self.pos).ok_or_else(|| {
-                        self.incomplete("unexpected end of file while looking for matching ``'")
-                    })?;
+                    let end = scan_bquote(&self.chars, self.pos)
+                        .ok_or_else(|| self.incomplete("unmatched `"))?;
                     out.extend(&self.chars[self.pos..end]);
                     self.pos = end;
                 }
@@ -716,25 +868,33 @@ impl Lexer {
                                 None => scan_paren(&self.chars, self.pos + 1),
                             }
                             .ok_or_else(|| {
-                                self.incomplete(
-                                    "unexpected end of file while looking for matching `)'",
-                                )
+                                let rest: String = self.chars[self.pos..].iter().collect();
+                                self.incomplete(&format!(
+                                    "parse error near `{}'",
+                                    rest.trim_end_matches('\n')
+                                ))
                             })?,
                         ),
                         '{' => {
                             Some(scan_brace(&self.chars, self.pos + 1, false).ok_or_else(|| {
-                                self.incomplete(
-                                    "unexpected end of file while looking for matching `}'",
-                                )
+                                // An unclosed quote inside is reported first.
+                                let rest = &self.chars[self.pos..];
+                                let quotes = rest
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|&(k, &c)| c == '"' && (k == 0 || rest[k - 1] != '\\'))
+                                    .count();
+                                self.incomplete(if quotes % 2 == 1 {
+                                    "unmatched \""
+                                } else {
+                                    "closing brace expected"
+                                })
                             })?)
                         }
-                        '\'' => Some(scan_dollar_squote(&self.chars, self.pos + 1).ok_or_else(
-                            || {
-                                self.incomplete(
-                                    "unexpected end of file while looking for matching `''",
-                                )
-                            },
-                        )?),
+                        '\'' => Some(
+                            scan_dollar_squote(&self.chars, self.pos + 1)
+                                .ok_or_else(|| self.incomplete("unmatched '"))?,
+                        ),
                         _ => None,
                     };
                     match end {

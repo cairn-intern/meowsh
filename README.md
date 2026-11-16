@@ -126,12 +126,24 @@ and builtins include:
 - prompts: `$PROMPT`/`$PS1` and `$PROMPT2`/`$PS2` get parameter and
   command substitution first, then zsh `%` escapes including `%N<..<`
   truncation
+- history expansion (`BANG_HIST`): `!!`, `!n`, `!-n`, `!str`, `!?str?`,
+  word designators (`!$`, `!*`, `:0`, `:2-4`), modifiers (`:h`,
+  `:s/a/b/`, ...) and `^old^new`
+- `MULTIOS` (`cmd >a >b`, `cmd <a <b`), `NO_CLOBBER` with
+  `CLOBBER_EMPTY` and `APPEND_CREATE`, `ERR_RETURN`, `PATH_DIRS`,
+  `CDABLE_VARS`, `CHECK_JOBS`, `PRINT_EXIT_VALUE`, and sticky emulation
+  for functions defined under `emulate -c`
+- `let`, `limit`/`unlimit`/`ulimit`, `pushd`/`popd`/`dirs`, `hash -d`,
+  `kill`, `getopts` and `shift -p` as zsh has them; modules are built in,
+  so `zmodload` always succeeds, and `zpty` (commands on a
+  pseudo-terminal) and `zselect` work
 
 There is no zle: `zle`, `bindkey`, `compinit`, `compdef` and `zcompile`
 are accepted and do nothing, so zle plugins such as zsh-autosuggestions
 load but stay inactive (meowsh shows its own history suggestions), and
 zsh completion scripts (`#compdef`) are not run.
-Other zsh options are recorded by `setopt` but have no effect. Up and Down
+zsh options meowsh does not implement are recorded by `setopt` but have
+no effect. Up and Down
 search history for lines starting with the typed text.
 
 Tab completes commands and file names with zsh's menu selection (what

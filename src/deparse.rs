@@ -46,10 +46,20 @@ impl Deparser {
         self.push(name);
         self.push(" () {");
         self.indent += 1;
-        self.body(body);
+        // `f() { ... } >out`: the redirections follow the closing brace.
+        let (inner, redirs) = match body {
+            Node::Redirected { node, redirs } if matches!(node.as_ref(), Node::Brace(_)) => {
+                (node.as_ref(), Some(redirs))
+            }
+            b => (b, None),
+        };
+        self.body(inner);
         self.indent -= 1;
         self.newline();
         self.push("}");
+        if let Some(r) = redirs {
+            self.redirs(r);
+        }
         self.out
     }
 
@@ -211,7 +221,11 @@ impl Deparser {
                 self.push("coproc ");
                 self.node(b);
             }
-            Node::Arith(e) => {
+            Node::Time(b) => {
+                self.push("time ");
+                self.node(b);
+            }
+            Node::Arith(e, _) => {
                 self.push("((");
                 self.push(e);
                 self.push("))");
@@ -291,7 +305,7 @@ impl Deparser {
                 self.newline();
                 self.push("}");
             }
-            Node::DBracket(words) => {
+            Node::DBracket(words, _) => {
                 self.push("[[ ");
                 self.push(&words.join(" "));
                 self.push(" ]]");
@@ -346,10 +360,15 @@ impl Deparser {
         self.push(&parts.join(" "));
         // zsh leaves a space after assignment-only and declaration
         // commands.
+        // (a declaration only when it assigns something).
         if c.words.is_empty() && !c.assigns.is_empty()
             || c.words
                 .first()
                 .is_some_and(|w| crate::parser::is_decl_word(w))
+                && (!c.decl_arrays.is_empty()
+                    || c.words[1..]
+                        .iter()
+                        .any(|w| crate::lexer::assignment_split(w).is_some()))
         {
             self.push(" ");
         }
@@ -363,6 +382,7 @@ impl Deparser {
                 RedirOp::Write => (">", 1),
                 RedirOp::Clobber => (">|", 1),
                 RedirOp::Append => (">>", 1),
+                RedirOp::AppendClobber => (">>|", 1),
                 RedirOp::ReadWrite => ("<>", 0),
                 RedirOp::DupIn => ("<&", 0),
                 RedirOp::DupOut => (">&", 1),
@@ -376,7 +396,7 @@ impl Deparser {
                 self.push(&r.fd.to_string());
             }
             self.push(op);
-            if r.op != RedirOp::DupIn && r.op != RedirOp::DupOut {
+            if !matches!(r.op, RedirOp::DupIn | RedirOp::DupOut | RedirOp::HereDoc) {
                 self.push(" ");
             }
             self.push(&r.target);
@@ -391,6 +411,14 @@ impl Deparser {
 /// zsh's `functions name` output.
 pub fn function_text(name: &str, body: &Node, spaces: Option<usize>) -> String {
     let mut s = Deparser::new(spaces).function(name, body);
+    // Traced functions say so first, as zsh shows them.
+    if crate::shell::trace_kind(name).is_some() {
+        let indent = match spaces {
+            Some(n) => " ".repeat(n),
+            None => "\t".to_string(),
+        };
+        s = s.replacen(" () {", &format!(" () {{\n{}# traced", indent), 1);
+    }
     s.push('\n');
     s
 }

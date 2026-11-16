@@ -87,7 +87,7 @@ fn test_shell_option_nounset() {
     let (status, stdout, stderr) = run_script(script);
     assert_ne!(status, 0);
     assert!(!stdout.contains("end"));
-    assert!(stderr.contains("unbound variable"));
+    assert!(stderr.contains("parameter not set"));
 }
 
 #[test]
@@ -99,7 +99,12 @@ fn test_shell_option_xtrace() {
     let (status, stdout, stderr) = run_script(script);
     assert_eq!(status, 0);
     assert!(stdout.contains("trace this"));
-    assert!(stderr.contains("+ echo trace this"));
+    // zsh's default PS4 is `+%N:%i> `.
+    assert!(
+        stderr.contains("+meowsh:3> echo 'trace this'"),
+        "{}",
+        stderr
+    );
 }
 
 #[test]
@@ -901,7 +906,7 @@ fn test_posix_set_options_then_positional_parameters() {
     let (status, stdout, stderr) = run_script(r#"set -x alpha beta; echo "$1:$2" 2>/dev/null"#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "alpha:beta");
-    assert!(stderr.contains("+ echo alpha:beta"));
+    assert!(stderr.contains("+meowsh:1> echo alpha:beta"), "{}", stderr);
 }
 
 #[test]
@@ -916,7 +921,7 @@ fn test_posix_shift_too_many_fails() {
     let (status, stdout, stderr) = run_script(r#"set -- a; shift 2; echo "status=$? count=$#""#);
     assert_eq!(status, 0);
     assert_eq!(stdout.trim(), "status=1 count=1");
-    assert!(stderr.contains("can't shift that many"));
+    assert!(stderr.contains("shift count must be <= $#"), "{}", stderr);
 }
 
 #[test]
@@ -1048,4 +1053,27 @@ fn test_zshrc_skipped_when_noninteractive() {
         .expect("Failed to spawn meowsh");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     assert_eq!(stdout.trim(), "result=");
+}
+
+#[test]
+fn kill_with_an_out_of_range_pid_fails_instead_of_signalling_pid_0() {
+    // A pid too big for pid_t parsed as 0, which signals the shell's own
+    // process group. Signal 0 only checks, so the test is harmless.
+    let (status, stdout, stderr) = run_script("kill -0 99999999999; echo $?");
+    assert_eq!(status, 0);
+    assert_eq!(stdout.trim(), "1");
+    assert!(
+        stderr.contains("kill 99999999999 failed: no such process"),
+        "{}",
+        stderr
+    );
+}
+
+#[test]
+fn zpty_master_is_not_inherited_by_later_commands() {
+    // Another process holding the master could type into the session.
+    let (status, stdout, stderr) =
+        run_script("zpty z cat; ls -l /proc/self/fd | grep -c ptmx; zpty -d z");
+    assert_eq!(status, 0, "{}", stderr);
+    assert_eq!(stdout.trim(), "0");
 }

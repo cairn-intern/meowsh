@@ -22,7 +22,10 @@ pub struct ExpError {
 pub type ExpResult<T> = Result<T, ExpError>;
 
 fn fail<T>(msg: &str) -> ExpResult<T> {
-    crate::shell::shell_err(msg);
+    // An empty message: the error was already reported.
+    if !msg.is_empty() {
+        crate::shell::shell_err(msg);
+    }
     Err(ExpError { status: 1 })
 }
 
@@ -61,6 +64,8 @@ struct Ctx {
     // neither unless GLOB_SUBST.
     param_tag: u8,
     subst_tag: u8,
+    // MAGIC_EQUAL_SUBST argument: `~` may follow `=`.
+    magic_eq: bool,
 }
 
 impl Ctx {
@@ -75,6 +80,7 @@ impl Ctx {
             rc_from: None,
             param_tag: 0,
             subst_tag: 0,
+            magic_eq: false,
         }
         .with_option_tags()
     }
@@ -150,11 +156,37 @@ fn pos_params() -> Vec<String> {
 }
 
 fn lookup(name: &str) -> Val {
+    let _swap = crate::shell::RefSwap::enter(name);
     match name {
         "@" => return Val::List(pos_params(), false),
         "*" => return Val::List(pos_params(), true),
+        // zsh's $dirstack: the directory stack without the current one.
+        "dirstack" if !crate::shell::var_exists("dirstack") => {
+            return Val::List(with_shell(|s| s.dir_stack.clone()), true)
+        }
         // zsh's $argv is the positional parameters.
         "argv" if !crate::shell::var_exists("argv") => return Val::List(pos_params(), true),
+        "jobstates" if !crate::shell::var_exists("jobstates") => {
+            let v = crate::jobs::job_ids()
+                .into_iter()
+                .filter_map(crate::jobs::job_state_text)
+                .collect();
+            return Val::List(v, true);
+        }
+        "zsh_eval_context" if !crate::shell::var_exists("zsh_eval_context") => {
+            return Val::List(crate::shell::eval_context(), true)
+        }
+        "ZSH_EVAL_CONTEXT" if !crate::shell::var_exists("ZSH_EVAL_CONTEXT") => {
+            return Val::Str(crate::shell::eval_context().join(":"))
+        }
+        // zsh/parameter's $funcstack: the functions (and sourced files)
+        // running, innermost first.
+        "funcstack" if !crate::shell::var_exists("funcstack") => {
+            let mut v: Vec<String> =
+                crate::shell::with_err_ctx(|e| e.stack.iter().map(|(n, _)| n.clone()).collect());
+            v.reverse();
+            return Val::List(v, true);
+        }
         "LINENO" if !crate::shell::var_exists("LINENO") => {
             return Val::Str(crate::shell::lineno().to_string())
         }
@@ -184,7 +216,7 @@ fn lookup(name: &str) -> Val {
 
 fn check_set(name: &str, val: &Val) -> ExpResult<()> {
     if matches!(val, Val::Unset) && name != "@" && name != "*" && opt_set(OPT_NOUNSET) {
-        return fail(&format!("{}: unbound variable", name));
+        return fail(&format!("{}: parameter not set", name));
     }
     Ok(())
 }
@@ -314,9 +346,18 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                 }
             }
             '\'' if mode == Mode::Unquoted => {
-                let (ie, next) = bounds(scan_squote(chars, i), n);
+                let (ie, mut next) = bounds(scan_squote(chars, i), n);
                 for &q in &chars[i + 1..ie.max(i + 1)] {
                     ctx.push(q, Q);
+                }
+                // RC_QUOTES: `''` inside single quotes is a quote.
+                while chars.get(next) == Some(&'\'') && crate::options::is_set("rcquotes") {
+                    ctx.push('\'', Q);
+                    let (ie2, next2) = bounds(scan_squote(chars, next), n);
+                    for &q in &chars[next + 1..ie2.max(next + 1)] {
+                        ctx.push(q, Q);
+                    }
+                    next = next2;
                 }
                 ctx.mark();
                 i = next;
@@ -385,14 +426,19 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                 }
                 i = end;
             }
+            // zsh: `<(...)` and `>(...)` anywhere in a word.
             '<' | '>'
                 if mode == Mode::Unquoted
-                    && i == 0
-                    && ctx.unquoted_lit == 0
-                    && chars.get(1) == Some(&'(') =>
+                    && (i > 0 || ctx.unquoted_lit == 0)
+                    && chars.get(i + 1) == Some(&'(')
+                    // Not the end of a numeric glob such as `<->(.)`.
+                    && !(c == '>'
+                        && chars[..i].iter().rposition(|&x| x == '<').is_some_and(|k| {
+                            crate::lexer::numeric_range_len(chars, k) == Some(i + 1 - k)
+                        })) =>
             {
-                let (ie, next) = bounds(scan_paren(chars, 1), n);
-                let src: String = chars[2..ie.max(2)].iter().collect();
+                let (ie, next) = bounds(scan_paren(chars, i + 1), n);
+                let src: String = chars[i + 2..ie.max(i + 2)].iter().collect();
                 match crate::exec::process_subst(&src, c == '<') {
                     Some(path) => {
                         for d in path.chars() {
@@ -403,7 +449,11 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                 }
                 i = next;
             }
-            '~' if mode == Mode::Unquoted && (i == 0 || (ctx.assign && chars[i - 1] == ':')) => {
+            '~' if mode == Mode::Unquoted
+                && (i == 0
+                    || (ctx.assign && chars[i - 1] == ':')
+                    || (ctx.magic_eq && chars[i - 1] == '=')) =>
+            {
                 match tilde(chars, i, ctx.assign) {
                     Some((dir, next)) => {
                         for d in dir.chars() {
@@ -439,7 +489,7 @@ fn tilde(chars: &[char], i: usize, assign: bool) -> Option<(String, usize)> {
         "" => var_get_opt("HOME").or_else(|| home_of(None))?,
         "+" => var_get_opt("PWD")?,
         "-" => var_get_opt("OLDPWD")?,
-        u => home_of(Some(u))?,
+        u => crate::shell::named_dir(u).or_else(|| home_of(Some(u)))?,
     };
     Some((dir, j))
 }
@@ -518,6 +568,103 @@ fn eval_arith_str(expr: &str) -> ExpResult<i64> {
     }
 }
 
+// `$(( ... ))` as text. A leading `[#base]` gives the output base, with
+// its `base#` prefix (or C's `0x`/`0` with C_BASES); `[##base]` omits it.
+// Digits in groups of `g` from the right (or from the left, for a
+// fraction), joined by underscores.
+fn group_digits(d: &str, g: usize, from_left: bool) -> String {
+    let chars: Vec<char> = d.chars().collect();
+    let mut out = String::new();
+    for (k, c) in chars.iter().enumerate() {
+        let boundary = if from_left { k } else { chars.len() - k };
+        if k > 0 && boundary % g == 0 {
+            out.push('_');
+        }
+        out.push(*c);
+    }
+    out
+}
+
+// `$(( [#base_group] expr ))`: the output base (`##` drops the prefix)
+// and digit grouping with underscores.
+fn arith_text(expr: &[char]) -> ExpResult<String> {
+    let s: String = expr.iter().collect();
+    let t = s.trim_start();
+    if let Some(rest) = t.strip_prefix("[#") {
+        if let Some(close) = rest.find(']') {
+            let spec = &rest[..close];
+            let (bare, spec) = match spec.strip_prefix('#') {
+                Some(d) => (true, d),
+                None => (false, spec),
+            };
+            let (digits, group) = match spec.split_once('_') {
+                Some((d, g)) => (d, Some(g.trim().parse::<usize>().unwrap_or(3).max(1))),
+                None => (spec, None),
+            };
+            let base = if digits.trim().is_empty() && group.is_some() {
+                Some(10)
+            } else {
+                digits.trim().parse::<u32>().ok()
+            };
+            if let Some(base) = base {
+                let body: Vec<char> = rest[close + 1..].chars().collect();
+                let v = arith_num(&body)?;
+                if let (crate::arith::Num::F(_), Some(g)) = (v, group) {
+                    let text = v.to_string();
+                    let (sign, text) = match text.strip_prefix('-') {
+                        Some(t) => ("-", t.to_string()),
+                        None => ("", text),
+                    };
+                    let (int, frac) = text.split_once('.').unwrap_or((&text, ""));
+                    return Ok(format!(
+                        "{}{}.{}",
+                        sign,
+                        group_digits(int, g, false),
+                        group_digits(frac, g, true)
+                    ));
+                }
+                let n = v.as_int();
+                let text = if !bare {
+                    crate::shell::format_int(n, base)
+                } else if !(2..=36).contains(&base) {
+                    n.to_string()
+                } else {
+                    let mut u = n.unsigned_abs();
+                    let mut digits = Vec::new();
+                    loop {
+                        digits.push(
+                            std::char::from_digit((u % base as u64) as u32, base)
+                                .unwrap_or('0')
+                                .to_ascii_uppercase(),
+                        );
+                        u /= base as u64;
+                        if u == 0 {
+                            break;
+                        }
+                    }
+                    let sign = if n < 0 { "-" } else { "" };
+                    format!("{}{}", sign, digits.iter().rev().collect::<String>())
+                };
+                let Some(g) = group else {
+                    return Ok(text);
+                };
+                // Group only the digits, after any sign and base prefix.
+                let split = text
+                    .find('#')
+                    .map(|k| k + 1)
+                    .or_else(|| text.find(['x', 'X']).map(|k| k + 1))
+                    .unwrap_or(usize::from(text.starts_with('-')));
+                return Ok(format!(
+                    "{}{}",
+                    &text[..split],
+                    group_digits(&text[split..], g, false)
+                ));
+            }
+        }
+    }
+    Ok(arith_num(expr)?.to_string())
+}
+
 fn arith_num(expr: &[char]) -> ExpResult<crate::arith::Num> {
     let mut ctx = Ctx::new(false, false);
     walk(expr, Mode::Dq, &mut ctx)?;
@@ -559,8 +706,8 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
                 return fail("unterminated command substitution");
             };
             if arith_end.is_some() {
-                let v = arith_num(&chars[i + 3..end - 2])?;
-                emit_str(ctx, &v.to_string(), quoted);
+                let v = arith_text(&chars[i + 3..end - 2])?;
+                emit_str(ctx, &v, quoted);
             } else {
                 let src: String = chars[i + 2..end - 1].iter().collect();
                 let out = command_subst(&src)?;
@@ -581,10 +728,24 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
         // optionally with a subscript.
         '+' | '#' | '=' | '^' | '~'
             if chars.get(i + 2).is_some_and(|&c| {
-                crate::lexer::is_name_start(c) || (next == '#' && c.is_ascii_digit())
+                crate::lexer::is_name_start(c)
+                    || (next == '#' && c.is_ascii_digit())
+                    || (next != '#' && (c.is_ascii_digit() || c == '@' || c == '*'))
+                    // zsh: `$#*` and `$#@` are `${#*}`, `${#@}`.
+                    || (next == '#' && matches!(c, '@' | '*') && !crate::exec::sh_emulation_pub())
             }) =>
         {
-            let end = name_with_subscript(chars, i + 2);
+            let end = match chars[i + 2] {
+                '@' | '*' => i + 3,
+                c if c.is_ascii_digit() => {
+                    let mut e = i + 2;
+                    while chars.get(e).is_some_and(char::is_ascii_digit) {
+                        e += 1;
+                    }
+                    e
+                }
+                _ => name_with_subscript(chars, i + 2),
+            };
             expand_braced(&chars[i + 1..end], mode, ctx)?;
             Ok(end)
         }
@@ -594,14 +755,35 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
                 j += 1;
             }
             // zsh: `$name[sub]` subscripts without braces.
+            // (Not with KSH_ARRAYS, where `$a[2]` is `${a}[2]`.)
             let end = name_with_subscript(chars, i + 1);
-            if end > j {
+            if end > j && !ksh_arrays() {
                 expand_braced(&chars[i + 1..end], mode, ctx)?;
                 return Ok(end);
             }
             let name: String = chars[i + 1..j].iter().collect();
-            let val = ksh_first(&name, lookup(&name));
+            let mut val = ksh_first(&name, lookup(&name));
+            if crate::options::is_set("rcexpandparam") {
+                if let Val::List(items, _) = val {
+                    val = Val::Rc(items);
+                }
+            }
+            // KSH_ARRAYS: a `[...]` after `$name` is plain text.
+            if end > j && ksh_arrays() {
+                check_set(&name, &val)?;
+                emit_val(ctx, &val, quoted);
+                for &c in &chars[j..end] {
+                    ctx.push(c, Q);
+                }
+                return Ok(end);
+            }
             check_set(&name, &val)?;
+            // zsh: `$name:h` and other modifiers without braces.
+            if chars.get(j) == Some(&':') && !crate::exec::sh_emulation_pub() {
+                let (val, used) = unbraced_modifiers(val, &chars[j..])?;
+                emit_val(ctx, &val, quoted);
+                return Ok(j + used);
+            }
             emit_val(ctx, &val, quoted);
             Ok(j)
         }
@@ -623,6 +805,12 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
             let name: String = chars[i + 1..end].iter().collect();
             let val = lookup(&name);
             check_set(&name, &val)?;
+            // Modifiers apply here too: `$@:a`, `$0:t`.
+            if chars.get(end) == Some(&':') && !crate::exec::sh_emulation_pub() {
+                let (val, used) = unbraced_modifiers(val, &chars[end..])?;
+                emit_val(ctx, &val, quoted);
+                return Ok(end + used);
+            }
             emit_val(ctx, &val, quoted);
             Ok(end)
         }
@@ -655,7 +843,12 @@ fn name_with_subscript(chars: &[char], i: usize) -> usize {
                 }
             }
             '\\' => k += 1,
-            '"' | '\'' | ' ' | '\t' | '\n' => return j,
+            // Quotes may appear inside a subscript.
+            q @ ('"' | '\'') => match chars[k + 1..].iter().position(|&c| c == q) {
+                Some(p) => k += p + 1,
+                None => return j,
+            },
+            ' ' | '\t' | '\n' => return j,
             _ => {}
         }
         k += 1;
@@ -668,11 +861,8 @@ fn name_with_subscript(chars: &[char], i: usize) -> usize {
 fn parse_param(body: &[char]) -> Option<(String, Option<String>, usize)> {
     let first = *body.first()?;
     let mut j;
-    if crate::lexer::is_name_start(first) {
-        j = 1;
-        while j < body.len() && crate::lexer::is_name_char(body[j]) {
-            j += 1;
-        }
+    if crate::lexer::is_name_start(first) || first == '.' {
+        j = crate::lexer::name_end(body, 0)?;
     } else if first.is_ascii_digit() {
         j = 1;
         while j < body.len() && body[j].is_ascii_digit() {
@@ -719,6 +909,10 @@ fn parse_param(body: &[char]) -> Option<(String, Option<String>, usize)> {
 
 #[derive(Default)]
 struct PFlags {
+    // (#): each word is an arithmetic expression, giving that character.
+    charcode: bool,
+    // (X): report errors in flags such as (#) instead of ignoring them.
+    report: bool,
     at: bool,
     keys: bool,
     values: bool,
@@ -727,6 +921,8 @@ struct PFlags {
     zsplit: bool,
     quote: u8,
     quote_min: bool,
+    // (q+): like (q-), with $'...' for control characters.
+    quote_plus: bool,
     unquote: bool,
     sort: Option<char>,
     numeric: bool,
@@ -744,6 +940,8 @@ struct PFlags {
     backslash: bool,
     eval: bool,
     indirect: bool,
+    // (!): a nameref itself, not what it refers to.
+    no_deref: bool,
     type_of: bool,
     // (l:n::fill::once:) / (r...): width, repeated fill, one-off string.
     pad_left: Option<(usize, Option<String>, Option<String>)>,
@@ -778,6 +976,11 @@ fn closing_delim(c: char) -> char {
 
 // Parses `(flags)` with `body[0] == '('`. Returns the flags and the index
 // after the closing `)`.
+thread_local! {
+    // Where parse_flags stopped on a bad flag: an index into the body.
+    static FLAG_ERR_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
     let mut f = PFlags {
         any: true,
@@ -800,19 +1003,32 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             '@' => f.at = true,
             'k' => f.keys = true,
             'v' => f.values = true,
-            'j' => f.join = Some(arg(&mut i)?),
-            's' => f.split = Some(arg(&mut i)?),
+            'j' => {
+                let a = arg(&mut i)?;
+                f.join = Some(if f.escapes { p_flag_arg(&a) } else { a });
+            }
+            's' => {
+                let a = arg(&mut i)?;
+                f.split = Some(if f.escapes { p_flag_arg(&a) } else { a });
+            }
             'f' => f.split = Some("\n".into()),
             'F' => f.join = Some("\n".into()),
             '0' => f.split = Some("\0".into()),
             'z' => f.zsplit = true,
             'Z' => {
                 f.zsplit = true;
+                let start = i + 1;
                 f.zopts = arg(&mut i)?;
+                // Only c, C and n are (Z) options.
+                if let Some(k) = f.zopts.chars().position(|c| !"cCn".contains(c)) {
+                    FLAG_ERR_AT.with(|e| e.set(Some(start + k)));
+                    return None;
+                }
             }
             'q' => {
                 if matches!(body.get(i), Some('-' | '+')) {
                     f.quote_min = true;
+                    f.quote_plus = body[i] == '+';
                     i += 1;
                 } else {
                     f.quote += 1;
@@ -835,6 +1051,7 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             'b' => f.backslash = true,
             'e' => f.eval = true,
             'P' => f.indirect = true,
+            '!' => f.no_deref = true,
             't' => f.type_of = true,
             'D' => f.tilde_dirs = true,
             'M' => f.matching = true,
@@ -866,11 +1083,25 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             // Accepted without effect: A (assignment), R/B/E/N (match
             // parts), V, w, W, c, X, ~, #, m, S, I, p, g.
             'A' => f.assign_array += 1,
-            'X' | '~' | '#' | 'm' => {}
-            _ => return None,
+            '#' => f.charcode = true,
+            'X' => f.report = true,
+            '~' | 'm' => {}
+            _ => {
+                FLAG_ERR_AT.with(|e| e.set(Some(i - 1)));
+                return None;
+            }
         }
     }
     None
+}
+
+// A flag argument after (p): `$name` is that parameter's value, other
+// text has print's escapes.
+fn p_flag_arg(a: &str) -> String {
+    match a.strip_prefix('$') {
+        Some(name) if crate::lexer::is_valid_name(name) => var_get(name),
+        _ => decode_escapes(a),
+    }
 }
 
 fn val_items(v: &Val) -> Vec<String> {
@@ -1034,7 +1265,7 @@ fn apply_subscript(val: Val, sub: &str) -> ExpResult<Val> {
     Ok(match val {
         Val::Unset => Val::Unset,
         Val::List(items, _) | Val::Rc(items) if !items.is_empty() || b.is_some() => match b {
-            Some(b) => Val::List(items[range_of(a, b, items.len())].to_vec(), false),
+            Some(b) => Val::List(items[range_of(a, b, items.len())].to_vec(), true),
             None => match index_of(
                 if a == 0 && crate::options::quick("kshzerosubscript") {
                     1
@@ -1175,7 +1406,18 @@ fn subscript_pattern(word: &str) -> ExpResult<String> {
     ctx.param_tag &= !NG;
     ctx.subst_tag &= !NG;
     walk(&chars, Mode::Unquoted, &mut ctx)?;
-    Ok(pattern_text(&ctx))
+    // A quoted backslash stays an active escape (`\\\\?` matches `\x`).
+    let mut out = String::new();
+    for &(c, f) in ctx.fields.iter().flatten() {
+        if f & MARK != 0 {
+            continue;
+        }
+        if f & (Q | NG) != 0 && c != '\\' && "*?[]()|<>^#~!-".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Ok(out)
 }
 
 // Elements searched: the list, a scalar's words, or None for characters.
@@ -1412,7 +1654,7 @@ fn matcher(word: &str, exact: bool) -> ExpResult<impl Fn(&str) -> bool> {
     let pat = if exact {
         expand_string(word)?
     } else {
-        expand_pattern(word)?
+        subscript_pattern(word)?
     };
     Ok(move |v: &str| {
         let m = if exact {
@@ -1426,6 +1668,7 @@ fn matcher(word: &str, exact: bool) -> ExpResult<impl Fn(&str) -> bool> {
 
 // Value of `name[sub]` for a named parameter.
 fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
+    let _swap = crate::shell::RefSwap::enter(name);
     let Some(sub) = sub else {
         return Ok(lookup(name));
     };
@@ -1435,8 +1678,59 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     } else {
         resolved.as_str()
     };
-    if name == "commands" && !with_shell(|s| s.assoc("commands").is_some()) {
+    // zsh/parameter's $jobstates: a job's state, mark and processes.
+    if name == "jobstates" && !with_shell(|s| s.assoc("jobstates").is_some()) {
         let key = expand_string(sub)?;
+        return Ok(
+            match key
+                .parse::<i32>()
+                .ok()
+                .and_then(crate::jobs::job_state_text)
+            {
+                Some(t) => Val::Str(t),
+                None => Val::Unset,
+            },
+        );
+    }
+    // zsh/system's $sysparams.
+    if name == "sysparams" && !with_shell(|s| s.assoc("sysparams").is_some()) {
+        let key = expand_string(sub)?;
+        return Ok(match key.as_str() {
+            "pid" => Val::Str(std::process::id().to_string()),
+            "ppid" => Val::Str(unsafe { libc::getppid() }.to_string()),
+            _ => Val::Unset,
+        });
+    }
+    // zsh/parameter's $functions: a function's body as text.
+    if name == "functions" && !with_shell(|s| s.assoc("functions").is_some()) {
+        let key = expand_string(sub)?;
+        return Ok(
+            match with_shell(|s| s.functions.get(&key).map(|f| f.body.clone())) {
+                Some(body) => {
+                    let text = crate::deparse::function_text(&key, &body, None);
+                    let lines: Vec<&str> = text.trim_end_matches('\n').lines().collect();
+                    // A body with redirections keeps its braces.
+                    if matches!(body.as_ref(), crate::types::Node::Redirected { .. })
+                        && lines.len() >= 2
+                    {
+                        let mut t = String::from("{\n");
+                        t.push_str(&lines[1..].join("\n"));
+                        Val::Str(t)
+                    } else {
+                        let inner = if lines.len() >= 2 {
+                            &lines[1..lines.len() - 1]
+                        } else {
+                            &lines[..]
+                        };
+                        Val::Str(inner.join("\n"))
+                    }
+                }
+                None => Val::Unset,
+            },
+        );
+    }
+    if name == "commands" && !with_shell(|s| s.assoc("commands").is_some()) {
+        let key = assoc_key(sub)?;
         return Ok(match crate::shell::find_command(&key) {
             Some(p) => Val::Str(p),
             None => Val::Unset,
@@ -1452,7 +1746,26 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
             sub == "*",
         ));
     }
-    if let Some((flags, word)) = search_flags(sub) {
+    // (k)/(K): the keys are patterns matched against the text; the
+    // value of the first (or of every) matching key.
+    if let Some((flags, word)) = search_flags(sub).filter(|(f, _)| f.contains(['k', 'K'])) {
+        let text = assoc_key(word)?;
+        let keys = assoc_keys(name).unwrap_or_default();
+        let mut found = keys
+            .iter()
+            .filter(|k| crate::pattern::matches(k, &text))
+            .map(|k| assoc_get(name, k).unwrap_or_default());
+        return Ok(if flags.contains('K') {
+            Val::List(found.collect(), false)
+        } else {
+            match found.next() {
+                Some(v) => Val::Str(v),
+                None => Val::Unset,
+            }
+        });
+    }
+    if let Some((flags, word)) = search_flags(sub).filter(|(f, _)| f.contains(['i', 'I', 'r', 'R']))
+    {
         let hit = matcher(word, flags.contains('e'))?;
         let last = flags.contains('I') || flags.contains('R');
         let want_value = flags.contains('r') || flags.contains('R');
@@ -1465,20 +1778,24 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
                 hit(k).then(|| (k.clone(), v))
             }
         });
-        let r = if last {
-            found.next_back()
-        } else {
-            found.next()
-        };
+        // (I)/(R) on a hash give every match; (i)/(r) the first.
+        if last {
+            let all: Vec<String> = found.map(|(k, v)| if want_value { v } else { k }).collect();
+            return Ok(Val::List(all, false));
+        }
         // (r)/(R) give the value, (i)/(I) the key; `(k)` on the whole
         // expansion turns a value search into its key (handled by caller
         // through `keys` flag).
-        return Ok(match r {
+        return Ok(match found.next() {
             Some((k, v)) => Val::Str(if want_value { v } else { k }),
             None => Val::Unset,
         });
     }
-    let key = expand_string(sub)?;
+    // (e) alone: the text is the key, exactly.
+    let key = match search_flags(sub).filter(|(f, _)| f.as_str() == "e") {
+        Some((_, w)) => expand_string(w)?,
+        None => assoc_key(sub)?,
+    };
     Ok(match assoc_get(name, &key) {
         Some(v) => Val::Str(v),
         None => Val::Unset,
@@ -1495,128 +1812,477 @@ pub fn modify_word(word: &str, mods: &str) -> String {
     }
 }
 
-fn modifier_letters(c: char) -> bool {
-    "aAcehlPqQrstugx&".contains(c)
+/// History-style modifiers at the start of `text` (`:h2:s/a/b/...`)
+/// applied to `word`: the result and how many characters were used.
+pub fn history_modifiers(word: &str, text: &[char]) -> (String, usize) {
+    match parse_modifiers(text, true) {
+        Ok((mods, used)) if !mods.is_empty() => {
+            match run_modifiers(Val::Str(word.to_string()), &mods) {
+                Ok(v) => (val_items(&v).join(" "), used),
+                Err(_) => (word.to_string(), used),
+            }
+        }
+        _ => (word.to_string(), 0),
+    }
 }
 
-// Applies `:` history-style modifiers starting at `rest[0] == ':'`.
-// Returns None if `rest` is not a modifier list.
+/// Splits text into shell words, as `${(z)...}` does.
+pub fn split_shell_words(s: &str) -> Vec<String> {
+    shell_words(s, "")
+}
+
+// One `:` modifier, as zsh's modify() reads it.
+struct Modifier {
+    op: char,
+    // :h / :t component count (braced only).
+    count: usize,
+    global: bool,
+    // :w / :W — each word separately, split on `sep` (blanks if None).
+    words: bool,
+    sep: Option<String>,
+    // :f repeats until nothing changes (-1); :F:n: n times.
+    rec: i64,
+    // :s/l/r/ — raw left and right sides.
+    subst: Option<(String, String)>,
+    // :S — the left side is a pattern.
+    pattern: bool,
+}
+
+// The last :s substitution, which :& repeats.
+static HIST_SUBST: std::sync::Mutex<Option<(String, String, bool)>> = std::sync::Mutex::new(None);
+
+// The text between a delimiter at `rest[i]` and its closing partner, as
+// zsh's get_strarg reads `:W` and `:F` arguments.
+fn delimited(rest: &[char], i: usize) -> Option<(String, usize)> {
+    let open = *rest.get(i)?;
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '<' => '>',
+        c => c,
+    };
+    let k = rest[i + 1..].iter().position(|&c| c == close)? + i + 1;
+    Some((rest[i + 1..k].iter().collect(), k + 1))
+}
+
+// Parses `:` modifiers at the start of `rest`. Returns them and how
+// many characters they use; parsing stops (keeping what came before) at
+// the first `:` that does not start a modifier.
+fn parse_modifiers(rest: &[char], inbrace: bool) -> ExpResult<(Vec<Modifier>, usize)> {
+    let mut mods = Vec::new();
+    let mut i = 0;
+    'outer: while rest.get(i) == Some(&':') {
+        let start = i;
+        i += 1;
+        let mut m = Modifier {
+            op: '\0',
+            count: 0,
+            global: false,
+            words: false,
+            sep: None,
+            rec: 1,
+            subst: None,
+            pattern: false,
+        };
+        while m.op == '\0' && i < rest.len() {
+            match rest[i] {
+                c @ ('a' | 'A' | 'c' | 'r' | 'e' | 'l' | 'u' | 'q' | 'Q' | 'P' | 'x') => {
+                    m.op = c;
+                    i += 1;
+                }
+                c @ ('h' | 't') => {
+                    m.op = c;
+                    i += 1;
+                    if inbrace {
+                        while let Some(d) = rest.get(i).and_then(|c| c.to_digit(10)) {
+                            m.count = m.count * 10 + d as usize;
+                            i += 1;
+                        }
+                    }
+                }
+                c @ ('s' | 'S') => {
+                    m.pattern = c == 'S';
+                    i += 1;
+                    let Some(&del) = rest.get(i) else {
+                        return fail("bad substitution");
+                    };
+                    i += 1;
+                    // Each side ends at an unescaped delimiter; the last
+                    // one is optional.
+                    let side = |i: &mut usize, need: bool| -> ExpResult<String> {
+                        let mut out = String::new();
+                        while *i < rest.len() && rest[*i] != del {
+                            if rest[*i] == '\\' && *i + 1 < rest.len() {
+                                out.push('\\');
+                                out.push(rest[*i + 1]);
+                                *i += 2;
+                                continue;
+                            }
+                            out.push(rest[*i]);
+                            *i += 1;
+                        }
+                        if *i < rest.len() {
+                            *i += 1;
+                        } else if need {
+                            return fail("bad substitution");
+                        }
+                        Ok(out)
+                    };
+                    let l = side(&mut i, true)?;
+                    let r = side(&mut i, false)?;
+                    m.op = 's';
+                    m.subst = Some((l, r));
+                }
+                '&' => {
+                    m.op = '&';
+                    i += 1;
+                }
+                'g' => {
+                    m.global = true;
+                    i += 1;
+                }
+                'w' => {
+                    m.words = true;
+                    i += 1;
+                }
+                'W' => {
+                    let Some((sep, next)) = delimited(rest, i + 1) else {
+                        i = start;
+                        break 'outer;
+                    };
+                    m.words = true;
+                    m.sep = Some(sep);
+                    i = next;
+                }
+                'f' => {
+                    m.rec = -1;
+                    i += 1;
+                }
+                'F' => {
+                    let Some((n, next)) = delimited(rest, i + 1) else {
+                        i = start;
+                        break 'outer;
+                    };
+                    m.rec = match crate::arith::eval(&n) {
+                        Ok(v) => v,
+                        Err(e) => return fail(&e),
+                    };
+                    i = next;
+                }
+                _ => {
+                    i = start;
+                    break 'outer;
+                }
+            }
+        }
+        if m.op == '\0' {
+            i = start;
+            break;
+        }
+        mods.push(m);
+    }
+    Ok((mods, i))
+}
+
+// zsh's remtpath: drops the last `count` components (`count` 0: one),
+// or with a count keeps the first `count`.
+fn rem_tail_path(s: &str, count: usize) -> String {
+    let b = s.as_bytes();
+    let mut end = b.len() as isize - 1;
+    while end >= 0 && b[end as usize] == b'/' {
+        end -= 1;
+    }
+    if count == 0 {
+        while end >= 0 && b[end as usize] != b'/' {
+            end -= 1;
+        }
+    }
+    if end < 0 {
+        return if s.starts_with('/') { "/" } else { "." }.to_string();
+    }
+    let end = end as usize;
+    if count > 0 {
+        let mut left = count;
+        let mut k = 0;
+        while k < end {
+            if b[k] == b'/' {
+                left -= 1;
+                if left == 0 {
+                    return s[..if k == 0 { 1 } else { k }].to_string();
+                }
+                while k + 1 < b.len() && b[k + 1] == b'/' {
+                    k += 1;
+                }
+            }
+            k += 1;
+        }
+        return s.to_string();
+    }
+    let mut e = end;
+    while e > 0 && b[e - 1] == b'/' {
+        e -= 1;
+    }
+    if e == 0 {
+        e = 1;
+        if b.get(1) == Some(&b'/') && b.get(2) != Some(&b'/') {
+            e = 2;
+        }
+    }
+    s[..e].to_string()
+}
+
+// zsh's remlpaths: keeps the last `count` components (at least one).
+fn rem_lead_paths(s: &str, count: usize) -> String {
+    let mut t = s.to_string();
+    if t.ends_with('/') {
+        let trimmed = t.trim_end_matches('/').len();
+        t.truncate(trimmed);
+        if t.is_empty() {
+            return String::new();
+        }
+    }
+    let b = t.as_bytes();
+    let mut left = count as isize;
+    let mut k = b.len() as isize - 1;
+    loop {
+        while k >= 0 {
+            if b[k as usize] == b'/' {
+                left -= 1;
+                if left > 0 {
+                    if k > 0 {
+                        k -= 1;
+                        break;
+                    }
+                    return t;
+                }
+                return t[k as usize + 1..].to_string();
+            }
+            k -= 1;
+        }
+        while k >= 0 && b[k as usize] == b'/' {
+            k -= 1;
+        }
+        if k <= 0 {
+            break;
+        }
+    }
+    t
+}
+
+// :s with zsh's rules: `\x` in the left side is x; in the right side `&`
+// is the left side and `\&` a literal &.
+fn hist_subst(s: &str, l: &str, r: &str, global: bool) -> String {
+    let unescape = |t: &str| {
+        let mut out = String::new();
+        let mut it = t.chars();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                if let Some(n) = it.next() {
+                    out.push(n);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let lhs = if l.is_empty() {
+        s.to_string()
+    } else {
+        unescape(l)
+    };
+    let global = global && !l.is_empty();
+    let mut rep = String::new();
+    let mut it = r.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = it.next() {
+                    rep.push(n);
+                }
+            }
+            '&' => rep.push_str(&lhs),
+            c => rep.push(c),
+        }
+    }
+    if lhs.is_empty() || !s.contains(&lhs) {
+        return s.to_string();
+    }
+    if global {
+        s.replace(&lhs, &rep)
+    } else {
+        s.replacen(&lhs, &rep, 1)
+    }
+}
+
+fn apply_one(m: &Modifier, s: &str, subst: &Option<(String, String)>) -> String {
+    match m.op {
+        'h' => rem_tail_path(s, m.count),
+        't' => rem_lead_paths(s, m.count),
+        'r' => path_root(s),
+        'e' => path_ext(s),
+        'a' => absolute_path(s),
+        'A' | 'P' => std::fs::canonicalize(absolute_path(s))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| absolute_path(s)),
+        'c' => crate::shell::find_command(s).unwrap_or_else(|| s.to_string()),
+        'l' => s.to_lowercase(),
+        'u' => s.to_uppercase(),
+        'q' => backslash_quote(s),
+        'Q' => unquote(s),
+        'x' => s
+            .split_whitespace()
+            .map(crate::builtins::shell_quote)
+            .collect::<Vec<_>>()
+            .join(" "),
+        's' | '&' if m.pattern => match subst {
+            Some((l, r)) => {
+                let pat = crate::pattern::Pattern::new(l);
+                let fl = crate::pattern::SubFlags {
+                    substr: true,
+                    long: true,
+                    global: m.global,
+                    ..Default::default()
+                };
+                let rep = r.replace("\\&", "&");
+                pat.getmatch(s, fl, 1, Some(&|| rep.clone()))
+            }
+            None => s.to_string(),
+        },
+        's' | '&' => match subst {
+            Some((l, r)) => hist_subst(s, l, r, m.global),
+            None => s.to_string(),
+        },
+        _ => s.to_string(),
+    }
+}
+
+// One modifier on one value, honouring :w/:W and :f/:F.
+fn apply_modifier(m: &Modifier, s: &str, subst: &Option<(String, String)>) -> String {
+    let once = |s: &str| -> String {
+        if !m.words {
+            return apply_one(m, s, subst);
+        }
+        match &m.sep {
+            Some(sep) if !sep.is_empty() => s
+                .split(sep.as_str())
+                .map(|w| apply_one(m, w, subst))
+                .collect::<Vec<_>>()
+                .join(sep),
+            _ => {
+                // Words between blanks; the blanks stay as they were.
+                let mut out = String::new();
+                let mut word = String::new();
+                for c in s.chars() {
+                    if c == ' ' || c == '\t' || c == '\n' {
+                        if !word.is_empty() {
+                            out.push_str(&apply_one(m, &word, subst));
+                            word.clear();
+                        }
+                        out.push(c);
+                    } else {
+                        word.push(c);
+                    }
+                }
+                if !word.is_empty() {
+                    out.push_str(&apply_one(m, &word, subst));
+                }
+                out
+            }
+        }
+    };
+    if m.rec < 0 {
+        let mut cur = s.to_string();
+        loop {
+            let next = once(&cur);
+            if next == cur {
+                return cur;
+            }
+            cur = next;
+        }
+    }
+    let mut cur = s.to_string();
+    for _ in 0..m.rec {
+        cur = once(&cur);
+    }
+    cur
+}
+
+fn run_modifiers(mut val: Val, mods: &[Modifier]) -> ExpResult<Val> {
+    val = plain(val);
+    for m in mods {
+        // :s sides may hold expansions; :& reuses the last ones.
+        let subst = match (&m.subst, m.op) {
+            (Some((l, r)), _) => {
+                let ex = |t: &str| -> ExpResult<String> {
+                    if t.contains(['$', '`']) {
+                        expand_heredoc(t)
+                    } else {
+                        Ok(t.to_string())
+                    }
+                };
+                let pair = (ex(l)?, ex(r)?);
+                if let Ok(mut h) = HIST_SUBST.lock() {
+                    *h = Some((pair.0.clone(), pair.1.clone(), m.pattern));
+                }
+                Some(pair)
+            }
+            (None, '&') => HIST_SUBST
+                .lock()
+                .ok()
+                .and_then(|h| h.clone())
+                .map(|(l, r, _)| (l, r)),
+            _ => None,
+        };
+        if m.op == '&' && subst.is_none() {
+            return fail("no previous substitution");
+        }
+        // `:&` repeats the last substitution, pattern or not.
+        let repeat;
+        let m = if m.op == '&' {
+            let pattern = HIST_SUBST
+                .lock()
+                .ok()
+                .and_then(|h| h.as_ref().map(|t| t.2))
+                .unwrap_or(false);
+            repeat = Modifier {
+                op: '&',
+                count: m.count,
+                global: m.global,
+                words: m.words,
+                sep: m.sep.clone(),
+                rec: m.rec,
+                subst: None,
+                pattern,
+            };
+            &repeat
+        } else {
+            m
+        };
+        val = map_items(val, |s| apply_modifier(m, s, &subst));
+    }
+    Ok(val)
+}
+
+// Applies `:` modifiers filling all of `rest` (`${name:mods}`). None if
+// `rest` is not a modifier list.
 fn apply_modifiers(val: Val, rest: &[char]) -> ExpResult<Option<Val>> {
-    if !rest.get(1).is_some_and(|&c| modifier_letters(c)) {
+    let (mods, used) = parse_modifiers(rest, true)?;
+    if mods.is_empty() || used != rest.len() {
         return Ok(None);
     }
-    let mut val = plain(val);
-    let mut i = 0;
-    while i < rest.len() {
-        if rest[i] != ':' {
-            return Ok(None);
-        }
-        i += 1;
-        let mut global = false;
-        if rest.get(i) == Some(&'g') {
-            global = true;
-            i += 1;
-        }
-        let Some(&m) = rest.get(i) else {
-            return Ok(None);
-        };
-        i += 1;
-        match m {
-            's' => {
-                let Some(&d) = rest.get(i) else {
-                    return Ok(None);
-                };
-                i += 1;
-                let mut parts = vec![String::new()];
-                while i < rest.len() && parts.len() <= 2 {
-                    if rest[i] == d {
-                        parts.push(String::new());
-                    } else {
-                        parts.last_mut().unwrap().push(rest[i]);
-                    }
-                    i += 1;
-                }
-                if parts.len() < 2 {
-                    return Ok(None);
-                }
-                // A third delimiter is optional at the end.
-                let (old, new) = (parts[0].clone(), parts[1].clone());
-                if parts.len() == 3 && !parts[2].is_empty() {
-                    i -= parts[2].chars().count();
-                }
-                val = map_items(val, |s| {
-                    let new = new.replace('&', &old);
-                    if global {
-                        s.replace(&old, &new)
-                    } else {
-                        s.replacen(&old, &new, 1)
-                    }
-                });
-            }
-            'h' | 't' => {
-                let mut n = 0usize;
-                while rest.get(i).is_some_and(|c| c.is_ascii_digit()) {
-                    n = n * 10 + rest[i].to_digit(10).unwrap() as usize;
-                    i += 1;
-                }
-                val = map_items(val, |s| {
-                    if m == 'h' {
-                        path_head(s, n)
-                    } else {
-                        path_tail(s, n)
-                    }
-                });
-            }
-            'r' => val = map_items(val, path_root),
-            'e' => val = map_items(val, path_ext),
-            'a' => val = map_items(val, absolute_path),
-            'A' | 'P' => {
-                val = map_items(val, |s| {
-                    std::fs::canonicalize(absolute_path(s))
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| absolute_path(s))
-                })
-            }
-            'c' => {
-                val = map_items(val, |s| {
-                    crate::shell::find_command(s).unwrap_or_else(|| s.to_string())
-                })
-            }
-            'l' => val = map_items(val, |s| s.to_lowercase()),
-            'u' => val = map_items(val, |s| s.to_uppercase()),
-            'q' => val = map_items(val, backslash_quote),
-            'Q' => val = map_items(val, unquote),
-            'x' => {
-                val = map_items(val, |s| {
-                    s.split_whitespace()
-                        .map(crate::builtins::shell_quote)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-            }
-            _ => return Ok(None),
-        }
-    }
-    Ok(Some(val))
+    run_modifiers(val, &mods).map(Some)
 }
 
-fn path_head(s: &str, n: usize) -> String {
-    if n > 0 {
-        let parts: Vec<&str> = s.split('/').collect();
-        return parts[..n.min(parts.len())].join("/");
+/// `$name:mods` without braces: the modifiers at `rest` and how many
+/// characters they take (0 if none).
+fn unbraced_modifiers(val: Val, rest: &[char]) -> ExpResult<(Val, usize)> {
+    let (mods, used) = parse_modifiers(rest, false)?;
+    if mods.is_empty() {
+        return Ok((val, 0));
     }
-    match s.trim_end_matches('/').rfind('/') {
-        Some(0) => "/".to_string(),
-        Some(k) => s[..k].to_string(),
-        None => ".".to_string(),
-    }
-}
-
-fn path_tail(s: &str, n: usize) -> String {
-    let t = s.trim_end_matches('/');
-    let parts: Vec<&str> = t.split('/').collect();
-    let n = n.max(1).min(parts.len());
-    parts[parts.len() - n..].join("/")
+    Ok((run_modifiers(val, &mods)?, used))
 }
 
 fn path_root(s: &str) -> String {
@@ -1673,6 +2339,7 @@ fn visible(s: &str) -> String {
 }
 
 // (qqqq): $'...' quoting.
+// (qqqq): $'...' with C escapes, other control characters in octal.
 fn dollar_quote(s: &str) -> String {
     let mut out = String::from("$'");
     for c in s.chars() {
@@ -1681,12 +2348,75 @@ fn dollar_quote(s: &str) -> String {
             '\'' => out.push_str("\\'"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
-            '\x1b' => out.push_str("\\e"),
-            c if (c as u32) < 32 || c == '\x7f' => out.push_str(&format!("\\x{:02x}", c as u32)),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            c if (c as u32) < 32 || c == '\x7f' => out.push_str(&format!("\\{:03o}", c as u32)),
             c => out.push(c),
         }
     }
     out.push('\'');
+    out
+}
+
+// (q-) and (q+): quoted only as much as needed. (q-) leaves a string
+// whose only special characters are `'` unquoted, escaping them; (q+)
+// uses $'...' when there are control characters.
+fn quote_minimal(s: &str, plus: bool) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if plus && s.chars().any(|c| (c as u32) < 32 || c == '\x7f') {
+        let mut out = String::from("$'");
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '\'' => out.push_str("\\'"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\x7f' => out.push_str("\\C-?"),
+                c if (c as u32) < 32 => {
+                    out.push_str("\\C-");
+                    out.push(char::from(b'@' + c as u8));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('\'');
+        return out;
+    }
+    let special = |c: char| c.is_whitespace() || "|&;<>()$`\\\"*?[]#~=%{}!^".contains(c);
+    let needs = s.chars().any(special);
+    if !needs && !s.contains('\'') {
+        return s.to_string();
+    }
+    if !needs && !plus {
+        return s.replace('\'', "\\'");
+    }
+    let rc = crate::options::is_set("rcquotes");
+    let mut out = String::from("'");
+    let mut open = true;
+    for c in s.chars() {
+        if c == '\'' {
+            if rc && open {
+                out.push_str("''");
+            } else {
+                if open {
+                    out.push('\'');
+                    open = false;
+                }
+                out.push_str("\\'");
+            }
+        } else {
+            if !open {
+                out.push('\'');
+                open = true;
+            }
+            out.push(c);
+        }
+    }
+    if open {
+        out.push('\'');
+    }
     out
 }
 
@@ -1716,10 +2446,13 @@ fn g_escapes(s: &str, opts: &str) -> String {
     out
 }
 
-fn backslash_quote(s: &str) -> String {
+pub(crate) fn backslash_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
     let mut out = String::new();
     for (k, c) in s.chars().enumerate() {
-        if " \t\n\\'\"`$&|;<>()[]{}*?#^=!".contains(c) || (c == '~' && k == 0) {
+        if " \t\n\\'\"`$&|;<>()[]{}*?#^".contains(c) || (matches!(c, '~' | '=') && k == 0) {
             out.push('\\');
         }
         out.push(c);
@@ -2067,6 +2800,12 @@ fn split_items(items: Vec<String>, sep: &str, keep_empty: bool) -> Vec<String> {
     out
 }
 
+/// Name order with digit runs compared by value, as NUMERIC_GLOB_SORT
+/// and the (n) flag use.
+pub fn numeric_order(a: &str, b: &str) -> std::cmp::Ordering {
+    numeric_cmp(a, b, false)
+}
+
 // zsh's numeric sort ((n), and (-) for signed numbers): runs of digits
 // compare by value, everything else character by character.
 fn numeric_cmp(a: &str, b: &str, signed: bool) -> std::cmp::Ordering {
@@ -2114,6 +2853,24 @@ fn numeric_cmp(a: &str, b: &str, signed: bool) -> std::cmp::Ordering {
 // splitting, case, escapes, quoting, directory names, visibility,
 // lexical splitting, uniqueness, ordering, re-evaluation, padding.
 fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
+    // `${=x-"a b" $y}`: splitting leaves the quoted parts of the word whole.
+    let mut ifs_done = false;
+    let val = match val {
+        Val::Tagged(fields) if f.ifs_split && f.split.is_none() => {
+            let ifs = ifs();
+            let mut out = Vec::new();
+            for field in &fields {
+                let marked: Vec<(char, u8)> = field
+                    .iter()
+                    .map(|&(c, t)| (c, if t & Q != 0 { t } else { t | S }))
+                    .collect();
+                out.extend(split_field(&marked, &ifs));
+            }
+            ifs_done = true;
+            Val::Tagged(out)
+        }
+        v => v,
+    };
     let mut val = plain(val);
     let list_in = is_list(&val);
     let wrap = |items: Vec<String>, was_list: bool| {
@@ -2123,16 +2880,40 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             Val::Str(items.into_iter().next().unwrap_or_default())
         }
     };
+    if f.charcode {
+        let was_list = is_list(&val);
+        let mut out = Vec::new();
+        for w in val_items(&val) {
+            match crate::arith::eval(&w) {
+                Ok(n) => match u32::try_from(n).ok().and_then(char::from_u32) {
+                    Some(c) => out.push(c.to_string()),
+                    None if f.report => return fail("character not in range"),
+                    None => {}
+                },
+                Err(e) if f.report => return fail(&e),
+                Err(_) => {}
+            }
+        }
+        val = if was_list {
+            Val::List(out, false)
+        } else {
+            match out.pop() {
+                Some(c) => Val::Str(c),
+                None => Val::List(Vec::new(), false),
+            }
+        };
+    }
     if f.indirect {
         val = match val {
             Val::Str(name) => lookup(&name),
             v => v,
         };
     }
-    let splitting = f.split.is_some() || f.ifs_split;
+    let splitting = f.split.is_some() || (f.ifs_split && !ifs_done);
     let mut list = is_list(&val) || list_in;
-    // Rule 10: (j), or splitting, first joins the words.
-    if (f.join.is_some() || splitting) && is_list(&val) {
+    // Rule 10: (j), or splitting, first joins the words; (@) keeps them
+    // apart for splitting.
+    if (f.join.is_some() || (splitting && !f.at)) && is_list(&val) {
         let sep = f.join.clone().unwrap_or_else(ifs_first);
         val = Val::Str(val_items(&val).join(&sep));
         list = false;
@@ -2143,7 +2924,7 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             split_items(items, sep, (f.at && quoted) || f.words_empty),
             false,
         );
-    } else if f.ifs_split {
+    } else if f.ifs_split && !ifs_done {
         let ifs = ifs();
         let words: Vec<String> = val_items(&val)
             .iter()
@@ -2201,7 +2982,7 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             *s = unquote(s);
         }
         if f.quote_min {
-            *s = crate::builtins::shell_quote(s);
+            *s = quote_minimal(s, f.quote_plus);
         } else {
             match f.quote {
                 0 => {}
@@ -2271,7 +3052,19 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             )?;
             fields.extend(tmp.fields);
         }
-        return Ok(Val::Tagged(fields));
+        // Like any expansion result, it is not globbed without GLOB_SUBST.
+        if !crate::options::is_set("globsubst") {
+            for f in fields.iter_mut() {
+                for c in f.iter_mut() {
+                    c.1 |= NG;
+                }
+            }
+        }
+        // Padding still applies to what (e) produced.
+        if f.pad_left.is_none() && f.pad_right.is_none() {
+            return Ok(Val::Tagged(fields));
+        }
+        items = fields.iter().map(|f| tagged_text(f)).collect();
     }
     if f.pad_left.is_some() || f.pad_right.is_some() {
         let (pre, premul, preone) = f.pad_left.clone().unwrap_or((0, None, None));
@@ -2297,9 +3090,137 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
     Ok(out)
 }
 
+// zsh's non-forking command substitutions: `${ cmd }` (its output),
+// `${| cmd }` (the value it leaves in a local REPLY) and `${{name} cmd }`
+// (the value of name). The commands run in this shell, as if in a
+// function: `local` and `return` work, positional parameters are shared.
+fn nofork(body: &[char], quoted: bool) -> ExpResult<Option<Val>> {
+    enum Kind {
+        Stdout,
+        Reply,
+        Var(String),
+    }
+    let (kind, code) = match body.first() {
+        Some(' ' | '\t' | '\n') => (Kind::Stdout, &body[1..]),
+        Some('|') => (Kind::Reply, &body[1..]),
+        Some('{') => {
+            let Some(close) = body.iter().position(|&c| c == '}') else {
+                return Ok(None);
+            };
+            let name: String = body[1..close].iter().collect();
+            if !crate::lexer::is_valid_name(&name) {
+                return Ok(None);
+            }
+            (Kind::Var(name), &body[close + 1..])
+        }
+        _ => return Ok(None),
+    };
+    let code: String = code.iter().collect();
+    let capture = match kind {
+        Kind::Stdout => {
+            let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+            let path = format!(
+                "{}/meowsh-nofork-{}-{}",
+                dir,
+                std::process::id(),
+                NOFORK_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path);
+            let _ = std::fs::remove_file(&path);
+            match file {
+                Ok(f) => Some(f),
+                Err(e) => return fail(&format!("{}: {}", path, e)),
+            }
+        }
+        _ => None,
+    };
+    use std::os::fd::AsRawFd;
+    let saved_out = capture.as_ref().map(|f| unsafe {
+        let saved = libc::dup(1);
+        libc::dup2(f.as_raw_fd(), 1);
+        saved
+    });
+    with_shell(|s| s.func_depth += 1);
+    crate::shell::push_scope();
+    if matches!(kind, Kind::Reply) {
+        crate::shell::declare_local("REPLY");
+        with_shell(|s| {
+            if let Some(p) = s.param_mut("REPLY") {
+                p.value = crate::params::Value::Scalar(String::new());
+                p.attrs = crate::params::UNSET;
+            }
+        });
+    }
+    let mut st = crate::exec::run_string_named(&code, None);
+    with_shell(|s| match s.flow {
+        crate::types::Flow::Return(n) => {
+            st = n;
+            s.flow = crate::types::Flow::None;
+        }
+        f @ (crate::types::Flow::Break(_) | crate::types::Flow::Continue(_)) => {
+            s.flow = crate::types::Flow::None;
+            if let Ok(mut d) = crate::exec::DEFERRED_FLOW.lock() {
+                *d = Some(f);
+            }
+        }
+        _ => {}
+    });
+    let value = |name: &str| -> Val {
+        with_shell(|s| match s.array(name) {
+            Some(items) => Val::List(items.to_vec(), true),
+            None => Val::Str(s.scalar(name).map(str::to_string).unwrap_or_default()),
+        })
+    };
+    let result = match &kind {
+        Kind::Reply => value("REPLY"),
+        Kind::Var(name) => value(name),
+        Kind::Stdout => Val::Unset,
+    };
+    crate::shell::pop_scope();
+    with_shell(|s| s.func_depth -= 1);
+    let result = match (capture, saved_out) {
+        (Some(mut f), Some(saved)) => {
+            unsafe {
+                libc::dup2(saved, 1);
+                libc::close(saved);
+            }
+            use std::io::{Read, Seek};
+            let mut bytes = Vec::new();
+            let _ = f.seek(std::io::SeekFrom::Start(0));
+            let _ = f.read_to_end(&mut bytes);
+            let mut out = String::from_utf8_lossy(&bytes).into_owned();
+            // Unquoted, zsh drops one trailing newline; emulations drop
+            // them all, quoted or not.
+            if with_shell(|s| s.emulation != crate::options::Emulation::Zsh) {
+                while out.ends_with('\n') {
+                    out.pop();
+                }
+            } else if !quoted && out.ends_with('\n') {
+                out.pop();
+            }
+            Val::Str(out)
+        }
+        _ => result,
+    };
+    with_shell(|s| {
+        s.last_cmdsub_status = Some(st);
+        s.last_status = st;
+    });
+    Ok(Some(result))
+}
+
+static NOFORK_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
+    if let Some(v) = nofork(body, mode != Mode::Unquoted)? {
+        return Ok(v);
+    }
     let text: String = body.iter().collect();
-    let bad = || fail::<Val>(&format!("${{{}}}: bad substitution", text));
+    let bad = || fail::<Val>("bad substitution");
     if body.is_empty() {
         return bad();
     }
@@ -2307,21 +3228,41 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     let mut i = 0;
     let mut flags = PFlags::default();
     if body[0] == '(' {
+        FLAG_ERR_AT.with(|e| e.set(None));
         let Some((f, end)) = parse_flags(body) else {
-            return fail(&format!("error in flags in '${{{}}}'", text));
+            // zsh counts from the `$`, 1-based.
+            return match FLAG_ERR_AT.with(|e| e.get()) {
+                Some(k) => fail(&format!(
+                    "error in flags near position {} in '${{{}}}'",
+                    k + 3,
+                    text
+                )),
+                None => fail(&format!("error in flags in '${{{}}}'", text)),
+            };
         };
         flags = f;
         i = end;
     }
     // Prefix operators: # length, + set test, ^ rc-expansion, = split,
     // ~ glob, ! bash indirection.
-    let (mut length, mut set_test, mut rc, mut ifs_split, mut indirect) =
-        (false, false, false, false, false);
+    // RC_EXPAND_PARAM makes every array expand as ${^name}.
+    let (mut length, mut set_test, mut rc, mut ifs_split, mut indirect) = (
+        false,
+        false,
+        crate::options::is_set("rcexpandparam"),
+        false,
+        false,
+    );
     while let Some(&c) = body.get(i) {
         let next = body.get(i + 1).copied();
         let starts_param = |n: Option<char>| {
             n.is_some_and(|n| {
-                n == '_' || n == '$' || n == '(' || n.is_alphanumeric() || is_special_param(n)
+                n == '_'
+                    || n == '.'
+                    || n == '$'
+                    || n == '('
+                    || n.is_alphanumeric()
+                    || is_special_param(n)
             })
         };
         match c {
@@ -2331,7 +3272,13 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
                 length = true
             }
             '+' if starts_param(next) => set_test = true,
-            '^' if starts_param(next) || matches!(next, Some('^' | ':')) => rc = !rc,
+            // `^` turns RC_EXPAND_PARAM on for this expansion, `^^` off.
+            '^' if starts_param(next) || matches!(next, Some('^' | ':')) => {
+                rc = next != Some('^');
+                if !rc {
+                    i += 1;
+                }
+            }
             // `=` splits words, `==` turns SH_WORD_SPLIT off; `~` and
             // `~~` do the same for GLOB_SUBST (see prefix_toggles).
             '=' if starts_param(next) || matches!(next, Some('=' | ':')) => {
@@ -2353,11 +3300,75 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     let mut sub = None;
     let mut val;
     let nested = body.get(i) == Some(&'$');
-    if body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'{') {
+    // `${${(P)name}[sub]}`: the parameter name holds, subscripted as
+    // itself (a hash keeps its keys).
+    let p_target = (body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'{'))
+        .then(|| scan_brace(body, i + 1, false))
+        .flatten()
+        .filter(|&end| body.get(end) == Some(&'['))
+        .and_then(|end| {
+            let inner: String = body[i + 2..end - 1].iter().collect();
+            let ident = inner.strip_prefix("(P)")?;
+            crate::lexer::is_valid_name(ident).then(|| (ident.to_string(), end))
+        });
+    if let Some((ident, end)) = p_target {
+        let target = match with_shell(|s| s.array(&ident).cloned()) {
+            Some(a) if a.len() == 1 => a[0].clone(),
+            Some(_) => return fail("parameter name reference used with array"),
+            None => var_get(&ident),
+        };
+        let (n, s) = match target.find('[') {
+            Some(k) if target.ends_with(']') => (
+                target[..k].to_string(),
+                Some(target[k + 1..target.len() - 1].to_string()),
+            ),
+            _ => (target.clone(), None),
+        };
+        val = match &s {
+            Some(sub) => param_value(&n, Some(sub))?,
+            None => {
+                // Let the outer subscript act on the parameter itself.
+                name = n;
+                let k = scan_bracket_end(body, end);
+                sub = Some(body[end + 1..k].iter().collect());
+                i = k + 1;
+                param_value(&name, sub.as_deref())?
+            }
+        };
+        if s.is_some() {
+            i = end;
+        }
+    } else if body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'{') {
         let Some(end) = scan_brace(body, i + 1, false) else {
             return bad();
         };
         val = braced(&body[i + 2..end - 1], Mode::Unquoted)?;
+        // In double quotes a nested array joins unless it has its own (@).
+        let inner_at = body.get(i + 2) == Some(&'(')
+            && body[i + 3..end - 1]
+                .iter()
+                .take_while(|&&c| c != ')')
+                .any(|&c| c == '@');
+        if mode != Mode::Unquoted && !inner_at && body.get(end) == Some(&'[') {
+            if let Val::List(items, _) = &val {
+                val = Val::Str(items.join(&ifs_first()));
+            }
+        }
+        // SH_WORD_SPLIT: an unquoted nested value is split into words
+        // before the outer operators apply.
+        if mode == Mode::Unquoted && crate::options::is_set("shwordsplit") {
+            if let Val::Str(t) = &val {
+                let ifs = ifs();
+                let words: Vec<String> = t
+                    .split(|c| ifs.contains(c))
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if words.len() > 1 {
+                    val = Val::List(words, false);
+                }
+            }
+        }
         i = end;
     } else if body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'(') {
         let arith_end = scan_arith(body, i + 1);
@@ -2365,7 +3376,7 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
             return bad();
         };
         val = if arith_end.is_some() {
-            Val::Str(arith_num(&body[i + 3..end - 2])?.to_string())
+            Val::Str(arith_text(&body[i + 3..end - 2])?)
         } else {
             let src: String = body[i + 2..end - 1].iter().collect();
             Val::Str(command_subst(&src)?)
@@ -2380,7 +3391,12 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
         i = end;
     } else if let Some((n, s, end)) = parse_param(&body[i..]) {
         name = n;
-        sub = s;
+        // In double quotes `\"` in a subscript is a `"`.
+        sub = if mode == Mode::Dq {
+            s.map(|t| t.replace("\\\"", "\""))
+        } else {
+            s
+        };
         i += end;
         // ${!ref} on a nameref: the name it refers to.
         let is_ref = with_shell(|s| {
@@ -2405,7 +3421,7 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
             }
         }
         if set_test && i == body.len() {
-            let set = if name == "commands" && sub.is_some() {
+            let set = if (name == "commands" || name == "functions") && sub.is_some() {
                 !matches!(param_value(&name, sub.as_deref())?, Val::Unset)
             } else if let Some(s) = &sub {
                 // ${+name[key]}: is the element set?
@@ -2415,9 +3431,38 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
             };
             return Ok(Val::Str(if set { "1" } else { "0" }.into()));
         }
-        val = if name == "commands" && sub.is_none() && flags.keys {
+        let own_ref = (flags.no_deref && sub.is_none())
+            .then(|| {
+                with_shell(|s| {
+                    s.param(&name)
+                        .filter(|p| p.attrs & crate::params::NAMEREF != 0)
+                        .map(|p| {
+                            if p.attrs & crate::params::UNSET != 0 {
+                                Val::Unset
+                            } else {
+                                Val::Str(p.text())
+                            }
+                        })
+                })
+            })
+            .flatten();
+        val = if let Some(v) = own_ref {
+            v
+        } else if name == "commands" && sub.is_none() && flags.keys {
             Val::List(crate::shell::all_commands(), false)
-        } else if flags.keys && sub.is_none() {
+        } else if name == "functions"
+            && sub.is_none()
+            && flags.keys
+            && !with_shell(|s| s.assoc("functions").is_some())
+        {
+            let mut names: Vec<String> = with_shell(|s| s.functions.keys().cloned().collect());
+            names.sort();
+            Val::List(names, false)
+        } else if flags.keys
+            && (sub.is_none()
+                || (matches!(sub.as_deref(), Some("@" | "*")) && assoc_keys(&name).is_some()))
+        {
+            // `${(k)h}`, and `${(k)h[@]}` on an association.
             match assoc_keys(&name) {
                 Some(keys) if flags.values => Val::List(
                     keys.iter()
@@ -2443,7 +3488,15 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
             } else {
                 found.next()
             };
-            r.map(Val::Str).unwrap_or(Val::Unset)
+            match r {
+                // (kv): the key and its value.
+                Some(k) if flags.values => {
+                    let v = assoc_get(&name, &k).unwrap_or_default();
+                    Val::List(vec![k, v], false)
+                }
+                Some(k) => Val::Str(k),
+                None => Val::Unset,
+            }
         } else if sub.is_none() {
             ksh_first(&name, param_value(&name, None)?)
         } else {
@@ -2456,7 +3509,10 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
         return bad();
     }
     if flags.type_of {
-        return Ok(Val::Str(type_of(&name)));
+        // A bound reference reports the type of what it refers to.
+        let _swap = crate::shell::RefSwap::enter(&name);
+        let target = crate::shell::split_target_pub(&crate::shell::resolve_ref(&name));
+        return Ok(Val::Str(type_of(&target)));
     }
     // Rule 5: in double quotes, without (@), an array joins into one word
     // before nested subscripts, operators, modifiers and sorting apply.
@@ -2501,12 +3557,21 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     let sorts = (flags.sort.is_some() || flags.unique || flags.numeric || flags.signed)
         && !flags.keys
         && !flags.values;
-    if dq_join && (!rest.is_empty() || sorts) {
+    // A bash-style offset slices the array before it is joined.
+    let offset_op = rest.first() == Some(&':')
+        && rest
+            .get(1)
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, ' ' | '$' | '(' | '\t'));
+    if dq_join && (!rest.is_empty() || sorts) && !offset_op {
         if let Val::List(items, star) = &val {
             if nested || *star {
                 val = Val::Str(items.join(&ifs_first()));
             }
         }
+    }
+    if ifs_split {
+        flags.ifs_split = true;
+        flags.any = true;
     }
     let mut val = if rest.is_empty() {
         if !name.is_empty() {
@@ -2517,18 +3582,27 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
         // ${a:^b} zips two arrays; ${a:^^b} repeats the shorter one.
         let long = rest.get(2) == Some(&'^');
         let other: String = rest[if long { 3 } else { 2 }..].iter().collect();
+        if !crate::lexer::is_valid_name(&other) {
+            return fail(&format!("not an identifier: {}", other));
+        }
+        if !name.is_empty() {
+            check_set(&name, &val)?;
+        }
+        let other_val = lookup(&other);
+        check_set(&other, &other_val)?;
         let a = val_items(&plain(val));
-        let b = val_items(&lookup(&other));
+        let b = val_items(&other_val);
         let n = if long {
-            if a.is_empty() || b.is_empty() {
-                0
-            } else {
-                a.len().max(b.len())
-            }
+            a.len().max(b.len())
         } else {
             a.len().min(b.len())
         };
         let mut items = Vec::new();
+        // ${a:^^b} with one side empty is just the other side.
+        if long && (a.is_empty() || b.is_empty()) {
+            items.extend(a.iter().chain(b.iter()).cloned());
+            return Ok(Val::List(items, false));
+        }
         for k in 0..n {
             items.push(a[k % a.len()].clone());
             items.push(b[k % b.len()].clone());
@@ -2555,12 +3629,29 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     {
         v
     } else {
+        ASSIGNED.with(|a| *a.borrow_mut() = None);
         apply_operator(val, &name, sub.as_deref(), rest, mode, &text, &flags)?
     };
-
-    if ifs_split {
-        flags.ifs_split = true;
-        flags.any = true;
+    let assigned = ASSIGNED.with(|a| a.borrow_mut().take());
+    if let (true, Some(items)) = (ifs_split, assigned) {
+        val = Val::List(items, false);
+        flags.ifs_split = false;
+    }
+    // (P) follows the stored name, not its -u/-l display form.
+    if flags.indirect && sub.is_none() && matches!(val, Val::Str(_)) {
+        let raw = with_shell(|s| {
+            s.param(&name).and_then(|p| match &p.value {
+                crate::params::Value::Scalar(v)
+                    if p.attrs & (crate::params::UPPER | crate::params::LOWER) != 0 =>
+                {
+                    Some(v.clone())
+                }
+                _ => None,
+            })
+        });
+        if let Some(r) = raw {
+            val = Val::Str(r);
+        }
     }
     if flags.any {
         val = apply_flags(val, &flags, quoted)?;
@@ -2612,6 +3703,11 @@ fn plain_clone(v: &Val) -> Val {
 // The result is the parameter read back, so attributes such as -Z3
 // show; `name[sub]` assigns an element or range, digits a positional
 // parameter.
+thread_local! {
+    // Set when `${x=word}` just assigned: the assigned array is not split again.
+    static ASSIGNED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn assign_word(
     name: &str,
     sub: Option<&str>,
@@ -2655,6 +3751,10 @@ fn assign_word(
         return param_value(name, Some(sub));
     }
     assign_whole(name, word, mode, pf)?;
+    if pf.ifs_split && pf.assign_array == 0 {
+        // `${=x=a "b c"}` splits the word, not the stored string.
+        return word_val(word, mode);
+    }
     param_value(name, None)
 }
 
@@ -2664,6 +3764,14 @@ fn assign_whole(name: &str, word: &[char], mode: Mode, pf: &PFlags) -> ExpResult
             Val::Tagged(fields) => {
                 let mut out = Vec::new();
                 for f in fields {
+                    // With `=`, the word's unquoted text splits too.
+                    let f: Vec<(char, u8)> = if pf.ifs_split {
+                        f.into_iter()
+                            .map(|(c, t)| (c, if t & Q != 0 { t } else { t | S }))
+                            .collect()
+                    } else {
+                        f
+                    };
                     for piece in split_field(&f, &ifs()) {
                         out.push(tagged_text(&piece));
                     }
@@ -2678,6 +3786,7 @@ fn assign_whole(name: &str, word: &[char], mode: Mode, pf: &PFlags) -> ExpResult
         if !crate::shell::array_set(name, items.clone()) {
             return Err(ExpError { status: 1 });
         }
+        ASSIGNED.with(|a| *a.borrow_mut() = Some(items.clone()));
         return Ok(Val::List(items, false));
     }
     let v = word_string(word, mode)?;
@@ -2697,7 +3806,7 @@ fn apply_operator(
     text: &str,
     pf: &PFlags,
 ) -> ExpResult<Val> {
-    let bad = || fail::<Val>(&format!("${{{}}}: bad substitution", text));
+    let bad = || fail::<Val>("bad substitution");
     let is_set = !matches!(val, Val::Unset);
     let is_null = match &val {
         Val::Unset => true,
@@ -2844,8 +3953,24 @@ fn apply_operator(
             };
             let off = eval_arith_str(&word_string(off_part, Mode::Unquoted)?)?;
             let len = match len_part {
+                Some([]) => return fail("unrecognized modifier"),
                 Some(l) => Some(eval_arith_str(&word_string(l, Mode::Unquoted)?)?),
                 None => None,
+            };
+            // A negative length that ends before the start is an error.
+            let check = |n: usize| -> ExpResult<()> {
+                if let Some(l) = len.filter(|&l| l < 0) {
+                    let n = n as i64;
+                    let start = if off < 0 {
+                        (n + off).max(0)
+                    } else {
+                        off.min(n)
+                    };
+                    if n + l < start {
+                        return fail(&format!("substring expression: {} < {}", n + l, start));
+                    }
+                }
+                Ok(())
             };
             Ok(match plain(val) {
                 Val::List(items, star) => {
@@ -2856,6 +3981,7 @@ fn apply_operator(
                     } else {
                         items
                     };
+                    check(items.len())?;
                     Val::List(slice(&items, off, len), star)
                 }
                 other => {
@@ -2864,6 +3990,7 @@ fn apply_operator(
                         .chars()
                         .map(|c| c.to_string())
                         .collect();
+                    check(chars.len())?;
                     Val::Str(slice(&chars, off, len).concat())
                 }
             })
@@ -3011,13 +4138,65 @@ fn pattern_of(word: &[char]) -> ExpResult<String> {
     Ok(pattern_text(&ctx))
 }
 
+/// An associative array key as zsh reads a subscript: quotes are
+/// literal, a backslash is dropped only before `\`, `[` or `]`, and
+/// parameter, command and arithmetic substitutions apply.
+pub fn assoc_key(sub: &str) -> ExpResult<String> {
+    let mut pre = String::new();
+    let mut it = sub.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.peek() {
+                Some('[' | ']') => {
+                    pre.push(it.next().unwrap());
+                    continue;
+                }
+                // Kept for the next step, where `\\` is one backslash.
+                Some('\\') => {
+                    pre.push_str("\\\\");
+                    it.next();
+                    continue;
+                }
+                Some('$' | '`') => {
+                    pre.push_str("\\\\");
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        pre.push(c);
+    }
+    expand_heredoc(&pre)
+}
+
+// Index of the `]` closing the `[` at `open`.
+fn scan_bracket_end(chars: &[char], open: usize) -> usize {
+    let mut depth = 0;
+    let mut k = open;
+    while k < chars.len() {
+        match chars[k] {
+            '\\' => k += 1,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return k;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    chars.len().saturating_sub(1)
+}
+
 fn pattern_text(ctx: &Ctx) -> String {
     let mut out = String::new();
     for &(c, f) in ctx.fields.iter().flatten() {
         if f & MARK != 0 {
             continue;
         }
-        if f & (Q | NG) != 0 && "*?[]()|<>^#~\\".contains(c) {
+        if f & (Q | NG) != 0 && "*?[]()|<>^#~\\!-".contains(c) {
             out.push('\\');
         }
         out.push(c);
@@ -3120,11 +4299,31 @@ fn brace_expand(field: &[(char, u8)]) -> Vec<Vec<(char, u8)>> {
             }
         } else {
             let inner: Vec<char> = field[i + 1..close].iter().map(|&(c, _)| c).collect();
-            if let Some(seq) = sequence(&inner) {
+            if let Some((seq, chars)) = sequence(&inner) {
+                let tag = if chars { Q } else { field[i].1 };
                 alts = seq
                     .into_iter()
-                    .map(|w| w.chars().map(|c| (c, field[i].1)).collect())
+                    .map(|w| w.chars().map(|c| (c, tag)).collect())
                     .collect();
+            } else if !inner.is_empty() && crate::options::is_set("braceccl") {
+                // BRACE_CCL: `{a-dz}` gives each character, in order.
+                let mut set = std::collections::BTreeSet::new();
+                let mut k = 0;
+                while k < inner.len() {
+                    if k + 2 < inner.len() && inner[k + 1] == '-' {
+                        let (lo, hi) = (inner[k] as u32, inner[k + 2] as u32);
+                        for c in lo.min(hi)..=lo.max(hi) {
+                            if let Some(c) = char::from_u32(c) {
+                                set.insert(c);
+                            }
+                        }
+                        k += 3;
+                    } else {
+                        set.insert(inner[k]);
+                        k += 1;
+                    }
+                }
+                alts = set.into_iter().map(|c| vec![(c, field[i].1)]).collect();
             }
         }
         if alts.is_empty() {
@@ -3166,75 +4365,86 @@ fn brace_close(field: &[(char, u8)], open: usize) -> Option<(usize, Vec<usize>)>
 }
 
 // `{a..b}` and `{a..b..step}` over integers or single characters.
-fn sequence(inner: &[char]) -> Option<Vec<String>> {
+// `{a..b}` and `{a..b..step}` as zsh's xpandbraces does them: numbers
+// (zero-padded when an operand has a leading zero; a negative step
+// reverses the order, a step aligns on the first number) or single
+// characters. The bool is true for characters, which stay literal.
+fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
     let s: String = inner.iter().collect();
     let parts: Vec<&str> = s.split("..").collect();
+    if parts.len() == 2 {
+        let (ca, cb): (Vec<char>, Vec<char>) =
+            (parts[0].chars().collect(), parts[1].chars().collect());
+        if ca.len() == 1 && cb.len() == 1 && !(ca[0].is_ascii_digit() && cb[0].is_ascii_digit()) {
+            let (mut a, mut b) = (ca[0] as u32, cb[0] as u32);
+            let rev = b < a;
+            if rev {
+                std::mem::swap(&mut a, &mut b);
+            }
+            let mut out: Vec<String> = (a..=b)
+                .filter_map(char::from_u32)
+                .map(|c| c.to_string())
+                .collect();
+            if rev {
+                out.reverse();
+            }
+            return Some((out, true));
+        }
+    }
     if parts.len() != 2 && parts.len() != 3 {
         return None;
     }
-    let step: i64 = match parts.get(2) {
-        Some(p) => p.parse().ok()?,
-        None => 1,
-    };
-    let step = step.unsigned_abs().max(1) as i64;
-    if let (Ok(a), Ok(b)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-        let width = if (parts[0].starts_with('0') && parts[0].len() > 1)
-            || (parts[1].starts_with('0') && parts[1].len() > 1)
-        {
-            parts[0].len().max(parts[1].len())
-        } else {
-            0
-        };
-        if (a - b).unsigned_abs() / step as u64 > 100_000 {
+    let num = |p: &str| -> Option<i64> {
+        let body = p.strip_prefix('-').unwrap_or(p);
+        if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
-        let mut out = Vec::new();
-        let mut x = a;
-        loop {
-            out.push(format!("{:0width$}", x, width = width));
-            if x == b {
-                break;
-            }
-            if a < b {
-                x += step;
-                if x > b {
-                    break;
-                }
-            } else {
-                x -= step;
-                if x < b {
-                    break;
-                }
-            }
-        }
-        return Some(out);
+        p.parse().ok()
+    };
+    let rstart = num(parts[0])?;
+    let rend = num(parts[1])?;
+    let rincr = match parts.get(2) {
+        Some(p) => num(p).filter(|&n| n != 0)?,
+        None => 1,
+    };
+    let zero = |p: &str| p.strip_prefix('-').unwrap_or(p).starts_with('0');
+    let minw = if zero(parts[0]) {
+        parts[0].len()
+    } else if zero(parts[1]) {
+        parts[1].len()
+    } else if parts.get(2).is_some_and(|p| zero(p)) {
+        parts[2].len()
+    } else {
+        0
+    };
+    // Ends near the limits of i64 overflow differences and steps.
+    let (mut rstart, mut rend) = (i128::from(rstart), i128::from(rend));
+    let mut rincr = i128::from(rincr);
+    let mut rev = false;
+    if rincr < 0 {
+        rincr = -rincr;
+        rev = !rev;
     }
-    let (ca, cb): (Vec<char>, Vec<char>) = (parts[0].chars().collect(), parts[1].chars().collect());
-    if ca.len() == 1 && cb.len() == 1 && ca[0].is_ascii_alphabetic() && cb[0].is_ascii_alphabetic()
-    {
-        let (a, b) = (ca[0] as i64, cb[0] as i64);
-        let mut out = Vec::new();
-        let mut x = a;
-        loop {
-            out.push(char::from_u32(x as u32)?.to_string());
-            if x == b {
-                break;
-            }
-            if a < b {
-                x += step;
-                if x > b {
-                    break;
-                }
-            } else {
-                x -= step;
-                if x < b {
-                    break;
-                }
-            }
-        }
-        return Some(out);
+    if rstart > rend {
+        std::mem::swap(&mut rstart, &mut rend);
+        rev = !rev;
+    } else if rincr > 1 {
+        rend -= (rend - rstart) % rincr;
     }
-    None
+    if (rend - rstart) / rincr > 100_000 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut x = rend;
+    while x >= rstart {
+        out.push(format!("{:0width$}", x, width = minw));
+        x -= rincr;
+    }
+    // Generated from the top: ascending unless reversed.
+    if !rev {
+        out.reverse();
+    }
+    Some((out, false))
 }
 
 // ---- field splitting and pathname expansion -------------------------------
@@ -3287,12 +4497,53 @@ fn split_field(field: &[(char, u8)], ifs: &str) -> Vec<Vec<(char, u8)>> {
 enum Globbed {
     // Not a pattern, or globbing is off.
     Word(String),
+    // A malformed pattern (BAD_PATTERN).
+    Bad(String),
     Matches(Vec<String>),
     // A pattern that matched nothing, with its literal text.
     NoMatch(String),
 }
 
+// An unescaped `[` with text but no `]` after it (a lone `[`, the test
+// command, is fine).
+fn unclosed_bracket(pat: &str) -> bool {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut k = 0;
+    while k < chars.len() {
+        match chars[k] {
+            '\\' => k += 1,
+            '[' => return chars.len() > 1 && !chars[k + 1..].contains(&']'),
+            _ => {}
+        }
+        k += 1;
+    }
+    false
+}
+
 fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
+    // GLOB_SUBST: a substituted `~name` at the start is expanded too.
+    let expanded;
+    let piece = match piece.first() {
+        Some(&('~', f))
+            if do_glob
+                && f & (Q | NG | MARK) == 0
+                && !crate::options::is_set("shfileexpansion") =>
+        {
+            let chars: Vec<char> = piece.iter().map(|&(c, _)| c).collect();
+            match tilde(&chars, 0, false) {
+                Some((dir, end)) => {
+                    expanded = dir
+                        .chars()
+                        .map(|c| (c, Q))
+                        .chain(piece[end..].iter().copied())
+                        .collect::<Vec<_>>();
+                    &expanded[..]
+                }
+                None => piece,
+            }
+        }
+        _ => piece,
+    };
     let literal: String = piece
         .iter()
         .filter(|(_, f)| f & MARK == 0)
@@ -3307,10 +4558,15 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
         if f & MARK != 0 {
             continue;
         }
-        if (f & (Q | NG) != 0 && "*?[]()|<>^#~\\".contains(c)) || (c == '\\' && f & (Q | NG) == 0) {
+        if (f & (Q | NG) != 0 && "*?[]()|<>^#~\\!-".contains(c)) || (c == '\\' && f & (Q | NG) == 0)
+        {
             pat.push('\\');
         }
         pat.push(c);
+    }
+    // BAD_PATTERN: an unclosed `[` is an error rather than text.
+    if crate::options::is_set("badpattern") && unclosed_bracket(&pat) {
+        return Globbed::Bad(literal);
     }
     let (base, quals) = crate::globber::split_qualifiers(&pat);
     if quals.is_none() && !crate::pattern::has_meta(base) {
@@ -3354,6 +4610,7 @@ fn finish_all(ctxs: Vec<Ctx>, do_glob: bool) -> ExpResult<Vec<String>> {
             for piece in split_field(field, &ifs) {
                 match glob_piece(&piece, do_glob) {
                     Globbed::Word(w) => out.push(w),
+                    Globbed::Bad(w) => return fail(&format!("bad pattern: {}", w)),
                     Globbed::Matches(m) => {
                         any_match = true;
                         out.extend(m);
@@ -3385,9 +4642,37 @@ pub fn expand_words(words: &[String]) -> ExpResult<Vec<String>> {
     let do_glob = !opt_set(OPT_NOGLOB);
     let mut ctxs = Vec::new();
     let braces = !crate::options::is_set("ignorebraces");
-    for word in words {
+    let magic = crate::options::is_set("magicequalsubst");
+    // KSH_TYPESET: typeset run as a builtin does not split `name=value`.
+    let ksh_typeset = crate::options::is_set("kshtypeset")
+        && words.first().is_some_and(|w| {
+            matches!(
+                w.as_str(),
+                "typeset" | "declare" | "local" | "export" | "readonly" | "integer" | "float"
+            )
+        });
+    for (k, word) in words.iter().enumerate() {
         let chars: Vec<char> = word.chars().collect();
+        // With MAGIC_EQUAL_SUBST, KSH_TYPESET keeps every `x=...`
+        // argument unsplit.
+        let unsplit = (ksh_typeset && crate::lexer::is_assignment(word))
+            || (magic && crate::options::is_set("kshtypeset") && word.contains('='));
+        if k > 0 && unsplit {
+            let mut c = Ctx::new(false, true);
+            c.magic_eq = magic;
+            walk(&chars, Mode::Unquoted, &mut c)?;
+            let v = c.joined();
+            let mut ctx = Ctx::new(true, false);
+            ctx.fields = vec![v.chars().map(|c| (c, Q)).collect()];
+            ctxs.push(ctx);
+            continue;
+        }
         let mut ctx = Ctx::new(true, false);
+        // MAGIC_EQUAL_SUBST: `~` after the `=` of an argument expands.
+        if k > 0 && magic && word.contains('=') {
+            ctx.assign = true;
+            ctx.magic_eq = true;
+        }
         walk(&chars, Mode::Unquoted, &mut ctx)?;
         if braces {
             ctx.fields = ctx.fields.iter().flat_map(|f| brace_expand(f)).collect();
@@ -3412,6 +4697,25 @@ pub fn expand_assign_value(word: &str) -> ExpResult<String> {
     let mut ctx = Ctx::new(false, true);
     walk(&chars, Mode::Unquoted, &mut ctx)?;
     Ok(ctx.joined())
+}
+
+/// A pattern for XTRACE: quoted characters that would be special or
+/// split shown with a backslash (`'f x'*` traces as `f\ x*`).
+pub fn pattern_for_trace(word: &str) -> ExpResult<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let mut ctx = Ctx::new(false, false);
+    walk(&chars, Mode::Unquoted, &mut ctx)?;
+    let mut out = String::new();
+    for &(c, f) in ctx.fields.iter().flatten() {
+        if f & MARK != 0 {
+            continue;
+        }
+        if f & (Q | NG) != 0 && (c.is_whitespace() || "*?[]()|<>^#~\\'\"$`;&".contains(c)) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Ok(out)
 }
 
 /// Expands a word used as a pattern; quoted characters match literally.
@@ -3545,5 +4849,25 @@ mod tests {
         let _l = setup();
         var_set("x", "v", false);
         assert_eq!(expand_heredoc("'$x' \"\\$x\"\n").unwrap(), "'v' \"$x\"\n");
+    }
+
+    #[test]
+    fn brace_sequences_at_the_ends_of_i64_do_not_overflow() {
+        let seq = |s: &str| sequence(&s.chars().collect::<Vec<_>>()).map(|(v, _)| v);
+        // The step past the minimum wrapped around and never ended.
+        assert_eq!(
+            seq("-9223372036854775808..-9223372036854775807"),
+            Some(vec![
+                "-9223372036854775808".to_string(),
+                "-9223372036854775807".to_string()
+            ])
+        );
+        // Too long a range is left unexpanded instead of filling memory.
+        assert_eq!(seq("-9223372036854775808..0"), None);
+        assert_eq!(seq("0..9223372036854775807"), None);
+        assert_eq!(
+            seq("1..10..-9223372036854775808"),
+            Some(vec!["1".to_string()])
+        );
     }
 }

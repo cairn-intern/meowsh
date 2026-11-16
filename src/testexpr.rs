@@ -8,6 +8,9 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
 type TResult = Result<bool, String>;
 
+// `-o` with an unknown option: an error (status 3) that `||` forgives.
+const NO_OPTION: &str = "\u{3}no such option";
+
 fn is_unary(op: &str) -> bool {
     matches!(
         op,
@@ -113,8 +116,17 @@ fn unary(op: &str, arg: &str) -> TResult {
         }
         "-v" => var_is_set(arg),
         // -o option: whether the shell option is on.
-        "-o" => crate::options::resolve(arg)
-            .is_some_and(|(name, on)| crate::options::is_set(name) == on),
+        "-o" => match crate::options::resolve(arg) {
+            Some((name, on)) => crate::options::is_set(name) == on,
+            // zsh: an error (status 3) unless POSIX_BUILTINS.
+            None if crate::options::is_set("posixbuiltins") || crate::exec::sh_emulation_pub() => {
+                false
+            }
+            None => {
+                crate::shell::shell_err(&format!("no such option: {}", arg));
+                return Err(NO_OPTION.to_string());
+            }
+        },
         _ => return Err(format!("{}: unary operator expected", op)),
     })
 }
@@ -122,8 +134,33 @@ fn unary(op: &str, arg: &str) -> TResult {
 // `-v name` or `-v name[subscript]`.
 fn var_is_set(arg: &str) -> bool {
     let Some((name, sub)) = arg.strip_suffix(']').and_then(|a| a.split_once('[')) else {
-        return crate::shell::var_exists(arg);
+        return crate::lexer::is_valid_name(arg) && crate::shell::var_exists(arg)
+            || arg.chars().all(|c| c.is_ascii_digit()) && crate::shell::var_exists(arg);
     };
+    // zsh: whatever `${+name[sub]}` says, for one subscript.
+    if !crate::exec::sh_emulation_pub() {
+        if sub.contains(']') || !crate::lexer::is_valid_name(name) {
+            return false;
+        }
+        // A scalar's characters are not elements.
+        if crate::shell::with_shell(|s| s.scalar(name).is_some()) {
+            return false;
+        }
+        // (i)/(I) give an index: is there an element there?
+        if (sub.starts_with("(i)") || sub.starts_with("(I)"))
+            && crate::shell::with_shell(|s| s.array(name).is_some())
+        {
+            let len = crate::shell::with_shell(|s| s.array(name).map_or(0, |a| a.len()));
+            return expand_string(&format!("${{{}}}", arg))
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .is_some_and(|k| k >= 1 && k <= len);
+        }
+        let set = crate::shell::without_assign_warnings(|| {
+            crate::sys::with_stderr_silenced(|| expand_string(&format!("${{+{}}}", arg)))
+        });
+        return set.is_ok_and(|v| v == "1");
+    }
     if let Some(v) = crate::shell::assoc_get(name, sub) {
         return !v.is_empty()
             || crate::shell::assoc_keys(name).is_some_and(|k| k.iter().any(|k| k == sub));
@@ -164,6 +201,83 @@ fn regex_match(s: &str, re: &str) -> TResult {
     }
 }
 
+// Capturing groups in an extended regex: unescaped `(` outside `[...]`.
+fn regex_groups(re: &str) -> usize {
+    let c: Vec<char> = re.chars().collect();
+    let (mut n, mut i, mut in_set) = (0, 0, false);
+    while i < c.len() {
+        match c[i] {
+            '\\' => i += 1,
+            '[' if !in_set => {
+                in_set = true;
+                // `[]...]` and `[^]...]`: a leading `]` is literal.
+                if c.get(i + 1) == Some(&'^') {
+                    i += 1;
+                }
+                if c.get(i + 1) == Some(&']') {
+                    i += 1;
+                }
+            }
+            ']' if in_set => in_set = false,
+            '(' if !in_set => n += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    n
+}
+
+// `[[ s =~ re ]]`: on a match, zsh sets $MATCH, $MBEGIN, $MEND and
+// $match, $mbegin, $mend for the groups (1-based character offsets).
+fn regex_match_set(s: &str, re: &str) -> TResult {
+    let (Ok(cs), Ok(cre)) = (CString::new(s), CString::new(re)) else {
+        return Ok(false);
+    };
+    unsafe {
+        let mut preg: libc::regex_t = std::mem::zeroed();
+        if libc::regcomp(&mut preg, cre.as_ptr(), libc::REG_EXTENDED) != 0 {
+            return Err(format!("failed to compile regex: {}", re));
+        }
+        let n = regex_groups(re) + 1;
+        let mut m = vec![
+            libc::regmatch_t {
+                rm_so: -1,
+                rm_eo: -1
+            };
+            n
+        ];
+        let r = libc::regexec(&preg, cs.as_ptr(), n, m.as_mut_ptr(), 0);
+        libc::regfree(&mut preg);
+        if r != 0 {
+            return Ok(false);
+        }
+        let bytes = s.as_bytes();
+        let chars_to = |b: usize| String::from_utf8_lossy(&bytes[..b]).chars().count();
+        let part = |b: usize, e: usize| String::from_utf8_lossy(&bytes[b..e]).into_owned();
+        let (b0, e0) = (m[0].rm_so as usize, m[0].rm_eo as usize);
+        crate::shell::var_set("MATCH", &part(b0, e0), false);
+        crate::shell::var_set("MBEGIN", &(chars_to(b0) + 1).to_string(), false);
+        crate::shell::var_set("MEND", &chars_to(e0).to_string(), false);
+        let (mut mt, mut mb, mut me) = (Vec::new(), Vec::new(), Vec::new());
+        for g in &m[1..] {
+            if g.rm_so < 0 {
+                mt.push(String::new());
+                mb.push("-1".to_string());
+                me.push("-1".to_string());
+            } else {
+                let (b, e) = (g.rm_so as usize, g.rm_eo as usize);
+                mt.push(part(b, e));
+                mb.push((chars_to(b) + 1).to_string());
+                me.push(chars_to(e).to_string());
+            }
+        }
+        crate::shell::array_set("match", mt);
+        crate::shell::array_set("mbegin", mb);
+        crate::shell::array_set("mend", me);
+        Ok(true)
+    }
+}
+
 fn binary(a: &str, op: &str, b: &str) -> TResult {
     Ok(match op {
         "=" | "==" => a == b,
@@ -191,8 +305,9 @@ fn binary(a: &str, op: &str, b: &str) -> TResult {
                         x < y
                     }
                 }
-                (Some(_), None) => op == "-nt",
-                (None, Some(_)) => op == "-ot",
+                // zsh: a missing file makes either test false.
+                (Some(_), None) => op == "-nt" && crate::exec::sh_emulation_pub(),
+                (None, Some(_)) => op == "-ot" && crate::exec::sh_emulation_pub(),
                 _ => false,
             }
         }
@@ -303,6 +418,8 @@ fn eval_test(args: &[String]) -> TResult {
                 Ok(!eval_test(&args[1..])?)
             } else if a[0] == "(" && a[2] == ")" {
                 Ok(!a[1].is_empty())
+            } else if is_unary(a[0]) && !crate::exec::sh_emulation_pub() {
+                Err("too many arguments".to_string())
             } else {
                 Err(format!("{}: binary operator expected", a[1]))
             }
@@ -313,7 +430,11 @@ fn eval_test(args: &[String]) -> TResult {
             let mut p = TestParser { args, pos: 0 };
             let v = p.or()?;
             if p.pos != args.len() {
-                return Err(format!("{}: too many arguments", args[p.pos]));
+                return Err(if crate::exec::sh_emulation_pub() {
+                    format!("{}: too many arguments", args[p.pos])
+                } else {
+                    "too many arguments".to_string()
+                });
             }
             Ok(v)
         }
@@ -349,6 +470,12 @@ struct DbParser<'a> {
 }
 
 fn exp(word: &str) -> Result<String, String> {
+    // `(#q...)` forces filename generation for an operand.
+    if word.ends_with(')') && word.contains("(#q") && crate::options::quick("extendedglob") {
+        return crate::expand::expand_words(&[word.to_string()])
+            .map(|w| w.join(" "))
+            .map_err(|_| String::new());
+    }
     expand_string(word).map_err(|_| String::new())
 }
 
@@ -358,13 +485,19 @@ impl DbParser<'_> {
     }
 
     fn or(&mut self, run: bool) -> TResult {
-        let mut v = self.and(run)?;
+        let mut v = self.and(run);
         while self.peek() == Some("||") {
             self.pos += 1;
-            let r = self.and(run && !v)?;
-            v = v || r;
+            // An unknown `-o` option counts as false here.
+            let left = match v {
+                Err(e) if e == NO_OPTION => false,
+                Err(e) => return Err(e),
+                Ok(b) => b,
+            };
+            let r = self.and(run && !left)?;
+            v = Ok(left || r);
         }
-        Ok(v)
+        v
     }
 
     fn and(&mut self, run: bool) -> TResult {
@@ -440,8 +573,50 @@ impl DbParser<'_> {
                         let m = crate::pattern::matches(&pat, &l);
                         Ok(if op == "!=" { !m } else { m })
                     }
+                    "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+                        // zsh evaluates both sides as arithmetic.
+                        let r = exp(&rhs)?;
+                        let m = |t: &str| {
+                            crate::arith::eval(t).map_err(|e| {
+                                crate::shell::shell_err(&e);
+                                String::new()
+                            })
+                        };
+                        let (a, b) = (m(&l)?, m(&r)?);
+                        Ok(match op.as_str() {
+                            "-eq" => a == b,
+                            "-ne" => a != b,
+                            "-lt" => a < b,
+                            "-le" => a <= b,
+                            "-gt" => a > b,
+                            _ => a >= b,
+                        })
+                    }
+                    "=~" => regex_match_set(&l, &exp(&rhs)?),
                     _ => binary(&l, &op, &exp(&rhs)?),
                 };
+            }
+        }
+        // zsh: `-word arg` with an unknown -word is an unknown condition.
+        if t.starts_with('-')
+            && t.len() > 1
+            && !is_unary(&t)
+            && next.is_some_and(|n| {
+                !matches!(n, "&&" | "||" | ")" | "=" | "==" | "!=" | "<" | ">" | "=~")
+                    && !is_binary(n)
+            })
+        {
+            return Err(format!("unknown condition: {}", t));
+        }
+        if let Some(op) =
+            next.filter(|n| n.starts_with('-') && n.len() > 1 && !is_binary(n) && !is_unary(n))
+        {
+            if self
+                .toks
+                .get(self.pos + 2)
+                .is_some_and(|x| !matches!(x.as_str(), "&&" | "||" | ")"))
+            {
+                return Err(format!("unknown condition: {}", op));
             }
         }
         if is_unary(&t) && next.is_some() && !matches!(next, Some("&&") | Some("||") | Some(")")) {
@@ -476,9 +651,10 @@ pub fn eval_dbracket(words: &[String]) -> i32 {
     match result {
         Ok(true) => 0,
         Ok(false) => 1,
+        Err(e) if e == NO_OPTION => 3,
         Err(e) => {
             if !e.is_empty() {
-                err_line(&format!("meowsh: [[: {}", e));
+                crate::shell::shell_err(&e);
             }
             2
         }

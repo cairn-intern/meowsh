@@ -31,6 +31,14 @@ type AliasLookup = Box<dyn Fn(&str) -> Option<String>>;
 pub struct Parser {
     lex: Lexer,
     peeked: Option<Tok>,
+    // Tokens split off a word (`{cmd` → `{` `cmd`), read before the
+    // lexer's next one; the last is next.
+    queued: Vec<Tok>,
+    // The peeked token came from `queued`, not from the lexer.
+    peeked_queued: bool,
+    // The last token read other than a newline, for zsh's
+    // "parse error near" at end of input.
+    last: Option<Tok>,
     final_input: bool,
     // Aliases currently being expanded and the input offset where each
     // expansion ends; an alias is not re-expanded inside its own text.
@@ -47,11 +55,20 @@ pub struct Parser {
     pending_redir: Option<Redir>,
 }
 
+// Whether zsh's brace splitting applies (`{cmd`, `cmd}`): not with
+// IGNORE_BRACES or in sh emulation.
+fn braces_split() -> bool {
+    !crate::options::is_set("ignorebraces") && !crate::exec::sh_emulation_pub()
+}
+
 impl Parser {
     pub fn new(input: &str, final_input: bool) -> Self {
         Parser {
             lex: Lexer::new(input, final_input),
             peeked: None,
+            queued: Vec::new(),
+            peeked_queued: false,
+            last: None,
             final_input,
             alias_guard: Vec::new(),
             alias_next: false,
@@ -87,21 +104,35 @@ impl Parser {
 
     fn peek(&mut self) -> PResult<&Tok> {
         if self.peeked.is_none() {
-            self.peeked = Some(self.lex.next_token()?);
+            self.peeked_queued = !self.queued.is_empty();
+            self.peeked = Some(match self.queued.pop() {
+                Some(t) => t,
+                None => self.lex.next_token()?,
+            });
         }
         Ok(self.peeked.as_ref().unwrap())
     }
 
     fn next(&mut self) -> PResult<Tok> {
-        if let Some(t) = self.peeked.take() {
-            return Ok(t);
+        let t = match self.peeked.take() {
+            Some(t) => t,
+            None => match self.queued.pop() {
+                Some(t) => t,
+                None => self.lex.next_token()?,
+            },
+        };
+        if !matches!(t, Tok::Newline | Tok::Eof) {
+            self.last = Some(t.clone());
         }
-        Ok(self.lex.next_token()?)
+        Ok(t)
     }
 
     fn eof_error(&self, what: &str) -> ParseError {
         if self.final_input {
-            ParseError::Syntax(format!("unexpected end of file (expecting {})", what))
+            ParseError::Syntax(match &self.last {
+                Some(t) => format!("parse error near `{}'", tok_text(t)),
+                None => format!("unexpected end of file (expecting {})", what),
+            })
         } else {
             ParseError::Incomplete
         }
@@ -181,6 +212,11 @@ impl Parser {
         loop {
             if !top_level {
                 self.skip_newlines()?;
+                // zsh: a nested list may start with `;` (`do; ...`).
+                while items.is_empty() && self.peek_is_op(";")? {
+                    self.next()?;
+                    self.skip_newlines()?;
+                }
             }
             if self.at_list_end()? {
                 break;
@@ -273,6 +309,12 @@ impl Parser {
 
     // pipeline: ['!'] command ('|' linebreak command)*
     fn parse_pipeline(&mut self) -> PResult<Node> {
+        // zsh's `time` reserved word times the pipeline after it.
+        if self.peek_is_word("time")? && !crate::builtins::is_disabled('r', "time") {
+            self.next()?;
+            let inner = self.parse_pipeline()?;
+            return Ok(Node::Time(Box::new(inner)));
+        }
         let mut bang = false;
         while self.peek_is_word("!")? {
             self.next()?;
@@ -349,13 +391,20 @@ impl Parser {
             Tok::Word(w) => w.clone(),
             _ => return Ok(false),
         };
+        // A word split off another has no input position of its own.
+        if self.peeked_queued || !self.queued.is_empty() {
+            return Ok(false);
+        }
         if self.alias_blocked(&name) {
             return Ok(false);
         }
         let found = if global {
             (self.galias_lookup)(&name)
         } else {
-            (self.alias_lookup)(&name).or_else(|| (self.galias_lookup)(&name))
+            (self.alias_lookup)(&name)
+                .or_else(|| (self.galias_lookup)(&name))
+                // `file.ext` runs the suffix alias for ext on the file.
+                .or_else(|| crate::shell::salias_for(&name).map(|v| format!("{} {}", v, name)))
         };
         let Some(value) = found else {
             return Ok(false);
@@ -383,6 +432,15 @@ impl Parser {
             // `disable -r word`: an ordinary command word.
             Tok::Word(w) if crate::builtins::is_disabled('r', w) => {
                 return self.parse_simple_or_funcdef()
+            }
+            // zsh: `{cmd` at the start of a command opens a group.
+            Tok::Word(w)
+                if w.len() > 1 && w.starts_with('{') && !w.starts_with("{}") && braces_split() =>
+            {
+                let rest = w[1..].to_string();
+                self.peeked = Some(Tok::Word("{".to_string()));
+                self.queued.push(Tok::Word(rest));
+                return self.parse_command();
             }
             Tok::Word(w) => match w.as_str() {
                 "if" => self.parse_if()?,
@@ -412,10 +470,17 @@ impl Parser {
                             let t = self.peek()?.clone();
                             return Err(self.unexpected(&t));
                         }
-                        let always = self.parse_command()?;
+                        // Only the brace group: redirections after it
+                        // apply to the whole construct.
+                        self.next()?;
+                        self.brace_depth += 1;
+                        let always = self.parse_list(false);
+                        self.brace_depth -= 1;
+                        let always = always?;
+                        self.expect_word("}")?;
                         Node::Always {
                             body: Box::new(Node::Brace(Box::new(body))),
-                            always: Box::new(always),
+                            always: Box::new(Node::Brace(Box::new(always))),
                         }
                     } else {
                         Node::Brace(Box::new(body))
@@ -439,8 +504,9 @@ impl Parser {
             }
             Tok::Arith(e) => {
                 let e = e.clone();
+                let line = self.lex.line();
                 self.next()?;
-                Node::Arith(e)
+                Node::Arith(e, line)
             }
             Tok::Eof => return Err(self.eof_error("a command")),
             Tok::IoNumber(_)
@@ -450,6 +516,12 @@ impl Parser {
             | Tok::Op(">>")
             | Tok::Op("<<")
             | Tok::Op("<<-")
+            | Tok::Op("<<<")
+            | Tok::Op(">&|")
+            | Tok::Op(">&!")
+            | Tok::Op(">>&")
+            | Tok::Op("&>>|")
+            | Tok::Op("&>>!")
             | Tok::Op("<&")
             | Tok::Op(">&")
             | Tok::Op("<>")
@@ -491,12 +563,12 @@ impl Parser {
     fn parse_anon_func(&mut self) -> PResult<Node> {
         let line = self.lex.line();
         self.next()?; // )
-        self.anon_func_rest(line)
+        self.anon_func_rest(line, false)
     }
 
     // The body of `() ...` or `function { ... }`, then its arguments and
     // redirections. An argument may start with a glob group: `(a|b)*`.
-    fn anon_func_rest(&mut self, line: usize) -> PResult<Node> {
+    fn anon_func_rest(&mut self, line: usize, traced: bool) -> PResult<Node> {
         self.skip_newlines()?;
         let body = self.parse_command()?;
         let mut args = Vec::new();
@@ -526,6 +598,7 @@ impl Parser {
             body: std::sync::Arc::new(body),
             args,
             line,
+            traced,
         };
         Ok(if redirs.is_empty() {
             node
@@ -565,7 +638,8 @@ impl Parser {
             "<" => (RedirOp::Read, 0),
             ">" => (RedirOp::Write, 1),
             ">|" | ">!" => (RedirOp::Clobber, 1),
-            ">>" | ">>|" | ">>!" => (RedirOp::Append, 1),
+            ">>" => (RedirOp::Append, 1),
+            ">>|" | ">>!" => (RedirOp::AppendClobber, 1),
             "<>" => (RedirOp::ReadWrite, 0),
             "<&" => (RedirOp::DupIn, 0),
             ">&" => (RedirOp::DupOut, 1),
@@ -590,7 +664,9 @@ impl Parser {
                 });
                 return Ok(Some(Redir {
                     fd: 1,
-                    op: if op.contains(">>") {
+                    op: if op.contains(">>") && (op.ends_with('|') || op.ends_with('!')) {
+                        RedirOp::AppendClobber
+                    } else if op.contains(">>") {
                         RedirOp::Append
                     } else if op.ends_with('|') || op.ends_with('!') {
                         RedirOp::Clobber
@@ -638,8 +714,14 @@ impl Parser {
     }
 
     fn parse_simple_or_funcdef(&mut self) -> PResult<Node> {
+        // The first word is already read: its line is where we start.
+        let line = if self.peeked.is_some() && !self.peeked_queued {
+            self.lex.tok_line()
+        } else {
+            self.lex.line()
+        };
         let mut cmd = SimpleCmd {
-            line: self.lex.line(),
+            line,
             ..SimpleCmd::default()
         };
         let line = cmd.line;
@@ -688,6 +770,18 @@ impl Parser {
                 Tok::Word(w) => w.clone(),
                 _ => break,
             };
+            // zsh: in a group, `cmd}` ends it (unless the braces pair up).
+            if self.brace_depth > 0
+                && word.len() > 1
+                && word.ends_with('}')
+                && word.matches('}').count() > word.matches('{').count()
+                && !word.contains(['\'', '"', '\\', '$'])
+                && braces_split()
+            {
+                self.peeked = Some(Tok::Word(word[..word.len() - 1].to_string()));
+                self.queued.push(Tok::Word("}".to_string()));
+                continue;
+            }
             if word == "}"
                 && self.brace_depth > 0
                 && !(cmd.words.is_empty() && cmd.assigns.is_empty() && cmd.redirs.is_empty())
@@ -749,6 +843,7 @@ impl Parser {
                             name,
                             body: Box::new(body.clone()),
                             line,
+                            traced: false,
                         },
                         background: false,
                     })
@@ -775,6 +870,7 @@ impl Parser {
                     name: word,
                     body: Box::new(body),
                     line,
+                    traced: false,
                 });
             }
             cmd.words.push(word);
@@ -795,9 +891,22 @@ impl Parser {
     fn parse_function_keyword(&mut self) -> PResult<Node> {
         let line = self.lex.line();
         self.next()?;
+        // `function -T name`: traced; `--` ends the options.
+        let mut traced = false;
+        loop {
+            if self.peek_is_word("-T")? {
+                self.next()?;
+                traced = true;
+            } else if self.peek_is_word("--")? {
+                self.next()?;
+                break;
+            } else {
+                break;
+            }
+        }
         // `function { ... } args`: an anonymous function.
         if self.peek_is_word("{")? {
-            return self.anon_func_rest(line);
+            return self.anon_func_rest(line, traced);
         }
         let mut names = vec![match self.next()? {
             Tok::Word(w) => w,
@@ -825,6 +934,7 @@ impl Parser {
                     name,
                     body: Box::new(body.clone()),
                     line,
+                    traced,
                 },
                 background: false,
             })
@@ -932,7 +1042,14 @@ impl Parser {
 
     // The body of a loop: `do list done`, `{ list }`, or a sublist (short
     // form).
+    // `short`: the option allowing a body without `do`/`{` (SHORT_LOOPS,
+    // or SHORT_REPEAT for repeat).
     fn parse_loop_body(&mut self) -> PResult<Node> {
+        let short = crate::options::is_set("shortloops");
+        self.parse_loop_body_with(short)
+    }
+
+    fn parse_loop_body_with(&mut self, short: bool) -> PResult<Node> {
         self.skip_newlines()?;
         if self.peek_is_word("do")? {
             self.next()?;
@@ -943,7 +1060,13 @@ impl Parser {
         if self.peek_is_word("{")? {
             return self.parse_command();
         }
-        if self.at_command_end()? {
+        // CSH_JUNKIE_LOOPS: `for x in a b; cmds; end`.
+        if crate::options::is_set("cshjunkieloops") {
+            let body = self.parse_list(false)?;
+            self.expect_word("end")?;
+            return Ok(body);
+        }
+        if self.at_command_end()? || !short {
             let t = self.peek()?.clone();
             return Err(if t == Tok::Eof {
                 self.eof_error("`do'")
@@ -966,7 +1089,8 @@ impl Parser {
         if self.peek_is_op(";")? {
             self.next()?;
         }
-        let body = self.parse_loop_body()?;
+        let short = crate::options::is_set("shortloops") || crate::options::is_set("shortrepeat");
+        let body = self.parse_loop_body_with(short)?;
         Ok(Node::Repeat {
             count,
             body: Box::new(body),
@@ -1080,8 +1204,9 @@ impl Parser {
                 body: Box::new(body),
             });
         }
+        // zsh also loops over positional parameters: `for 1 in ...`.
         let mut vars = vec![match self.next()? {
-            Tok::Word(w) if is_valid_name(&w) => w,
+            Tok::Word(w) if is_valid_name(&w) || w.chars().all(|c| c.is_ascii_digit()) => w,
             Tok::Eof => return Err(self.eof_error("a variable name")),
             t => return Err(self.unexpected(&t)),
         }];
@@ -1271,6 +1396,7 @@ impl Parser {
     // [[ expr ]]: operands and operators are kept as raw words and
     // evaluated by the executor.
     fn parse_dbracket(&mut self) -> PResult<Node> {
+        let line = self.lex.line();
         self.next()?; // [[
         let mut args = Vec::new();
         loop {
@@ -1289,7 +1415,7 @@ impl Parser {
                 Tok::Eof => return Err(self.eof_error("`]]'")),
             }
         }
-        Ok(Node::DBracket(args))
+        Ok(Node::DBracket(args, line))
     }
 }
 
@@ -1385,7 +1511,8 @@ fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
         | Node::ForArith { body, .. }
         | Node::Repeat { body, .. }
         | Node::Select { body, .. }
-        | Node::Coproc(body) => fill_heredocs(body, bodies),
+        | Node::Coproc(body)
+        | Node::Time(body) => fill_heredocs(body, bodies),
         Node::Case { items, .. } => {
             for item in items {
                 if let Some(b) = item.body.as_mut() {
@@ -1403,7 +1530,7 @@ fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
                 fill_heredocs(b, bodies);
             }
         }
-        Node::DBracket(_) | Node::Arith(_) | Node::Empty => {}
+        Node::DBracket(..) | Node::Arith(..) | Node::Empty => {}
     }
 }
 
@@ -1412,6 +1539,7 @@ mod tests {
     use super::*;
 
     fn parse_one(s: &str) -> Node {
+        let _g = crate::zsh_test_guard();
         let mut p = Parser::without_aliases(s, true);
         p.parse_complete_command().unwrap().unwrap()
     }
@@ -1497,7 +1625,7 @@ mod tests {
 
     #[test]
     fn arithmetic_command_and_c_style_for() {
-        assert!(matches!(parse_one("(( x > 1 ))"), Node::Arith(e) if e == " x > 1 "));
+        assert!(matches!(parse_one("(( x > 1 ))"), Node::Arith(e, _) if e == " x > 1 "));
         assert!(matches!(
             parse_one("for ((i=0; i<3; i++)); do echo $i; done"),
             Node::ForArith { .. }

@@ -84,6 +84,12 @@ pub fn shell_init() {
     set(&mut shell, "ZSH_VERSION", "5.9-meowsh".to_string(), 0);
     set(
         &mut shell,
+        "ZSH_PATCHLEVEL",
+        format!("zsh-5.9-meowsh-0-meowsh-{}", env!("CARGO_PKG_VERSION")),
+        0,
+    );
+    set(
+        &mut shell,
         "MEOWSH_VERSION",
         env!("CARGO_PKG_VERSION").to_string(),
         0,
@@ -95,7 +101,15 @@ pub fn shell_init() {
     set(&mut shell, "PPID", ppid.to_string(), 0);
     let shlvl = shell
         .scalar("SHLVL")
-        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| {
+            // Like zsh's strtol: the leading number, never an expression.
+            let t = v.trim_start();
+            let end = t
+                .char_indices()
+                .find(|&(k, c)| !(c.is_ascii_digit() || (k == 0 && c == '-')))
+                .map_or(t.len(), |(k, _)| k);
+            t[..end].parse::<i64>().unwrap_or(0)
+        })
         .unwrap_or(0)
         .max(0)
         + 1;
@@ -155,16 +169,42 @@ pub fn opt_set(flag: u32) -> bool {
     with_shell(|s| s.opts & flag != 0)
 }
 
+// With ALIASES off nothing is alias-expanded.
 pub fn alias_get(name: &str) -> Option<String> {
-    with_shell(|s| s.alias(name, false).cloned())
+    with_shell(|s| {
+        crate::options::is_set_in(s, "aliases")
+            .then(|| s.alias(name, false).cloned())
+            .flatten()
+    })
+}
+
+/// A suffix alias (`alias -s ext=cmd`) for a command word `file.ext`.
+pub fn salias_for(word: &str) -> Option<String> {
+    let (stem, ext) = word.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() {
+        return None;
+    }
+    with_shell(|s| {
+        crate::options::is_set_in(s, "aliases")
+            .then(|| {
+                s.assoc(crate::types::SALIASES)
+                    .and_then(|m| m.get(ext).cloned())
+            })
+            .flatten()
+    })
 }
 
 pub fn galias_get(name: &str) -> Option<String> {
-    with_shell(|s| s.alias(name, true).cloned())
+    with_shell(|s| {
+        crate::options::is_set_in(s, "aliases")
+            .then(|| s.alias(name, true).cloned())
+            .flatten()
+    })
 }
 
 /// Value of a parameter, or None if it is unset.
 pub fn var_get_opt(name: &str) -> Option<String> {
+    let _swap = crate::shell::RefSwap::enter(name);
     if var_exists(name) {
         Some(var_get(name))
     } else {
@@ -177,7 +217,8 @@ pub fn build_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
     let mut map: BTreeMap<String, String> = with_shell(|s| {
         s.params
             .iter()
-            .filter(|(_, p)| p.attrs & EXPORT != 0)
+            // SHLVL is always exported in zsh, even when recreated.
+            .filter(|(k, p)| p.attrs & EXPORT != 0 || k.as_str() == "SHLVL")
             .filter_map(|(k, p)| match &p.value {
                 Value::Scalar(v) => Some((k.clone(), v.clone())),
                 _ => None,
@@ -207,11 +248,62 @@ pub fn terminal_size() -> Option<(u16, u16)> {
     None
 }
 
+/// zsh's named directories (`hash -d name=dir`, `~name`).
+pub static NAMED_DIRS: std::sync::Mutex<BTreeMap<String, String>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+pub fn named_dir(name: &str) -> Option<String> {
+    NAMED_DIRS.lock().ok()?.get(name).cloned()
+}
+
+/// zsh's $zsh_eval_context: how the code now running was reached
+/// (toplevel, shfunc, eval, cmdsubst, trap, file, math, ...).
+pub static EVAL_CONTEXT: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+
+/// Runs `f` in eval context `ctx`.
+pub fn in_eval_context<R>(ctx: &'static str, f: impl FnOnce() -> R) -> R {
+    if let Ok(mut c) = EVAL_CONTEXT.lock() {
+        c.push(ctx);
+    }
+    let r = f();
+    if let Ok(mut c) = EVAL_CONTEXT.lock() {
+        c.pop();
+    }
+    r
+}
+
+pub fn eval_context() -> Vec<String> {
+    let mut v: Vec<String> = EVAL_CONTEXT
+        .lock()
+        .map(|c| c.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+    if v.is_empty() {
+        v.push("toplevel".to_string());
+    }
+    v
+}
+
+/// How many subshells deep this process is ($ZSH_SUBSHELL).
+pub static SUBSHELL_LEVEL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Parameters computed on each read, as in zsh. A user assignment to
 /// RANDOM reseeds it; the others ignore assignments.
 fn dynamic_var(name: &str) -> Option<String> {
     use std::sync::atomic::Ordering;
+    // A parameter of the same name shadows the special: a hidden (-h)
+    // local, or one that replaced the not-yet-loaded SRANDOM.
+    if DYNAMIC_NAMES.contains(&name) && with_shell(|s| s.param(name).is_some()) {
+        return None;
+    }
     match name {
+        "SRANDOM" => {
+            crate::typeset::SRANDOM_LOADED.store(true, Ordering::Relaxed);
+            let mut b = [0u8; 4];
+            unsafe {
+                libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, 4, 0);
+            }
+            Some(u32::from_ne_bytes(b).to_string())
+        }
         "RANDOM" => {
             let mut x = RANDOM_STATE.load(Ordering::Relaxed);
             if x == 0 {
@@ -244,11 +336,44 @@ fn dynamic_var(name: &str) -> Option<String> {
                 format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
             })
         }
+        "ZSH_SUBSHELL" => Some(SUBSHELL_LEVEL.load(Ordering::Relaxed).to_string()),
+        "LINENO" => Some(lineno().to_string()),
+        // zsh's user and group ids.
+        "UID" => Some(unsafe { libc::getuid() }.to_string()),
+        "EUID" => Some(unsafe { libc::geteuid() }.to_string()),
+        "GID" => Some(unsafe { libc::getgid() }.to_string()),
+        "EGID" => Some(unsafe { libc::getegid() }.to_string()),
+        "USERNAME" => unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            (!pw.is_null() && !(*pw).pw_name.is_null()).then(|| {
+                std::ffi::CStr::from_ptr((*pw).pw_name)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        },
         "COLUMNS" => terminal_size().map(|(c, _)| c.to_string()),
         "LINES" => terminal_size().map(|(_, r)| r.to_string()),
         _ => None,
     }
 }
+
+/// Specials computed on read; a parameter of the same name hides them.
+pub const DYNAMIC_NAMES: &[&str] = &[
+    "RANDOM",
+    "SRANDOM",
+    "SECONDS",
+    "EPOCHSECONDS",
+    "EPOCHREALTIME",
+    "ZSH_SUBSHELL",
+    "UID",
+    "EUID",
+    "GID",
+    "EGID",
+    "USERNAME",
+    "LINENO",
+    "COLUMNS",
+    "LINES",
+];
 
 /// Reseeds `$RANDOM` after `RANDOM=n`.
 pub fn seed_random(seed: u64) {
@@ -263,6 +388,11 @@ pub fn resolve_ref(name: &str) -> String {
     with_shell(|s| s.resolve_name(name))
 }
 
+/// The parameter name in a nameref target (without its subscript).
+pub fn split_target_pub(t: &str) -> String {
+    split_target(t).0
+}
+
 // Resolves a nameref target that carries a subscript: (name, sub).
 fn split_target(t: &str) -> (String, Option<String>) {
     match t.find('[') {
@@ -273,7 +403,18 @@ fn split_target(t: &str) -> (String, Option<String>) {
     }
 }
 
+/// True when `name` is, or leads through references to, a nameref that
+/// refers to nothing yet (a placeholder).
+pub fn placeholder_ref(name: &str) -> bool {
+    with_shell(|s| {
+        let t = s.resolve_name(name);
+        s.param(&t)
+            .is_some_and(|p| p.attrs & crate::params::NAMEREF != 0)
+    })
+}
+
 pub fn var_get(name: &str) -> String {
+    let _swap = crate::shell::RefSwap::enter(name);
     if let Some(v) = dynamic_var(name) {
         return v;
     }
@@ -302,6 +443,13 @@ pub fn var_get(name: &str) -> String {
         "!" => return format!("{}", shell.last_bg_pid),
         "0" => return shell.argv0.clone(),
         "#" => return format!("{}", shell.pos_params.len()),
+        // zsh's ARGC: the number of positional parameters.
+        "ARGC"
+            if shell.param("ARGC").is_none()
+                && matches!(shell.emulation, crate::options::Emulation::Zsh) =>
+        {
+            return format!("{}", shell.pos_params.len())
+        }
         "@" | "*" => return shell.pos_params.join(" "),
         "-" => return crate::options::flags_string(&shell),
         _ => {}
@@ -328,14 +476,30 @@ pub fn var_get(name: &str) -> String {
 }
 
 pub fn var_exists(name: &str) -> bool {
+    let _swap = crate::shell::RefSwap::enter(name);
     let resolved = resolve_ref(name);
     if resolved != name {
         return var_exists(&split_target(&resolved).0);
     }
-    if matches!(
-        name,
-        "RANDOM" | "SECONDS" | "EPOCHSECONDS" | "EPOCHREALTIME"
-    ) || (matches!(name, "COLUMNS" | "LINES") && terminal_size().is_some())
+    let shadowed = DYNAMIC_NAMES.contains(&name) && with_shell(|s| s.param(name).is_some());
+    if !shadowed
+        && matches!(
+            name,
+            "RANDOM"
+                | "SRANDOM"
+                | "SECONDS"
+                | "EPOCHSECONDS"
+                | "EPOCHREALTIME"
+                | "ZSH_SUBSHELL"
+                | "UID"
+                | "EUID"
+                | "GID"
+                | "EGID"
+                | "USERNAME"
+                | "LINENO"
+        )
+        || (name == "ARGC" && !crate::exec::sh_emulation_pub())
+        || (matches!(name, "COLUMNS" | "LINES") && terminal_size().is_some())
     {
         return true;
     }
@@ -413,6 +577,9 @@ pub fn format_int(n: i64, base: u32) -> String {
 }
 
 pub fn format_float(f: f64, attrs: u32, digits: u32) -> String {
+    if !f.is_finite() {
+        return crate::arith::Num::F(f).to_string();
+    }
     let d = if digits == 0 { 10 } else { digits as usize };
     if attrs & FLOAT_F != 0 {
         format!("{:.*}", d, f)
@@ -506,36 +673,254 @@ pub fn set_ref_target(name: &str, target: &str) -> bool {
         shell_err(&format!("invalid variable name: {}", target));
         return false;
     }
-    let looping = with_shell(|s| {
-        let mut cur = base.clone();
-        for _ in 0..64 {
-            if cur == name {
-                return true;
-            }
-            match s.param(&cur) {
-                Some(p) if p.attrs & crate::params::NAMEREF != 0 => match &p.value {
-                    Value::Scalar(t) if !t.is_empty() => cur = split_target(t).0,
+    // Referring to an enclosing parameter of the same name is fine.
+    let enclosing = base == name
+        && with_shell(|s| {
+            let lvl = s.param(name).map_or(0, |p| p.level);
+            s.bind_level(&base, lvl, true).is_some()
+        });
+    let looping = !enclosing
+        && with_shell(|s| {
+            let mut cur = base.clone();
+            for _ in 0..64 {
+                if cur == name {
+                    return true;
+                }
+                match s.param(&cur) {
+                    Some(p) if p.attrs & crate::params::NAMEREF != 0 => match &p.value {
+                        Value::Scalar(t) if !t.is_empty() => cur = split_target(t).0,
+                        _ => return false,
+                    },
                     _ => return false,
-                },
-                _ => return false,
+                }
             }
-        }
-        true
-    });
+            true
+        });
     if looping {
         shell_err(&format!("{}: invalid self reference", name));
         return false;
     }
     with_shell(|s| {
+        let (lvl, upper) = s.param(name).map_or((0, false), |p| {
+            (p.level, p.attrs & crate::params::UPPER != 0)
+        });
+        // A reference to its own name means the enclosing one; to a
+        // name not set yet, the scope of the reference.
+        let bound = if base == name {
+            s.bind_level(&base, lvl, true)
+        } else {
+            s.bind_level(&base, lvl, upper)
+        }
+        .or(Some(if upper { lvl.saturating_sub(1) } else { lvl }));
         if let Some(p) = s.param_mut(name) {
             p.value = Value::Scalar(target.to_string());
             p.attrs &= !UNSET;
+            p.ref_level = bound;
         }
     });
     true
 }
 
+/// While alive, the parameter a nameref was bound to sits in place of
+/// the local that hides it, so reads and writes through the reference
+/// reach it (zsh binds references to a scope, not just a name).
+pub struct RefSwap {
+    target: String,
+    scope: Option<usize>,
+    visible: Option<Param>,
+}
+
+impl RefSwap {
+    pub fn enter(name: &str) -> Option<RefSwap> {
+        with_shell(|s| {
+            let p = s.param(name)?;
+            if p.attrs & crate::params::NAMEREF == 0 {
+                return None;
+            }
+            let level = p.ref_level?;
+            let Value::Scalar(t) = &p.value else {
+                return None;
+            };
+            let target = split_target(t).0;
+            if target.is_empty() {
+                return None;
+            }
+            match s.hidden_scope(&target, level)? {
+                Some(scope) => {
+                    let hidden = s.local_scopes[scope].get(&target).cloned().flatten()?;
+                    let visible = s.params.insert(target.clone(), hidden);
+                    Some(RefSwap {
+                        target,
+                        scope: Some(scope),
+                        visible,
+                    })
+                }
+                // Nothing at the bound scope: the reference sees nothing.
+                None => {
+                    let visible = s.params.remove(&target);
+                    Some(RefSwap {
+                        target,
+                        scope: None,
+                        visible,
+                    })
+                }
+            }
+        })
+    }
+}
+
+impl Drop for RefSwap {
+    fn drop(&mut self) {
+        with_shell(|s| {
+            let cur = s.params.remove(&self.target);
+            if let Some(slot) = self.scope.and_then(|j| s.local_scopes.get_mut(j)) {
+                slot.insert(self.target.clone(), cur);
+            }
+            if let Some(v) = self.visible.take() {
+                s.params.insert(self.target.clone(), v);
+            }
+        });
+    }
+}
+
+// Assignments that never warn (typeset, temporary assignments, element
+// updates), and whether the current one comes from arithmetic.
+static WARN_OFF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static ARITH_ASSIGN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Runs `f` with WARN_CREATE_GLOBAL / WARN_NESTED_VAR warnings off.
+pub fn without_assign_warnings<R>(f: impl FnOnce() -> R) -> R {
+    use std::sync::atomic::Ordering;
+    WARN_OFF.fetch_add(1, Ordering::SeqCst);
+    let r = f();
+    WARN_OFF.fetch_sub(1, Ordering::SeqCst);
+    r
+}
+
+/// Traced functions: `functions -t` (trace it and what it calls) or
+/// `-T` (it and anonymous functions inside), as (name, is_T).
+pub static TRACED_FUNCS: std::sync::RwLock<Vec<(String, bool)>> =
+    std::sync::RwLock::new(Vec::new());
+
+pub fn trace_kind(name: &str) -> Option<bool> {
+    TRACED_FUNCS
+        .read()
+        .ok()?
+        .iter()
+        .rev()
+        .find(|(n, _)| n == name)
+        .map(|(_, t)| *t)
+}
+
+pub fn set_traced(name: &str, kind: Option<bool>) {
+    if let Ok(mut t) = TRACED_FUNCS.write() {
+        match kind {
+            // -T takes precedence over -t.
+            Some(false) if t.iter().any(|(n, k)| n == name && *k) => {}
+            Some(k) => {
+                t.retain(|(n, _)| n != name);
+                t.push((name.to_string(), k));
+            }
+            None => t.retain(|(n, _)| n != name),
+        }
+    }
+}
+
+/// Functions marked with `functions -W` (WARN_NESTED_VAR for them).
+pub static WARN_NESTED_FUNCS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+// zsh's WARN_CREATE_GLOBAL and WARN_NESTED_VAR: an assignment in a
+// function that creates a global, or changes a parameter of an
+// enclosing scope. `kind` is the new value's type.
+fn assign_warning(name: &str, kind: &str) {
+    use std::sync::atomic::Ordering;
+    if WARN_OFF.load(Ordering::SeqCst) > 0 {
+        return;
+    }
+    let fname = with_err_ctx(|e| e.stack.last().map(|c| c.0.clone()));
+    let Some(fname) = fname else {
+        return;
+    };
+    let attr = WARN_NESTED_FUNCS
+        .read()
+        .map(|w| w.contains(&fname))
+        .unwrap_or(false);
+    let numeric = ARITH_ASSIGN.load(Ordering::SeqCst);
+    let msg = with_shell(|s| {
+        if s.func_depth == 0 {
+            return None;
+        }
+        let depth = s.local_scopes.len();
+        if s.param(name).is_some_and(|p| p.level >= depth) {
+            return None;
+        }
+        let p = s.param(name).filter(|p| p.attrs & UNSET == 0);
+        let kind = match p {
+            Some(p) if numeric || p.attrs & crate::params::NUMERIC != 0 && kind == "scalar" => {
+                "numeric"
+            }
+            _ if numeric => "numeric",
+            _ => kind,
+        };
+        match p {
+            None if crate::options::is_set_in(s, "warncreateglobal") => Some(format!(
+                "{} parameter {} created globally in function {}",
+                kind, name, fname
+            )),
+            Some(p)
+                if p.level < depth
+                    && p.attrs & crate::params::SPECIAL == 0
+                    && (attr || crate::options::is_set_in(s, "warnnestedvar")) =>
+            {
+                Some(format!(
+                    "{} parameter {} set in enclosing scope in function {}",
+                    kind, name, fname
+                ))
+            }
+            _ => None,
+        }
+    });
+    if let Some(m) = msg {
+        shell_err(&m);
+    }
+}
+
 pub fn var_set(name: &str, value: &str, export: bool) -> bool {
+    let ok = var_set_inner(name, value, export);
+    // AUTO_NAME_DIRS: a global set to a directory's absolute path names it.
+    if ok
+        && value.starts_with('/')
+        && crate::lexer::is_valid_name(name)
+        && crate::options::is_set("autonamedirs")
+        && with_shell(|s| {
+            s.param(name)
+                .is_some_and(|p| p.level == 0 && p.attrs & crate::params::NAMEREF == 0)
+        })
+        && std::path::Path::new(value).is_dir()
+    {
+        if let Ok(mut t) = NAMED_DIRS.lock() {
+            t.insert(name.to_string(), value.to_string());
+        }
+    }
+    ok
+}
+
+fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
+    let _swap = crate::shell::RefSwap::enter(name);
+    // `1=x` (and `for 1 in ...`) sets a positional parameter.
+    if let Some(n) = name
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0 && name.chars().all(|c| c.is_ascii_digit()))
+    {
+        with_shell(|s| {
+            if s.pos_params.len() < n {
+                s.pos_params.resize(n, String::new());
+            }
+            s.pos_params[n - 1] = value.to_string();
+        });
+        return true;
+    }
     // A nameref without a target yet: the value becomes its target.
     let placeholder = with_shell(|s| {
         s.param(name).is_some_and(|p| {
@@ -557,6 +942,34 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
     if name == "RANDOM" {
         seed_random(value.trim().parse().unwrap_or(0));
     }
+    // zsh: assigning UID, EUID, GID or EGID changes the process's ids.
+    if matches!(name, "UID" | "EUID" | "GID" | "EGID")
+        && with_shell(|s| s.param(name).is_none())
+        && !crate::exec::sh_emulation_pub()
+    {
+        let id = crate::arith::eval(value).unwrap_or(-1) as libc::uid_t;
+        let (r, what) = unsafe {
+            match name {
+                "UID" => (libc::setuid(id), "user ID"),
+                "EUID" => (libc::seteuid(id), "effective user ID"),
+                "GID" => (libc::setgid(id), "group ID"),
+                _ => (libc::setegid(id), "effective group ID"),
+            }
+        };
+        if r != 0 {
+            let e =
+                crate::exec::strerror(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            let mut c = e.chars();
+            let e = c
+                .next()
+                .map(|f| f.to_lowercase().chain(c).collect::<String>())
+                .unwrap_or_default();
+            shell_err(&format!("failed to change {}: {}", what, e));
+            return false;
+        }
+        return true;
+    }
+    assign_warning(name, "scalar");
     let attrs = with_shell(|s| s.param(name).map(|p| p.attrs).unwrap_or(0));
     if attrs & READONLY != 0 {
         readonly_error(name);
@@ -589,13 +1002,25 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
 
 /// Stores items into array `name`, honoring -U and readonly.
 pub fn array_set(name: &str, items: Vec<String>) -> bool {
+    let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
+    let kind = if with_shell(|s| s.assoc(name).is_some()) {
+        "association"
+    } else {
+        "array"
+    };
+    assign_warning(name, kind);
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
     if shell.assoc(name).is_some() {
+        if items.len() % 2 != 0 {
+            drop(shell);
+            shell_err("bad set of key/value pairs for associative array");
+            return false;
+        }
         let assoc = assoc_from_items(items);
         shell.store(name, Value::Assoc(assoc));
         return true;
@@ -636,8 +1061,27 @@ pub fn plain_items(items: &[ArrItem]) -> Vec<String> {
 /// associative array each sets a key (plain items pair up); for a normal
 /// array `[n]=v` sets element n and later plain items follow it.
 pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool {
+    let _swap = crate::shell::RefSwap::enter(name);
+    if placeholder_ref(name) {
+        shell_err(&format!("{}: can't change type of a named reference", name));
+        return false;
+    }
     if !items.iter().any(|i| matches!(i, ArrItem::Key(..))) {
         let plain = plain_items(&items);
+        // zsh: $argv is the positional parameters.
+        if name == "argv"
+            && !crate::exec::sh_emulation_pub()
+            && with_shell(|s| s.param("argv").is_none())
+        {
+            with_shell(|s| {
+                if append {
+                    s.pos_params.extend(plain);
+                } else {
+                    s.pos_params = plain;
+                }
+            });
+            return true;
+        }
         return if append {
             array_append(name, plain)
         } else {
@@ -712,6 +1156,11 @@ pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool
 /// `name[a,b]=(items)`: replaces elements a through b (1-based,
 /// negatives from the end) with `items`. `name[n]=(items)` replaces one.
 pub fn array_splice(name: &str, sub: &str, items: Vec<String>) -> bool {
+    let _swap = crate::shell::RefSwap::enter(name);
+    without_assign_warnings(|| array_splice_inner(name, sub, items))
+}
+
+fn array_splice_inner(name: &str, sub: &str, items: Vec<String>) -> bool {
     let target = split_target(&resolve_ref(name)).0;
     let (a, b) = match sub.split_once(',') {
         Some((a, b)) => (crate::arith::eval(a), crate::arith::eval(b)),
@@ -746,6 +1195,7 @@ pub fn array_splice(name: &str, sub: &str, items: Vec<String>) -> bool {
 }
 
 pub fn array_append(name: &str, items: Vec<String>) -> bool {
+    let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
@@ -770,6 +1220,7 @@ pub fn array_append(name: &str, items: Vec<String>) -> bool {
 }
 
 pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: bool) -> bool {
+    let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
@@ -809,7 +1260,11 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
         let len = items.len() as isize;
         let resolved = len + index;
         if resolved < 0 {
-            return false;
+            // Before the first element: the value goes in front.
+            items.insert(0, value);
+            let items = maybe_unique_items(&shell, name, items);
+            shell.store(name, Value::Array(items));
+            return true;
         }
         resolved as usize
     };
@@ -872,6 +1327,7 @@ pub fn assoc_declare(name: &str) -> bool {
 }
 
 pub fn assoc_set(name: &str, key: &str, value: &str) {
+    let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
     let mut shell = SHELL.shell.lock().unwrap();
@@ -994,6 +1450,11 @@ pub fn build_prompt() -> String {
             var_get("PS1")
         }
     };
+    // A PS1 set to nothing means no prompt; only an unset one gets the
+    // default.
+    if prompt_str.is_empty() && (var_exists("PS1") || var_exists("PROMPT")) {
+        return String::new();
+    }
     if prompt_str.is_empty() {
         let user = var_get("USER");
         let user = if user.is_empty() { "meow" } else { &user };
@@ -1009,156 +1470,529 @@ pub fn build_prompt() -> String {
 /// order zsh uses with PROMPT_SUBST. Text produced by a substitution may
 /// itself contain `%` escapes, as starship's output does.
 pub fn render_prompt(s: &str) -> String {
-    let expanded = crate::expand::expand_prompt_string(s).unwrap_or_else(|_| s.to_string());
-    expand_prompt(&expanded)
+    // PROMPT_SUBST: parameter, command and arithmetic substitution.
+    let mut t = if crate::options::is_set("promptsubst") {
+        crate::expand::expand_prompt_string(s).unwrap_or_else(|_| s.to_string())
+    } else {
+        s.to_string()
+    };
+    // PROMPT_BANG: `!` is the history event number, `!!` a `!`.
+    if crate::options::is_set("promptbang") {
+        let n = history_count();
+        let mut out = String::new();
+        let mut chars = t.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '!' {
+                out.push(c);
+            } else if chars.peek() == Some(&'!') {
+                chars.next();
+                out.push('!');
+            } else {
+                out.push_str(&n);
+            }
+        }
+        t = out;
+    }
+    if crate::options::is_set("promptpercent") {
+        t = expand_prompt(&t);
+    }
+    t
 }
 
+/// zsh prompt `%` escapes (prompt.c's putpromptchar): paths, times,
+/// conditionals `%(x.true.false)`, truncation `%N<..<` / `%N>..>`,
+/// colours and attributes.
 pub fn expand_prompt(s: &str) -> String {
+    let mut p = Prompt {
+        f: s.chars().collect(),
+        pos: 0,
+        trunc: false,
+    };
     let mut out = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        // %N<str< ... %<< and %N>str> ... %>>: truncate the text up to
-        // the closing marker to N characters, marking the cut with str.
-        let mut digits = String::new();
-        while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
-            digits.push(chars.next().unwrap());
-        }
-        if matches!(chars.peek(), Some('<' | '>')) {
-            let dir = chars.next().unwrap();
-            let mut marker = String::new();
-            for ch in chars.by_ref() {
-                if ch == dir {
-                    break;
-                }
-                marker.push(ch);
-            }
-            if digits.is_empty() {
-                // A bare %<< ends a truncation region; nothing to do here.
-                continue;
-            }
-            let end_tag = format!("%{0}{0}", dir);
-            let rest: String = chars.collect();
-            let (region, after) = match rest.find(&end_tag) {
-                Some(k) => (&rest[..k], &rest[k + end_tag.len()..]),
-                None => (rest.as_str(), ""),
-            };
-            let text: Vec<char> = expand_prompt(region).chars().collect();
-            let n: usize = digits.parse().unwrap_or(0);
-            if text.len() <= n {
-                out.extend(text);
-            } else {
-                let keep = n.saturating_sub(marker.chars().count());
-                if dir == '<' {
-                    out.push_str(&marker);
-                    out.extend(&text[text.len() - keep..]);
-                } else {
-                    out.extend(&text[..keep]);
-                    out.push_str(&marker);
-                }
-            }
-            out.push_str(&expand_prompt(after));
-            return out;
-        }
-        // %Nv: element N of $psvar.
-        if chars.peek() == Some(&'v') {
-            chars.next();
-            let n: usize = digits.parse().unwrap_or(1).max(1);
-            let v = with_shell(|s| s.array("psvar").and_then(|a| a.get(n - 1).cloned()));
-            out.push_str(&v.unwrap_or_default());
-            continue;
-        }
-        // Numeric arguments to other escapes (%3~ and so on) are ignored.
-        match chars.next() {
-            None => out.push('%'),
-            Some('%') => out.push('%'),
-            Some('n') => out.push_str(&var_get("USER")),
-            Some('m') => out.push_str(&hostname_short()),
-            Some('M') => out.push_str(&hostname_full()),
-            Some('~') => out.push_str(&shorten_path(&var_get("PWD"))),
-            Some('d') | Some('/') => out.push_str(&var_get("PWD")),
-            Some('c') | Some('.') | Some('C') => out.push_str(&pwd_basename()),
-            Some('#') => out.push(if is_root() { '#' } else { '%' }),
-            Some('T') => out.push_str(&time_fmt("%H:%M")),
-            Some('t') | Some('@') => out.push_str(&time_fmt("%I:%M%p")),
-            Some('*') => out.push_str(&time_fmt("%H:%M:%S")),
-            Some('D') => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    let fmt = read_until_brace(&mut chars);
-                    out.push_str(&time_fmt(&fmt));
-                } else {
-                    out.push_str(&time_fmt("%y-%m-%d"));
-                }
-            }
-            Some('w') => out.push_str(&time_fmt("%a %d")),
-            Some('W') => out.push_str(&time_fmt("%m/%d/%y")),
-            Some('!') | Some('h') => out.push_str(&history_count()),
-            Some('?') => out.push_str(&format!("{}", SHELL.shell.lock().unwrap().last_status)),
-            Some('j') => out.push_str(&jobs_count()),
-            Some('B') => out.push_str("\x1b[1m"),
-            Some('b') => out.push_str("\x1b[22m"),
-            Some('U') => out.push_str("\x1b[4m"),
-            Some('u') => out.push_str("\x1b[24m"),
-            Some('S') => out.push_str("\x1b[7m"),
-            Some('s') => out.push_str("\x1b[27m"),
-            Some('F') => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    let name = read_until_brace(&mut chars);
-                    out.push_str(&color_fg(&name));
-                } else {
-                    out.push_str("\x1b[39m");
-                }
-            }
-            Some('f') => out.push_str("\x1b[39m"),
-            Some('K') => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    let name = read_until_brace(&mut chars);
-                    out.push_str(&color_bg(&name));
-                } else {
-                    out.push_str("\x1b[49m");
-                }
-            }
-            Some('k') => out.push_str("\x1b[49m"),
-            // %{ raw %} — content is emitted verbatim. We don't track
-            // visual width, so the markers are effectively no-ops.
-            Some('{') => loop {
-                match chars.next() {
-                    None => break,
-                    Some('%') => {
-                        if chars.peek() == Some(&'}') {
-                            chars.next();
-                            break;
-                        }
-                        out.push('%');
-                    }
-                    Some(ch) => out.push(ch),
-                }
-            },
-            Some(other) => {
-                out.push('%');
-                out.push(other);
-            }
+    while p.pos < p.f.len() {
+        p.put(&mut out, true, None);
+        // A stray end character at the top level is plain text.
+        if p.pos < p.f.len() {
+            out.push(p.f[p.pos]);
+            p.pos += 1;
         }
     }
     out
 }
 
-fn read_until_brace(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut s = String::new();
-    while let Some(&ch) = chars.peek() {
-        chars.next();
-        if ch == '}' {
-            break;
+struct Prompt {
+    f: Vec<char>,
+    pos: usize,
+    // Inside a truncation region: the next one ends it.
+    trunc: bool,
+}
+
+// The longest named directory (HOME as ``) that starts `p`, for `~`.
+fn find_named_dir(p: &str) -> Option<(String, String)> {
+    let mut best: Option<(String, String)> = None;
+    let mut consider = |name: String, dir: String| {
+        if dir.is_empty() || dir == "/" {
+            return;
         }
-        s.push(ch);
+        let hit = p == dir || p.strip_prefix(&dir).is_some_and(|r| r.starts_with('/'));
+        if hit && best.as_ref().is_none_or(|(_, d)| dir.len() > d.len()) {
+            best = Some((name, dir));
+        }
+    };
+    consider(String::new(), var_get("HOME"));
+    if let Ok(t) = NAMED_DIRS.lock() {
+        for (k, v) in t.iter() {
+            consider(k.clone(), v.clone());
+        }
     }
-    s
+    best
+}
+
+// zsh's promptpath: `p` with ~names if `tilde`, cut to the last `n`
+// components (or, negative, the first ones).
+fn prompt_path(p: &str, n: i64, tilde: bool) -> String {
+    let modp = match find_named_dir(p).filter(|_| tilde) {
+        Some((name, dir)) => format!("~{}{}", name, &p[dir.len()..]),
+        None => p.to_string(),
+    };
+    if n == 0 {
+        return modp;
+    }
+    let c: Vec<char> = modp.chars().collect();
+    if n > 0 {
+        let mut left = n;
+        let mut k = c.len();
+        while k > 0 {
+            k -= 1;
+            if c[k] == '/' {
+                left -= 1;
+                if left == 0 {
+                    k += 1;
+                    break;
+                }
+            }
+        }
+        if k < c.len() && c[k] == '/' && k + 1 < c.len() && k != 0 {
+            k += 1;
+        }
+        c[k..].iter().collect()
+    } else {
+        let mut left = n;
+        let mut k = 1;
+        while k < c.len() {
+            if c[k] == '/' {
+                left += 1;
+                if left == 0 {
+                    break;
+                }
+            }
+            k += 1;
+        }
+        c[..k.min(c.len())].iter().collect()
+    }
+}
+
+// Visible width, not counting `\x1b[...m` sequences.
+fn visible_width(s: &str) -> usize {
+    let mut n = 0;
+    let mut esc = false;
+    for c in s.chars() {
+        if esc {
+            if c.is_ascii_alphabetic() {
+                esc = false;
+            }
+        } else if c == '\x1b' {
+            esc = true;
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+impl Prompt {
+    fn at(&self, k: usize) -> Option<char> {
+        self.f.get(k).copied()
+    }
+
+    fn number(&mut self) -> Option<i64> {
+        let start = self.pos;
+        while self.at(self.pos).is_some_and(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        (self.pos > start).then(|| {
+            self.f[start..self.pos]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+    }
+
+    // Text up to `end`, with backslash escapes; pos after `end`.
+    fn upto(&mut self, end: char) -> String {
+        let mut s = String::new();
+        while let Some(c) = self.at(self.pos) {
+            self.pos += 1;
+            if c == end {
+                break;
+            }
+            if c == '\\' {
+                if let Some(n) = self.at(self.pos) {
+                    s.push(n);
+                    self.pos += 1;
+                    continue;
+                }
+            }
+            s.push(c);
+        }
+        s
+    }
+
+    fn test(&self, cond: char, arg: i64) -> i32 {
+        let pwd = var_get("PWD");
+        match cond {
+            'c' | '.' | '~' | '/' | 'C' => {
+                let mut arg = arg;
+                let mut ss: &str = &pwd;
+                if matches!(cond, 'c' | '.' | '~') {
+                    if let Some((_, dir)) = find_named_dir(&pwd) {
+                        arg -= 1;
+                        ss = &pwd[dir.len()..];
+                    }
+                }
+                let mut it = ss.chars();
+                if it.next() == Some('/') && !it.as_str().is_empty() {
+                    arg -= 1;
+                }
+                arg -= it.filter(|&c| c == '/').count() as i64;
+                i32::from(arg <= 0)
+            }
+            't' | 'T' | 'd' | 'D' | 'w' => {
+                let fmt = match cond {
+                    't' => "%M",
+                    'T' => "%H",
+                    'd' => "%d",
+                    'D' => "%m",
+                    _ => "%w",
+                };
+                let mut v: i64 = time_fmt(fmt).trim().parse().unwrap_or(-1);
+                if cond == 'D' {
+                    v -= 1;
+                }
+                i32::from(v == arg)
+            }
+            '?' => i32::from(with_shell(|s| s.last_status) as i64 == arg),
+            '#' => i32::from(unsafe { libc::geteuid() } as i64 == arg),
+            'g' => i32::from(unsafe { libc::getegid() } as i64 == arg),
+            'j' => i32::from(jobs_count().parse::<i64>().unwrap_or(0) >= arg),
+            'L' => i32::from(var_get("SHLVL").parse::<i64>().unwrap_or(0) >= arg),
+            'S' => {
+                let secs = START
+                    .get_or_init(std::time::Instant::now)
+                    .elapsed()
+                    .as_secs() as i64;
+                i32::from(secs >= arg)
+            }
+            'v' => i32::from(with_shell(|s| s.array("psvar").map_or(0, |a| a.len())) as i64 >= arg),
+            'V' => {
+                let ps = with_shell(|s| s.array("psvar").cloned()).unwrap_or_default();
+                let k = if arg == 0 { 1 } else { arg } as usize;
+                i32::from(ps.len() >= k && !ps[k - 1].is_empty())
+            }
+            'e' => {
+                let depth = with_err_ctx(|e| e.stack.len()) as i64;
+                i32::from(depth >= arg)
+            }
+            '_' => i32::from(crate::exec::CMD_STACK.lock().map_or(0, |c| c.len()) as i64 >= arg),
+            '!' => i32::from(unsafe { libc::geteuid() } == 0),
+            'l' => 0,
+            _ => -1,
+        }
+    }
+
+    // Processes the format up to `end` (or the end). False if the
+    // format ended early.
+    fn put(&mut self, out: &mut String, doprint: bool, end: Option<char>) -> bool {
+        while let Some(c) = self.at(self.pos) {
+            if Some(c) == end {
+                return true;
+            }
+            if c != '%' {
+                if doprint {
+                    out.push(c);
+                }
+                self.pos += 1;
+                continue;
+            }
+            let pct = self.pos;
+            self.pos += 1;
+            let mut minus = false;
+            if self.at(self.pos) == Some('-') {
+                minus = true;
+                self.pos += 1;
+            }
+            let mut arg = match self.number() {
+                Some(n) => n,
+                None if minus => 1,
+                None => 0,
+            };
+            if minus {
+                arg = -arg;
+            }
+            let Some(e) = self.at(self.pos) else {
+                if doprint {
+                    out.push('%');
+                }
+                return false;
+            };
+            if e == '(' {
+                self.pos += 1;
+                if let Some(n) = self.number() {
+                    arg = n;
+                } else if arg < 0 {
+                    arg = -arg;
+                }
+                let Some(cond) = self.at(self.pos) else {
+                    return false;
+                };
+                let test = self.test(cond, arg);
+                self.pos += 1;
+                let Some(sep) = self.at(self.pos) else {
+                    return false;
+                };
+                self.pos += 1;
+                let saved = self.trunc;
+                self.trunc = false;
+                if !self.put(out, test == 1 && doprint, Some(sep)) {
+                    self.trunc = saved;
+                    return false;
+                }
+                self.pos += 1;
+                if self.pos > self.f.len() || !self.put(out, test == 0 && doprint, Some(')')) {
+                    self.trunc = saved;
+                    return false;
+                }
+                self.trunc = saved;
+                self.pos += 1;
+                continue;
+            }
+            self.pos += 1;
+            // Truncation: `%N<str<` ... (to the next truncation or end).
+            if matches!(e, '<' | '>' | '[') {
+                let close = if e == '[' { ']' } else { e };
+                if e == '[' {
+                    if let Some(n) = self.number() {
+                        arg = n;
+                    }
+                }
+                if arg <= 0 {
+                    // `%<<`: ends a truncation region.
+                    let _ = self.upto(close);
+                    if self.trunc {
+                        return true;
+                    }
+                    continue;
+                }
+                if self.trunc {
+                    self.pos = pct;
+                    return true;
+                }
+                let marker = self.upto(close);
+                let mut region = String::new();
+                self.trunc = true;
+                let ok = self.put(&mut region, doprint, end);
+                self.trunc = false;
+                if doprint {
+                    let width = arg as usize;
+                    let w = visible_width(&region);
+                    if w <= width {
+                        out.push_str(&region);
+                    } else {
+                        let chars: Vec<char> = region.chars().collect();
+                        let mlen = marker.chars().count();
+                        if mlen >= width {
+                            out.push_str(&marker);
+                        } else {
+                            let keep = width - mlen;
+                            if e == '<' {
+                                out.push_str(&marker);
+                                out.extend(&chars[chars.len() - keep..]);
+                            } else {
+                                out.extend(&chars[..keep]);
+                                out.push_str(&marker);
+                            }
+                        }
+                    }
+                }
+                if !ok {
+                    return false;
+                }
+                continue;
+            }
+            if !doprint {
+                if matches!(e, 'D' | 'F' | 'K' | 'H') && self.at(self.pos) == Some('{') {
+                    self.pos += 1;
+                    let _ = self.upto('}');
+                }
+                continue;
+            }
+            let pwd = var_get("PWD");
+            match e {
+                '~' => out.push_str(&prompt_path(&pwd, arg, true)),
+                'd' | '/' => out.push_str(&prompt_path(&pwd, arg, false)),
+                'c' | '.' => out.push_str(&prompt_path(&pwd, if arg == 0 { 1 } else { arg }, true)),
+                'C' => out.push_str(&prompt_path(&pwd, if arg == 0 { 1 } else { arg }, false)),
+                // %N: the running function, eval or script.
+                'N' => out.push_str(&with_err_ctx(|e| {
+                    e.stack
+                        .last()
+                        .map(|c| c.0.clone())
+                        .unwrap_or_else(|| e.name.clone())
+                })),
+                'h' | '!' => out.push_str(&history_count()),
+                'j' => out.push_str(&jobs_count()),
+                'M' => out.push_str(&var_get("HOST")),
+                'm' => {
+                    let host = var_get("HOST");
+                    let arg = if arg == 0 { 1 } else { arg };
+                    let parts: Vec<&str> = host.split('.').collect();
+                    let text = if arg > 0 {
+                        parts[..(arg as usize).min(parts.len())].join(".")
+                    } else {
+                        parts[parts.len().saturating_sub((-arg) as usize)..].join(".")
+                    };
+                    out.push_str(&text);
+                }
+                'n' => out.push_str(&var_get("USERNAME")),
+                'l' | 'y' => {
+                    let tty = unsafe {
+                        let p = libc::ttyname(0);
+                        if p.is_null() {
+                            String::new()
+                        } else {
+                            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                        }
+                    };
+                    let shown = if tty.is_empty() {
+                        "()".to_string()
+                    } else if e == 'l' {
+                        tty.strip_prefix("/dev/tty")
+                            .or_else(|| tty.strip_prefix("/dev/"))
+                            .unwrap_or(&tty)
+                            .to_string()
+                    } else {
+                        tty.strip_prefix("/dev/").unwrap_or(&tty).to_string()
+                    };
+                    out.push_str(&shown);
+                }
+                'L' => out.push_str(&var_get("SHLVL")),
+                '?' => out.push_str(&with_shell(|s| s.last_status).to_string()),
+                '%' | ')' => out.push(e),
+                '#' => out.push(if is_root() { '#' } else { '%' }),
+                'v' => {
+                    let ps = with_shell(|s| s.array("psvar").cloned()).unwrap_or_default();
+                    let k = if arg == 0 {
+                        1
+                    } else if arg < 0 {
+                        ps.len() as i64 + arg + 1
+                    } else {
+                        arg
+                    };
+                    if k > 0 && (k as usize) <= ps.len() {
+                        out.push_str(&ps[k as usize - 1]);
+                    }
+                }
+                'e' => out.push_str(&with_err_ctx(|e| e.stack.len()).to_string()),
+                'i' => out.push_str(&lineno().to_string()),
+                'I' => out.push_str(&with_err_ctx(|e| e.lineno).to_string()),
+                'x' => {
+                    let file = with_shell(|s| s.function_origin());
+                    out.push_str(&prompt_path(&file, arg, false));
+                }
+                'T' => out.push_str(time_fmt("%k:%M").trim_start()),
+                '*' => out.push_str(time_fmt("%k:%M:%S").trim_start()),
+                't' | '@' => out.push_str(time_fmt("%l:%M%p").trim_start()),
+                'w' => out.push_str(&time_fmt("%a %e").replace("  ", " ")),
+                'W' => out.push_str(&time_fmt("%m/%d/%y")),
+                'D' => {
+                    if self.at(self.pos) == Some('{') {
+                        self.pos += 1;
+                        let fmt = self.upto('}');
+                        if !fmt.is_empty() {
+                            out.push_str(&time_fmt(&fmt));
+                        }
+                    } else {
+                        out.push_str(&time_fmt("%y-%m-%d"));
+                    }
+                }
+                'B' => out.push_str("\x1b[1m"),
+                'b' => out.push_str("\x1b[22m"),
+                'U' => out.push_str("\x1b[4m"),
+                'u' => out.push_str("\x1b[24m"),
+                'S' => out.push_str("\x1b[7m"),
+                's' => out.push_str("\x1b[27m"),
+                'E' => out.push_str("\x1b[K"),
+                'F' | 'K' => {
+                    let spec = if self.at(self.pos) == Some('{') {
+                        self.pos += 1;
+                        Some(self.upto('}'))
+                    } else if arg > 0 {
+                        Some(arg.to_string())
+                    } else {
+                        None
+                    };
+                    match (spec, e) {
+                        (Some(n), 'F') => out.push_str(&color_fg(&n)),
+                        (Some(n), _) => out.push_str(&color_bg(&n)),
+                        (None, 'F') => out.push_str("\x1b[39m"),
+                        (None, _) => out.push_str("\x1b[49m"),
+                    }
+                }
+                'f' => out.push_str("\x1b[39m"),
+                'k' => out.push_str("\x1b[49m"),
+                'H' => {
+                    if self.at(self.pos) == Some('{') {
+                        self.pos += 1;
+                        let _ = self.upto('}');
+                    }
+                }
+                // %{ ... %}: text that takes no space, kept as is.
+                '{' | '}' | 'G' => {}
+                '_' | '^' => {
+                    let stack = crate::exec::CMD_STACK
+                        .lock()
+                        .map(|c| c.clone())
+                        .unwrap_or_default();
+                    let n = stack.len() as i64;
+                    if n > 0 {
+                        let k = if arg == 0 || arg.abs() > n {
+                            n
+                        } else {
+                            arg.abs()
+                        };
+                        let part: Vec<&str> = if (arg >= 0) == (e == '_') {
+                            stack[(n - k) as usize..].to_vec()
+                        } else {
+                            stack[..k as usize].to_vec()
+                        };
+                        let part: Vec<&str> = if e == '^' {
+                            part.into_iter().rev().collect()
+                        } else {
+                            part
+                        };
+                        out.push_str(&part.join(" "));
+                    }
+                }
+                'r' | 'R' => {}
+                other => {
+                    out.push('%');
+                    out.push(other);
+                }
+            }
+        }
+        end.is_none()
+    }
 }
 
 fn hostname_full() -> String {
@@ -1170,22 +2004,6 @@ fn hostname_full() -> String {
         }
     }
     String::new()
-}
-
-fn hostname_short() -> String {
-    let h = hostname_full();
-    h.split('.').next().unwrap_or(&h).to_string()
-}
-
-fn pwd_basename() -> String {
-    let pwd = var_get("PWD");
-    if pwd.is_empty() {
-        return String::new();
-    }
-    PathBuf::from(&pwd)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| pwd.clone())
 }
 
 fn is_root() -> bool {
@@ -1346,6 +2164,8 @@ pub struct ErrCtx {
     // The script, or the shell's name for `-c` and standard input.
     pub name: String,
     pub interactive: bool,
+    // Inside an eval with NO_EVAL_LINENO: line numbers stay the caller's.
+    pub frozen: usize,
 }
 
 static ERR_CTX: std::sync::Mutex<ErrCtx> = std::sync::Mutex::new(ErrCtx {
@@ -1353,6 +2173,7 @@ static ERR_CTX: std::sync::Mutex<ErrCtx> = std::sync::Mutex::new(ErrCtx {
     lineno: 0,
     name: String::new(),
     interactive: false,
+    frozen: 0,
 });
 
 pub fn with_err_ctx<R>(f: impl FnOnce(&mut ErrCtx) -> R) -> R {
@@ -1458,11 +2279,11 @@ mod tests {
     fn test_expand_prompt_user_and_pwd() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         shell_init();
-        var_set("USER", "alice", false);
+        // %n is $USERNAME, the login name, as in zsh.
         var_set("HOME", "/home/alice", false);
         var_set("PWD", "/home/alice/projects", false);
         let s = expand_prompt("%n at %~");
-        assert_eq!(s, "alice at ~/projects");
+        assert_eq!(s, format!("{} at ~/projects", var_get("USERNAME")));
     }
 
     #[test]
@@ -1492,6 +2313,12 @@ mod tests {
     fn test_prompt_expands_substitutions_before_percent_escapes() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         shell_init();
+        // Substitution needs PROMPT_SUBST, which starship and
+        // oh-my-zsh turn on.
+        with_shell(|s| {
+            crate::options::set_in(s, "promptsubst", true);
+            crate::options::set_in(s, "promptpercent", true);
+        });
         var_set("PS1", "", false);
         var_set("PROMPT", "$(printf '%%{X%%}a')%%", false);
         assert_eq!(build_prompt(), "Xa%");
@@ -1501,8 +2328,11 @@ mod tests {
     fn test_build_prompt_uses_cat_fallback_without_ps1() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         shell_init();
-        var_set("PS1", "", false);
-        var_set("PROMPT", "", false);
+        // Unset, not empty: an empty PS1 means no prompt, as in zsh.
+        with_shell(|s| {
+            s.remove_param("PS1");
+            s.remove_param("PROMPT");
+        });
         var_set("USER", "alice", false);
         var_set("HOME", "/home/alice", false);
         var_set("PWD", "/home/alice/projects", false);
@@ -1511,6 +2341,8 @@ mod tests {
         assert!(s.contains("alice"));
         assert!(s.contains("~/projects"));
         assert!(s.contains("𓃠"));
+        var_set("PS1", "", false);
+        assert_eq!(build_prompt(), "");
     }
 
     #[test]

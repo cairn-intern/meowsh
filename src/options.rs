@@ -11,6 +11,44 @@ use crate::types::{
     OPT_NOEXEC, OPT_NOGLOB, OPT_NOUNSET, OPT_PIPEFAIL, OPT_VERBOSE, OPT_XTRACE,
 };
 
+/// zsh's sticky emulation: the emulation (with -R and any -o options)
+/// an `emulate -c` ran under; functions defined there keep it.
+pub type Sticky = (Emulation, bool, Vec<(String, bool)>);
+
+/// The sticky emulation in effect now.
+pub static CUR_STICKY: std::sync::Mutex<Option<Sticky>> = std::sync::Mutex::new(None);
+
+/// Functions with a sticky emulation, by name.
+pub static STICKY_FUNCS: std::sync::Mutex<Vec<(String, Sticky)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn sticky_of(name: &str) -> Option<Sticky> {
+    STICKY_FUNCS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, s)| s.clone())
+}
+
+pub fn set_sticky(name: &str) {
+    let cur = CUR_STICKY.lock().ok().and_then(|c| c.clone());
+    if let Ok(mut f) = STICKY_FUNCS.lock() {
+        f.retain(|(n, _)| n != name);
+        if let Some(s) = cur {
+            f.push((name.to_string(), s));
+        }
+    }
+}
+
+/// Puts the shell into a sticky emulation.
+pub fn apply_sticky(st: &Sticky) {
+    crate::shell::with_shell(|s| emulate_in(s, st.0, st.1));
+    for (name, on) in &st.2 {
+        set(name, *on);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Emulation {
     Csh = 1,
@@ -100,12 +138,14 @@ pub fn resolve(name: &str) -> Option<(&'static str, bool)> {
 // while taking the shell lock.
 static QUICK: std::sync::RwLock<Vec<&'static str>> = std::sync::RwLock::new(Vec::new());
 const QUICK_NAMES: &[&str] = &[
+    "kshglob",
     "cbases",
     "octalzeroes",
     "extendedglob",
     "ksharrays",
     "kshzerosubscript",
     "posixidentifiers",
+    "shglob",
 ];
 
 /// For code that may run with the shell lock held: whether one of a few

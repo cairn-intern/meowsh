@@ -114,6 +114,9 @@ pub struct Shell {
     // Nonzero while running a context in which `set -e` is ignored
     // (conditions, non-final AND-OR elements, negated pipelines).
     pub errexit_suppressed: usize,
+    // The same for ERR_RETURN, which starts afresh in each function.
+    pub errreturn_suppressed: usize,
+    pub errreturn_stack: Vec<usize>,
     pub flow: Flow,
     // The pending Flow::Exit comes from an error (expansion, assignment,
     // redirection) rather than `exit`; `eval` stops it, as in zsh.
@@ -123,6 +126,9 @@ pub struct Shell {
     pub last_cmdsub_status: Option<i32>,
     // Character offset inside the current `getopts` argument.
     pub getopts_pos: usize,
+    // Loop depth of the parent when this subshell forked: `break` here
+    // cannot reach those loops.
+    pub subshell_loop_depth: usize,
     // Stack of local scopes. Each maps a parameter name to its state
     // before it was made local (None = unset). Pushed on function entry,
     // popped on return.
@@ -182,11 +188,14 @@ impl Shell {
             func_depth: 0,
             source_depth: 0,
             errexit_suppressed: 0,
+            errreturn_suppressed: 0,
+            errreturn_stack: Vec::new(),
             flow: Flow::None,
             error_exit: false,
             emulation: crate::options::Emulation::Zsh,
             last_cmdsub_status: None,
             getopts_pos: 0,
+            subshell_loop_depth: 0,
             local_scopes: Vec::new(),
             named_opts: HashMap::new(),
             zstyles: Vec::new(),
@@ -222,6 +231,7 @@ impl Shell {
 
 pub const ALIASES: &str = "aliases";
 pub const GALIASES: &str = "galiases";
+pub const SALIASES: &str = "saliases";
 
 impl Default for Shell {
     fn default() -> Self {
@@ -231,15 +241,16 @@ impl Default for Shell {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RedirOp {
-    Read,      // <
-    Write,     // >
-    Clobber,   // >|
-    Append,    // >>
-    ReadWrite, // <>
-    DupIn,     // <&
-    DupOut,    // >&
-    HereDoc,   // << and <<-
-    HereStr,   // <<< word
+    Read,          // <
+    Write,         // >
+    Clobber,       // >|
+    Append,        // >>
+    AppendClobber, // >>| and >>!: appends even with NO_CLOBBER
+    ReadWrite,     // <>
+    DupIn,         // <&
+    DupOut,        // >&
+    HereDoc,       // << and <<-
+    HereStr,       // <<< word
 }
 
 #[derive(Clone, Debug)]
@@ -336,7 +347,8 @@ pub enum Node {
         until: bool,
     },
     // `(( expr ))`
-    Arith(String),
+    // `(( expr ))` and the input line it is on.
+    Arith(String, usize),
     // `repeat count body`
     Repeat {
         count: String,
@@ -350,6 +362,8 @@ pub enum Node {
     },
     // `coproc cmd`
     Coproc(Box<Node>),
+    // `time pipeline`: report its CPU and elapsed time.
+    Time(Box<Node>),
     // Run in the background with `&|` / `&!`: no job entry, no notice.
     Disowned(Box<Node>),
     // zsh `{ try } always { cleanup }`
@@ -362,6 +376,8 @@ pub enum Node {
         body: std::sync::Arc<Node>,
         args: Vec<String>,
         line: usize,
+        // `function -T { ... }`: traced.
+        traced: bool,
     },
     // `for (( init; cond; step ))`
     ForArith {
@@ -383,8 +399,10 @@ pub enum Node {
         name: String,
         body: Box<Node>,
         line: usize,
+        // `function -T name { ... }`: traced.
+        traced: bool,
     },
-    DBracket(Vec<String>),
+    DBracket(Vec<String>, usize),
     Redirected {
         node: Box<Node>,
         redirs: Vec<Redir>,

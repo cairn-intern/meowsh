@@ -46,6 +46,9 @@ pub struct Param {
     pub tie: Option<(String, String)>,
     // Function depth that created it; 0 for globals.
     pub level: usize,
+    // A nameref: the level of the parameter it was bound to, which it
+    // keeps referring to even when a later local hides that one.
+    pub ref_level: Option<usize>,
 }
 
 impl Param {
@@ -61,6 +64,7 @@ impl Param {
             base: 0,
             tie: None,
             level: 0,
+            ref_level: None,
         }
     }
 
@@ -346,6 +350,42 @@ impl Shell {
         self.local_scopes
             .last()
             .is_some_and(|s| s.contains_key(name))
+    }
+
+    /// The scope holding the newest hidden `name` at or below `level`:
+    /// Some(Some(j)) found in scope j, Some(None) there is none, None
+    /// when the visible one already qualifies.
+    pub fn hidden_scope(&self, name: &str, level: usize) -> Option<Option<usize>> {
+        if self.params.get(name).is_none_or(|p| p.level <= level) {
+            return None;
+        }
+        for j in (0..self.local_scopes.len()).rev() {
+            match self.local_scopes[j].get(name) {
+                Some(Some(p)) if p.level <= level => return Some(Some(j)),
+                // Before this local there was none.
+                Some(None) => return Some(None),
+                _ => {}
+            }
+        }
+        Some(None)
+    }
+
+    /// The level of the `name` a new reference made at `level` binds to:
+    /// the visible one, or with `upper` the nearest one below `level`.
+    pub fn bind_level(&self, name: &str, level: usize, upper: bool) -> Option<usize> {
+        let visible = self.params.get(name).map(|p| p.level);
+        if !upper {
+            return visible;
+        }
+        if visible.is_some_and(|v| v < level) {
+            return visible;
+        }
+        (0..self.local_scopes.len())
+            .rev()
+            .find_map(|j| match self.local_scopes[j].get(name) {
+                Some(Some(p)) if p.level < level => Some(p.level),
+                _ => None,
+            })
     }
 
     pub fn push_scope(&mut self) {

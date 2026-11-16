@@ -200,6 +200,26 @@ pub fn temp_file_with(data: &[u8]) -> io::Result<i32> {
     Ok(fd)
 }
 
+/// Runs `f` with standard error sent to /dev/null.
+pub fn with_stderr_silenced<R>(f: impl FnOnce() -> R) -> R {
+    let saved = unsafe { libc::dup(2) };
+    let null = std::fs::OpenOptions::new().write(true).open("/dev/null");
+    if let Ok(n) = &null {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::dup2(n.as_raw_fd(), 2);
+        }
+    }
+    let r = f();
+    if saved >= 0 {
+        unsafe {
+            libc::dup2(saved, 2);
+            libc::close(saved);
+        }
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -44,6 +44,8 @@ impl std::fmt::Display for Num {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Num::I(n) => write!(f, "{}", n),
+            Num::F(x) if x.is_nan() => write!(f, "NaN"),
+            Num::F(x) if x.is_infinite() => write!(f, "{}", if *x < 0.0 { "-Inf" } else { "Inf" }),
             Num::F(x) => {
                 let s = format!("{}", x);
                 if x.is_finite() && !s.contains('.') && !s.contains('e') {
@@ -64,9 +66,9 @@ enum T {
 }
 
 const OPS: &[&str] = &[
-    "<<=", ">>=", "**", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "++", "--", "+=", "-=",
-    "*=", "/=", "%=", "&=", "^=", "|=", "+", "-", "*", "/", "%", "<", ">", "&", "^", "|", "!", "~",
-    "?", ":", "=", "(", ")", ",",
+    "<<=", ">>=", "**=", "&&=", "||=", "^^=", "^^", "**", "<<", ">>", "<=", ">=", "==", "!=", "&&",
+    "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=", "+", "-", "*", "/", "%", "<",
+    ">", "&", "^", "|", "!", "~", "?", ":", "=", "(", ")", ",",
 ];
 
 thread_local! {
@@ -120,8 +122,87 @@ fn parse_value(s: &str) -> Result<Num, String> {
     parse_number(s).map(Num::I)
 }
 
+// zsh's lexconstant: the longest number at `n` (0x, 0b, base#, octal
+// with OCTAL_ZEROES, floats; `_` separates digits) and where it ends.
+fn scan_number(c: &[char], n: usize) -> Result<(Num, usize), String> {
+    let digit = |i: usize, base: u32| c.get(i).and_then(|x| x.to_digit(36)).filter(|&d| d < base);
+    let int_run = |i: &mut usize, base: u32| -> i64 {
+        let mut v: i64 = 0;
+        while *i < c.len() && (c[*i] == '_' || digit(*i, base).is_some()) {
+            if let Some(d) = digit(*i, base) {
+                v = v.wrapping_mul(base as i64).wrapping_add(d as i64);
+            }
+            *i += 1;
+        }
+        v
+    };
+    let dec = |i: usize| c.get(i).is_some_and(|x| x.is_ascii_digit() || *x == '_');
+    if c[n] == '0' {
+        let low = c.get(n + 1).map(|x| x.to_ascii_lowercase());
+        if matches!(low, Some('x' | 'b')) {
+            let mut i = n + 2;
+            let v = int_run(&mut i, if low == Some('x') { 16 } else { 2 });
+            return Ok((Num::I(v), i));
+        }
+        if crate::options::quick("octalzeroes") {
+            let mut p = n + 1;
+            while dec(p) {
+                p += 1;
+            }
+            if p > n + 1 && !matches!(c.get(p), Some('.' | 'e' | 'E' | '#')) {
+                let mut i = n + 1;
+                return Ok((Num::I(int_run(&mut i, 8)), i));
+            }
+        }
+    }
+    let mut i = n;
+    while dec(i) {
+        i += 1;
+    }
+    if matches!(c.get(i), Some('.' | 'e' | 'E')) {
+        if c[i] == '.' {
+            i += 1;
+            while dec(i) {
+                i += 1;
+            }
+        }
+        if matches!(c.get(i), Some('e' | 'E')) {
+            let mut k = i + 1;
+            if matches!(c.get(k), Some('+' | '-')) {
+                k += 1;
+            }
+            if c.get(k).is_some_and(char::is_ascii_digit) {
+                while dec(k) {
+                    k += 1;
+                }
+                i = k;
+            }
+        }
+        let text: String = c[n..i].iter().filter(|&&x| x != '_').collect();
+        let v = text
+            .parse::<f64>()
+            .map_err(|_| "bad floating point constant".to_string())?;
+        if c.get(i) == Some(&'.') {
+            return Err("bad floating point constant".to_string());
+        }
+        return Ok((Num::F(v), i));
+    }
+    let mut i = n;
+    let mut v = int_run(&mut i, 10);
+    if c.get(i) == Some(&'#') {
+        i += 1;
+        if !(2..=36).contains(&v) {
+            return Err(format!("invalid base (must be 2 to 36 inclusive): {}", v));
+        }
+        v = int_run(&mut i, v as u32);
+    }
+    Ok((Num::I(v), i))
+}
+
 // Tokens and where each starts in the text, for error messages.
 fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
+    let force_float = crate::options::is_set("forcefloat");
+    let sh = crate::shell::with_shell(|s| s.emulation == crate::options::Emulation::Sh);
     let c: Vec<char> = s.chars().collect();
     let mut out = Vec::new();
     let mut starts = Vec::new();
@@ -135,40 +216,10 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
         starts.truncate(out.len());
         starts.push(i);
         if ch.is_ascii_digit() || (ch == '.' && c.get(i + 1).is_some_and(|d| d.is_ascii_digit())) {
-            let start = i;
-            // OCTAL_ZEROES: `09` is the number 0 followed by 9.
-            if ch == '0' && crate::options::quick("octalzeroes") {
-                let mut j = i + 1;
-                while j < c.len() && c[j].is_ascii_digit() {
-                    j += 1;
-                }
-                let plain = !matches!(c.get(j), Some('.' | '#' | 'e' | 'E' | 'x' | 'X'));
-                if plain && j > i + 1 {
-                    let mut k = i + 1;
-                    while k < j && ('0'..='7').contains(&c[k]) {
-                        k += 1;
-                    }
-                    if k < j {
-                        let text: String = c[i..k].iter().collect();
-                        out.push(T::Num(parse_value(&text)?));
-                        i = k;
-                        continue;
-                    }
-                }
-            }
-            while i < c.len() {
-                let d = c[i];
-                let exp_sign = matches!(d, '+' | '-')
-                    && matches!(c[i - 1], 'e' | 'E')
-                    && !c[start..i].iter().any(|x| matches!(x, 'x' | 'X' | '#'));
-                if d.is_ascii_alphanumeric() || d == '#' || d == '_' || d == '.' || exp_sign {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            let text: String = c[start..i].iter().collect();
-            out.push(T::Num(parse_value(&text)?));
+            let (v, end) = scan_number(&c, i)?;
+            // FORCE_FLOAT: every constant is a float.
+            out.push(T::Num(if force_float { Num::F(v.as_float()) } else { v }));
+            i = end;
             continue;
         }
         // `##c` (or `#\c`): the character code of c; `#name`: of the
@@ -177,10 +228,33 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
             let code = |x: Option<&char>| x.map(|&x| x as i64);
             if matches!(c.get(i + 1), Some('#' | '\\')) {
                 let mut k = i + 2;
+                // `##\C-a` (control) and `##\M-a` (meta), as bindkey reads them.
+                let mut mask = (0x7fff_ffff_i64, 0);
                 if c[i + 1] == '#' && c.get(k) == Some(&'\\') && k + 1 < c.len() {
                     k += 1;
+                    loop {
+                        match (c.get(k), c.get(k + 1), c.get(k + 2)) {
+                            (Some('C'), Some('-'), Some(_)) => {
+                                mask.0 &= 0x1f;
+                                k += 2;
+                            }
+                            (Some('M'), Some('-'), Some(_)) => {
+                                mask.1 |= 0x80;
+                                k += 2;
+                            }
+                            _ => break,
+                        }
+                        if c.get(k) == Some(&'\\') && k + 1 < c.len() {
+                            k += 1;
+                        }
+                    }
                 }
-                let v = code(c.get(k)).ok_or("character missing after ##")?;
+                let v = code(c.get(k)).ok_or("bad math expression: character missing after ##")?;
+                let v = if mask.0 == 0x1f && v == '?' as i64 {
+                    0x7f
+                } else {
+                    (v & mask.0) | mask.1
+                };
                 out.push(T::Num(Num::I(v)));
                 i = k + 1;
                 continue;
@@ -202,12 +276,53 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
                 continue;
             }
         }
-        if crate::lexer::is_name_start(ch) {
+        if crate::lexer::is_name_start(ch)
+            || (ch == '.'
+                && c.get(i + 1)
+                    .is_some_and(|&x| crate::lexer::is_name_start(x)))
+        {
             let start = i;
-            while i < c.len() && crate::lexer::is_name_char(c[i]) {
-                i += 1;
+            // Namespaced names (`.ns.var`) only with the leading dot.
+            match crate::lexer::name_end(&c, i).filter(|_| ch == '.') {
+                Some(e) => i = e,
+                None => {
+                    while i < c.len() && crate::lexer::is_name_char(c[i]) {
+                        i += 1;
+                    }
+                }
             }
-            out.push(T::Ident(c[start..i].iter().collect()));
+            // `name[sub]`: an element; the subscript is kept as text.
+            if c.get(i) == Some(&'[') {
+                let mut depth = 0;
+                let mut k = i;
+                while k < c.len() {
+                    match c[k] {
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if k < c.len() {
+                    i = k + 1;
+                }
+            }
+            let word: String = c[start..i].iter().collect();
+            // `Inf` and `NaN`, in any case, are float constants.
+            if sh {
+                out.push(T::Ident(word));
+            } else if word.eq_ignore_ascii_case("inf") {
+                out.push(T::Num(Num::F(f64::INFINITY)));
+            } else if word.eq_ignore_ascii_case("nan") {
+                out.push(T::Num(Num::F(f64::NAN)));
+            } else {
+                out.push(T::Ident(word));
+            }
             continue;
         }
         let mut matched = false;
@@ -221,7 +336,7 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
             }
         }
         if !matched {
-            return Err(format!("bad math expression: illegal character: {}", c[i]));
+            return Err(format!("bad math expression: invalid character: {}", c[i]));
         }
     }
     starts.truncate(out.len());
@@ -229,6 +344,8 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
 }
 
 struct P {
+    // C_PRECEDENCES: C's operator order instead of zsh's.
+    cprec: bool,
     toks: Vec<T>,
     pos: usize,
     src: Vec<char>,
@@ -237,7 +354,39 @@ struct P {
 
 type R = Result<Num, String>;
 
+// `name[sub]` with its subscript evaluated once, so `a[++x]++` steps x
+// a single time: array subscripts are arithmetic, hash keys are text.
+fn resolve(ident: &str) -> Result<String, String> {
+    let Some((name, sub)) = ident.split_once('[') else {
+        return Ok(ident.to_string());
+    };
+    let sub = sub.strip_suffix(']').unwrap_or(sub);
+    let target = crate::shell::split_target_pub(&crate::shell::resolve_ref(name));
+    if crate::shell::with_shell(|s| s.assoc(&target).is_some()) || matches!(sub, "@" | "*") {
+        return Ok(ident.to_string());
+    }
+    let n = eval_num(sub)?.as_int();
+    Ok(format!("{}[{}]", name, n))
+}
+
 fn var_value(name: &str) -> R {
+    let v = var_value_raw(name)?;
+    // FORCE_FLOAT: integer variables read as floats.
+    Ok(match v {
+        Num::I(n) if crate::options::is_set("forcefloat") => Num::F(n as f64),
+        v => v,
+    })
+}
+
+fn var_value_raw(name: &str) -> R {
+    if name.contains('[') {
+        let val =
+            crate::expand::expand_string(&format!("${{{}}}", name)).map_err(|_| String::new())?;
+        if val.trim().is_empty() {
+            return Ok(Num::I(0));
+        }
+        return parse_value(&val).or_else(|_| eval_num(&val));
+    }
     let Some(val) = crate::shell::var_get_opt(name) else {
         if crate::shell::opt_set(crate::types::OPT_NOUNSET) {
             return Err(format!("{}: parameter not set", name));
@@ -384,7 +533,7 @@ fn call_user(m: &MathFunc, args: Vec<String>) -> R {
     }
     let mut words = vec![m.name.clone()];
     words.extend(args);
-    crate::exec::call_function(&body, &words, line);
+    crate::shell::in_eval_context("math", || crate::exec::call_function(&body, &words, line));
     Ok(LAST_VALUE.lock().ok().and_then(|l| *l).unwrap_or(Num::I(0)))
 }
 
@@ -470,20 +619,40 @@ impl P {
         ) {
             if matches!(
                 op,
-                "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>=" | "&=" | "^=" | "|="
+                "=" | "+="
+                    | "-="
+                    | "*="
+                    | "/="
+                    | "%="
+                    | "<<="
+                    | ">>="
+                    | "&="
+                    | "^="
+                    | "|="
+                    | "**="
+                    | "&&="
+                    | "||="
+                    | "^^="
             ) {
                 self.pos += 2;
                 let rhs = self.assign(skip)?;
                 if skip {
                     return Ok(Num::I(0));
                 }
-                let v = if op == "=" {
-                    rhs
-                } else {
-                    binop(&op[..op.len() - 1], var_value(&name)?, rhs)?
+                let name = resolve(&name)?;
+                let v = match op {
+                    "=" => rhs,
+                    "&&=" | "||=" | "^^=" => {
+                        let (l, r) = (var_value(&name)?.truthy(), rhs.truthy());
+                        Num::I(match op {
+                            "&&=" => l && r,
+                            "||=" => l || r,
+                            _ => l != r,
+                        } as i64)
+                    }
+                    _ => binop(&op[..op.len() - 1], var_value(&name)?, rhs)?,
                 };
-                set_var(&name, v)?;
-                return Ok(v);
+                return set_var(&name, v);
             }
         }
         self.ternary(skip)
@@ -505,7 +674,12 @@ impl P {
 
     fn lor(&mut self, skip: bool) -> R {
         let mut l = self.land(skip)?;
-        while self.eat_op(&["||"]).is_some() {
+        while let Some(op) = self.eat_op(&["||", "^^"]) {
+            if op == "^^" {
+                let r = self.land(skip)?;
+                l = Num::I((l.truthy() != r.truthy()) as i64);
+                continue;
+            }
             let r = self.land(skip || l.truthy())?;
             l = Num::I((l.truthy() || r.truthy()) as i64);
         }
@@ -521,9 +695,9 @@ impl P {
         Ok(l)
     }
 
-    // Binary levels from loosest to tightest.
+    // Binary levels from loosest to tightest; `**` is right-associative.
     fn binary(&mut self, level: usize, skip: bool) -> R {
-        const LEVELS: &[&[&str]] = &[
+        const C_LEVELS: &[&[&str]] = &[
             &["|"],
             &["^"],
             &["&"],
@@ -532,13 +706,30 @@ impl P {
             &["<<", ">>"],
             &["+", "-"],
             &["*", "/", "%"],
+            &["**"],
         ];
-        if level >= LEVELS.len() {
-            return self.power(skip);
+        const ZSH_LEVELS: &[&[&str]] = &[
+            &["==", "!="],
+            &["<", "<=", ">", ">="],
+            &["+", "-"],
+            &["*", "/", "%"],
+            &["**"],
+            &["|"],
+            &["^"],
+            &["&"],
+            &["<<", ">>"],
+        ];
+        let levels = if self.cprec { C_LEVELS } else { ZSH_LEVELS };
+        if level >= levels.len() {
+            return self.unary(skip);
         }
         let mut l = self.binary(level + 1, skip)?;
-        while let Some(op) = self.eat_op(LEVELS[level]) {
-            let r = self.binary(level + 1, skip)?;
+        while let Some(op) = self.eat_op(levels[level]) {
+            let r = if op == "**" {
+                self.binary(level, skip)?
+            } else {
+                self.binary(level + 1, skip)?
+            };
             l = match op {
                 "==" | "!=" | "<" | "<=" | ">" | ">=" => Num::I(compare(op, l, r) as i64),
                 _ if skip => Num::I(0),
@@ -546,18 +737,6 @@ impl P {
             };
         }
         Ok(l)
-    }
-
-    fn power(&mut self, skip: bool) -> R {
-        let base = self.unary(skip)?;
-        if self.eat_op(&["**"]).is_some() {
-            let exp = self.power(skip)?;
-            if skip {
-                return Ok(Num::I(0));
-            }
-            return binop("**", base, exp);
-        }
-        Ok(base)
     }
 
     fn unary(&mut self, skip: bool) -> R {
@@ -571,10 +750,14 @@ impl P {
                 if skip {
                     return Ok(Num::I(0));
                 }
+                // `++a++`: the result of ++a is not an lvalue.
+                if matches!(self.peek(), Some(T::Op("++" | "--"))) {
+                    return Err("bad math expression: lvalue required".to_string());
+                }
+                let name = resolve(&name)?;
                 let v = var_value(&name)?;
                 let nv = binop(if op == "++" { "+" } else { "-" }, v, Num::I(1))?;
-                set_var(&name, nv)?;
-                return Ok(nv);
+                return set_var(&name, nv);
             }
             let v = self.unary(skip)?;
             return Ok(match (op, v) {
@@ -646,6 +829,7 @@ impl P {
                     if skip {
                         return Ok(Num::I(0));
                     }
+                    let name = resolve(&name)?;
                     let v = var_value(&name)?;
                     let nv = binop(if op == "++" { "+" } else { "-" }, v, Num::I(1))?;
                     set_var(&name, nv)?;
@@ -654,7 +838,7 @@ impl P {
                 if skip {
                     return Ok(Num::I(0));
                 }
-                var_value(&name)
+                var_value(&resolve(&name)?)
             }
             Some(T::Op("(")) => {
                 self.pos += 1;
@@ -670,13 +854,65 @@ impl P {
     }
 }
 
-fn set_var(name: &str, v: Num) -> Result<(), String> {
-    if crate::shell::var_set(name, &v.to_string(), false) {
-        Ok(())
-    } else {
-        Err(format!("read-only variable: {}", name))
+// Assigns in math context and returns the value as stored: an integer
+// parameter truncates. A new parameter (or an array) becomes an integer
+// or a float, unless POSIX_IDENTIFIERS.
+fn set_var(name: &str, v: Num) -> Result<Num, String> {
+    use crate::params::{FLOAT_E, FLOAT_F, INTEGER};
+    use std::sync::atomic::Ordering;
+    if let Some((base, sub)) = name.split_once('[') {
+        let sub = sub.strip_suffix(']').unwrap_or(sub);
+        return match crate::exec::set_subscripted(base, sub, &v.to_string(), false) {
+            Ok(true) => Ok(v),
+            _ => Err(String::new()),
+        };
     }
+    let target = crate::shell::split_target_pub(&crate::shell::resolve_ref(name));
+    let (attrs, fresh) = crate::shell::with_shell(|s| match s.param(&target) {
+        Some(p) if p.is_array() || p.is_assoc() => (0, true),
+        Some(p) if p.attrs & crate::params::UNSET != 0 && p.attrs & NUMERIC_BITS == 0 => {
+            (p.attrs, true)
+        }
+        Some(p) => (p.attrs, false),
+        None => (0, true),
+    });
+    let v = if attrs & INTEGER != 0 {
+        Num::I(v.as_int())
+    } else if attrs & (FLOAT_E | FLOAT_F) != 0 {
+        Num::F(v.as_float())
+    } else {
+        v
+    };
+    let fresh = fresh && !crate::options::quick("posixidentifiers");
+    if fresh {
+        crate::shell::with_shell(|s| {
+            if s.param(&target)
+                .is_some_and(|p| p.is_array() || p.is_assoc())
+            {
+                s.remove_param(&target);
+            }
+        });
+    }
+    crate::shell::ARITH_ASSIGN.store(true, Ordering::SeqCst);
+    let ok = crate::shell::var_set(name, &v.to_string(), false);
+    crate::shell::ARITH_ASSIGN.store(false, Ordering::SeqCst);
+    if !ok {
+        return Err(format!("read-only variable: {}", name));
+    }
+    if fresh {
+        crate::shell::with_shell(|s| {
+            if let Some(p) = s.param_mut(&target) {
+                p.attrs |= match v {
+                    Num::I(_) => INTEGER,
+                    Num::F(_) => FLOAT_F,
+                };
+            }
+        });
+    }
+    Ok(v)
 }
+
+const NUMERIC_BITS: u32 = crate::params::NUMERIC;
 
 /// Evaluates an arithmetic expression whose parameter expansions and
 /// command substitutions have already been performed.
@@ -686,6 +922,7 @@ pub fn eval_num(expr: &str) -> R {
         return Ok(Num::I(0));
     }
     let mut p = P {
+        cprec: crate::options::is_set("cprecedences"),
         toks,
         pos: 0,
         src: expr.chars().collect(),
@@ -699,6 +936,7 @@ pub fn eval_num(expr: &str) -> R {
         return Err(match &p.toks[p.pos] {
             T::Op(":") => "bad math expression: ':' without '?'".to_string(),
             T::Op("=") => "bad math expression: lvalue required".to_string(),
+            T::Op(")") => "bad math expression: unexpected ')'".to_string(),
             _ => p.expected("operator"),
         });
     }
@@ -716,6 +954,7 @@ mod tests {
 
     #[test]
     fn precedence_and_associativity() {
+        let _g = crate::zsh_test_guard();
         assert_eq!(eval("10-2-3"), Ok(5));
         assert_eq!(eval("3*(2+1)"), Ok(9));
         assert_eq!(eval(" (1+2)*3 "), Ok(9));

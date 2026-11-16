@@ -184,6 +184,15 @@ pub fn in_trap() -> bool {
     IN_TRAP.load(Ordering::SeqCst)
 }
 
+/// A signal that arrived and has a trap set, if any.
+pub fn pending_trapped() -> Option<i32> {
+    let bits = PENDING.load(Ordering::SeqCst);
+    (1..64).find(|&sig| {
+        bits & (1u64 << sig) != 0
+            && with_shell(|s| s.traps.get(&sig).is_some_and(|a| !a.is_empty()))
+    })
+}
+
 /// True if a signal arrived that has not been handled yet.
 pub fn has_pending() -> bool {
     PENDING.load(Ordering::SeqCst) != 0
@@ -224,9 +233,15 @@ pub fn run_pending() {
 pub fn run_action(action: &str) {
     IN_TRAP.store(true, Ordering::SeqCst);
     let saved = with_shell(|s| s.last_status);
-    crate::exec::run_string(action);
+    let st = crate::shell::in_eval_context("trap", || crate::exec::run_string(action));
+    // A TRAPxxx function returning non-zero makes the function it
+    // interrupted return with that status.
+    let trap_func = action.starts_with("TRAP") && !action.contains(';');
     with_shell(|s| {
-        if !matches!(s.flow, Flow::Exit(_)) {
+        if trap_func && st != 0 && s.flow == Flow::None && s.func_depth > 0 {
+            s.flow = Flow::Return(st);
+            s.last_status = st;
+        } else if !matches!(s.flow, Flow::Exit(_) | Flow::Return(_)) {
             s.last_status = saved;
         }
     });
