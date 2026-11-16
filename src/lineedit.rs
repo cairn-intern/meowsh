@@ -186,7 +186,6 @@ impl MeowshHelper {
 
     fn get_completions(&self, line: &str) -> Vec<rustyline::completion::Pair> {
         let mut completions = Vec::new();
-        let shell = crate::shell::SHELL.shell.lock().unwrap();
 
         let parts: Vec<&str> = line.split_whitespace().collect();
         // Command position: empty line, single word without '/', or after a pipe/operator
@@ -196,6 +195,9 @@ impl MeowshHelper {
 
         if is_cmd_position {
             let current = parts.last().unwrap_or(&"");
+            // Held only here: path completion reads variables, which lock
+            // the shell themselves.
+            let shell = crate::shell::SHELL.shell.lock().unwrap();
 
             let aliases: Vec<String> = shell
                 .assoc(crate::types::ALIASES)
@@ -1028,6 +1030,29 @@ mod tests {
         let partial_str = partial.to_str().unwrap();
         helper.complete_paths(partial_str, &mut completions, false);
         assert!(completions.iter().any(|c| c.display == ".hidden"));
+    }
+
+    #[test]
+    fn tilde_paths_complete_without_deadlocking() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("Projects")).unwrap();
+        std::fs::create_dir(home.path().join("Pictures")).unwrap();
+        let old_home = crate::shell::var_get_opt("HOME");
+        crate::shell::var_set("HOME", &home.path().to_string_lossy(), false);
+        // Expanding `~` reads $HOME, which takes the shell lock; holding it
+        // across that call hung the shell.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(MeowshHelper.get_completions("ls ~/P"));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("completion deadlocked");
+        crate::shell::var_set("HOME", old_home.as_deref().unwrap_or(""), false);
+        let mut names: Vec<_> = got.into_iter().map(|p| p.replacement).collect();
+        names.sort();
+        assert_eq!(names, ["~/Pictures/", "~/Projects/"]);
     }
 
     #[test]
