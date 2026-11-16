@@ -172,6 +172,18 @@ echo /usr/local/bin/meowsh | sudo tee -a /etc/shells
 chsh -s /usr/local/bin/meowsh
 ```
 
+Add meowsh to `/etc/shells` even if you only use it as your terminal's
+shell. Tools that open a new terminal in the current terminal's directory,
+such as Omarchy's Super + Enter, read the directory of the shell running in
+the focused window, but only trust it when that shell's path is listed in
+`/etc/shells`. Otherwise the new terminal opens in `$HOME`. List the path
+you actually run, for example `~/.cargo/bin/meowsh` after `cargo install`.
+
+Reinstalling meowsh replaces the binary under shells that are still
+running, so the kernel reports their path as `meowsh (deleted)`. That path
+no longer matches `/etc/shells`, so those windows fall back to `$HOME`
+until you open a fresh shell.
+
 ## Development
 
 The source code is written in Rust and located in the `src/` directory. Run the checks with:
