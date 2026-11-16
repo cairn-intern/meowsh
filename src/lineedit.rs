@@ -378,17 +378,6 @@ impl MeowshHelper {
         }
 
         completions.sort_by(|a, b| a.display.cmp(&b.display));
-
-        // If the only match is a directory, expand into it so the user can
-        // keep tabbing into its contents instead of cycling back.
-        if completions.len() == 1 && completions[0].replacement.ends_with('/') {
-            let dir_path = completions[0].replacement.clone();
-            let mut inner = Vec::new();
-            self.complete_paths(&dir_path, &mut inner, dirs_only);
-            if !inner.is_empty() {
-                *completions = inner;
-            }
-        }
     }
 }
 
@@ -1042,15 +1031,14 @@ mod tests {
         helper.complete_paths(partial_str, &mut completions, false);
         assert!(completions.iter().any(|c| c.display == "hello.txt"));
 
-        // When a single directory matches, it auto-expands into its contents.
-        // Add a file inside subdir so the expansion has results.
+        // A single matching directory is completed, not entered, as in zsh.
         std::fs::write(sub_dir.join("inner.txt"), "").unwrap();
         let mut completions = Vec::new();
         let partial = tmp.path().join("sub");
         let partial_str = partial.to_str().unwrap();
         helper.complete_paths(partial_str, &mut completions, false);
-        // "subdir/" was the only match, so it expanded into its contents
-        assert!(completions.iter().any(|c| c.display == "inner.txt"));
+        let shown: Vec<&str> = completions.iter().map(|c| c.display.as_str()).collect();
+        assert_eq!(shown, ["subdir/"]);
 
         // When multiple dirs/files match the prefix, directories keep their slash
         std::fs::create_dir(tmp.path().join("submarine")).unwrap();
@@ -1177,6 +1165,21 @@ mod tests {
 
         let file_comp = completions.iter().find(|c| c.display == "myfile").unwrap();
         assert!(!file_comp.replacement.ends_with('/'));
+    }
+
+    #[test]
+    fn a_lone_directory_match_is_completed_not_entered() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("rust-remake/assets")).unwrap();
+        let partial = format!("{}/r", tmp.path().display());
+        // As zsh does: `cd dir/r` gives `dir/rust-remake/`, not what is in it.
+        for dirs_only in [true, false] {
+            let mut completions = Vec::new();
+            MeowshHelper.complete_paths(&partial, &mut completions, dirs_only);
+            let got: Vec<&str> = completions.iter().map(|c| c.replacement.as_str()).collect();
+            assert_eq!(got, [format!("{}/rust-remake/", tmp.path().display())]);
+        }
     }
 
     #[test]
