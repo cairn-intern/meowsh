@@ -738,7 +738,7 @@ pub fn set_ref_target(name: &str, target: &str) -> bool {
             true
         });
     if looping {
-        shell_err(&format!("{}: invalid self reference", name));
+        shell_err(&format!("{}: invalid self reference", base));
         return false;
     }
     with_shell(|s| {
@@ -762,6 +762,16 @@ pub fn set_ref_target(name: &str, target: &str) -> bool {
     true
 }
 
+thread_local! {
+    static REF_TYPE_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether an assignment through a reference just tried to change a hidden
+/// parameter's type (and was undone).
+pub fn take_ref_type_error() -> bool {
+    REF_TYPE_ERROR.with(|e| e.replace(false))
+}
+
 /// While alive, the parameter a nameref was bound to sits in place of
 /// the local that hides it, so reads and writes through the reference
 /// reach it (zsh binds references to a scope, not just a name).
@@ -769,6 +779,8 @@ pub struct RefSwap {
     target: String,
     scope: Option<usize>,
     visible: Option<Param>,
+    // The hidden parameter as it was: its type may not change.
+    hidden: Option<Param>,
 }
 
 impl RefSwap {
@@ -789,11 +801,12 @@ impl RefSwap {
             match s.hidden_scope(&target, level)? {
                 Some(scope) => {
                     let hidden = s.local_scopes[scope].get(&target).cloned().flatten()?;
-                    let visible = s.params.insert(target.clone(), hidden);
+                    let visible = s.params.insert(target.clone(), hidden.clone());
                     Some(RefSwap {
                         target,
                         scope: Some(scope),
                         visible,
+                        hidden: Some(hidden),
                     })
                 }
                 // Nothing at the bound scope: the reference sees nothing.
@@ -803,6 +816,7 @@ impl RefSwap {
                         target,
                         scope: None,
                         visible,
+                        hidden: None,
                     })
                 }
             }
@@ -812,15 +826,34 @@ impl RefSwap {
 
 impl Drop for RefSwap {
     fn drop(&mut self) {
-        with_shell(|s| {
-            let cur = s.params.remove(&self.target);
+        let kind = |p: &Param| (p.is_array(), p.is_assoc());
+        let changed = with_shell(|s| {
+            let mut cur = s.params.remove(&self.target);
+            // zsh refuses to change a hidden parameter's type through a
+            // reference: put it back as it was.
+            let changed = match (&self.hidden, &cur) {
+                (Some(h), Some(c)) => kind(h) != kind(c),
+                _ => false,
+            };
+            if changed {
+                cur = self.hidden.clone();
+            }
             if let Some(slot) = self.scope.and_then(|j| s.local_scopes.get_mut(j)) {
                 slot.insert(self.target.clone(), cur);
             }
             if let Some(v) = self.visible.take() {
                 s.params.insert(self.target.clone(), v);
             }
+            changed
         });
+        if changed {
+            shell_err(&format!(
+                "can't change type of hidden variable: {}",
+                self.target
+            ));
+            REF_TYPE_ERROR.with(|e| e.set(true));
+            crate::exec::abort_command(1);
+        }
     }
 }
 
@@ -1055,6 +1088,10 @@ pub fn array_set(name: &str, items: Vec<String>) -> bool {
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
+    }
+    // A value makes a declared-but-unset parameter (TYPESET_TO_UNSET) set.
+    if let Some(p) = shell.param_mut(name) {
+        p.attrs &= !UNSET;
     }
     if shell.assoc(name).is_some() {
         if !items.len().is_multiple_of(2) {

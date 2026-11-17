@@ -1175,7 +1175,9 @@ pub fn set_subscripted(name: &str, sub: &str, v: &str, append: bool) -> Result<b
     if append {
         return append_subscripted(name, sub, v);
     }
-    let is_assoc = with_shell(|s| s.assoc(name).is_some())
+    // Through a reference, the kind of what it refers to.
+    let target = crate::shell::split_target_pub(&crate::shell::resolve_ref(name));
+    let is_assoc = with_shell(|s| s.assoc(&target).is_some())
         || (name == "functions" && crate::zparam::functions_special());
     if sub.contains(',') && !is_assoc {
         let sub = expand_string(sub).map_err(|e| e.status)?;
@@ -1297,7 +1299,7 @@ fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
             }
         }
     };
-    if ok {
+    if ok && !crate::shell::take_ref_type_error() {
         Ok(())
     } else {
         Err(1)

@@ -1139,3 +1139,52 @@ fn p_and_t_flags_give_the_named_parameters_type() {
     let (_, out, _) = sh("typeset -a arr; v=arr; print -r -- ${(Pt)v} ${(t)v}");
     assert_eq!(out, "array scalar\n");
 }
+
+#[test]
+fn reference_cannot_change_a_hidden_parameters_type() {
+    let (_, out, err) = sh("typeset -a arr=(a b); () { typeset -n R=arr; typeset arr; \
+         { R=foo } always { TRY_BLOCK_ERROR=0 }; echo $? }; typeset -p arr");
+    assert_eq!(out, "1\ntypeset -a arr=( a b )\n");
+    assert!(
+        err.contains("can't change type of hidden variable: arr"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn subscript_through_a_reference_uses_the_targets_kind() {
+    let (_, out, _) = sh("typeset -A var=(k1 v1); typeset -n ptr=var; ptr[k2]=v2; typeset -p var");
+    assert_eq!(out, "typeset -A var=( [k1]=v1 [k2]=v2 )\n");
+}
+
+#[test]
+fn nameref_errors_name_what_zsh_names() {
+    let (_, _, err) = sh("typeset -n ptr[1]=var");
+    assert!(
+        err.contains("reference variable cannot be an array"),
+        "{}",
+        err
+    );
+    let (_, _, err) = sh("typeset -n p; typeset -t p");
+    assert!(
+        err.contains("p: can't change type of a named reference"),
+        "{}",
+        err
+    );
+    let (_, _, err) = sh("typeset -A ass=(a b); typeset -n Ass=ass; typeset Ass=foo");
+    assert!(
+        err.contains("ass: inconsistent type for assignment"),
+        "{}",
+        err
+    );
+    let (_, _, err) =
+        sh("typeset ptr1=foo; () { typeset -n ptr1; typeset -n ptr2=ptr1; ptr1=ptr2 }");
+    assert!(err.contains("ptr2: invalid self reference"), "{}", err);
+}
+
+#[test]
+fn array_assignment_sets_a_declared_unset_array() {
+    let (_, out, _) = sh("setopt typesettounset; typeset -a x; x=(c d); typeset -p x");
+    assert_eq!(out, "typeset -a x=( c d )\n");
+}

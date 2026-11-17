@@ -625,6 +625,10 @@ fn typeset_single(
         }
         return false;
     }
+    if subscript.is_some() && on & NAMEREF != 0 {
+        warn(cmd, "reference variable cannot be an array");
+        return false;
+    }
     let level = locallevel();
     // A nameref stands for what it refers to, unless -n/+n is given or a
     // new local is being made.
@@ -643,7 +647,7 @@ fn typeset_single(
     // A placeholder reference (one referring to nothing yet) can't become
     // an array or a number.
     if on & NAMEREF == 0
-        && on & (K_ARRAY | K_ASSOC | INTEGER | FLOAT_E | FLOAT_F) != 0
+        && on & (K_ARRAY | K_ASSOC | INTEGER | FLOAT_E | FLOAT_F | TAG) != 0
         && existing
             .as_ref()
             .is_some_and(|p| p.attrs & NAMEREF != 0 && (p.level == level || on & LOCAL == 0))
@@ -778,7 +782,10 @@ fn typeset_single(
             matches!(asg, DeclArg::Assign { value: Some(_), .. }) && kind_bits(&pm) != 0
         };
         if inconsistent {
-            warn(cmd, &format!("{}: inconsistent type for assignment", pname));
+            warn(
+                cmd,
+                &format!("{}: inconsistent type for assignment", base_name),
+            );
             return false;
         }
         on &= !LOCAL;
@@ -884,7 +891,10 @@ fn typeset_single(
     } else {
         matches!(asg, DeclArg::Assign { value: Some(_), .. }) && on & (K_ARRAY | K_ASSOC) != 0
     } {
-        warn(cmd, &format!("{}: inconsistent type for assignment", pname));
+        warn(
+            cmd,
+            &format!("{}: inconsistent type for assignment", base_name),
+        );
         return false;
     }
     // A local special array (path, fpath, ...) stays an array: a scalar
