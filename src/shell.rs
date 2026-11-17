@@ -1044,7 +1044,13 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
         return true;
     }
     assign_warning(name, "scalar");
-    let attrs = with_shell(|s| s.param(name).map(|p| p.attrs).unwrap_or(0));
+    // zsh's integer specials that start unset take their type when set.
+    let fresh = if name == "ZLE_RPROMPT_INDENT" {
+        INTEGER
+    } else {
+        0
+    };
+    let attrs = with_shell(|s| s.param(name).map(|p| p.attrs).unwrap_or(fresh));
     if attrs & READONLY != 0 {
         readonly_error(name, attrs);
         return false;
@@ -1058,10 +1064,11 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
     };
     let mut shell = SHELL.shell.lock().unwrap();
     let allexport = shell.opts & OPT_ALLEXPORT != 0;
-    let p = shell
-        .params
-        .entry(name.to_string())
-        .or_insert_with(|| Param::scalar(""));
+    let p = shell.params.entry(name.to_string()).or_insert_with(|| {
+        let mut p = Param::scalar("");
+        p.attrs = fresh;
+        p
+    });
     if export || allexport {
         p.attrs |= EXPORT;
     }

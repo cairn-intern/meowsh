@@ -757,6 +757,19 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
             emit_str(ctx, &v, quoted);
             Ok(end)
         }
+        // `$(\<newline>(`: the escaped newline goes, so this can still be
+        // `$((...))` (the lexer joins the line before deciding).
+        '(' if chars.get(i + 2) == Some(&'\\')
+            && chars.get(i + 3) == Some(&'\n')
+            && chars.get(i + 4) == Some(&'(') =>
+        {
+            let joined: Vec<char> = chars[..i + 2]
+                .iter()
+                .chain(&chars[i + 4..])
+                .copied()
+                .collect();
+            Ok(expand_dollar(&joined, i, mode, ctx)? + 2)
+        }
         '(' => {
             let arith_end = scan_arith(chars, i + 1);
             let Some(end) = arith_end.or_else(|| scan_paren(chars, i + 1)) else {
@@ -1071,7 +1084,7 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
                 f.join_pattern = f.tilde;
             }
             // Strings later flags insert are patterns.
-            '~' => f.tilde = true,
+            '~' => f.tilde = !f.tilde,
             's' => {
                 let a = arg(&mut i)?;
                 f.split = Some(if f.escapes { p_flag_arg(&a) } else { a });
@@ -1129,7 +1142,8 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             'p' => f.escapes = true,
             'l' | 'r' => {
                 let d = *body.get(i)?;
-                let n_text = arg(&mut i)?;
+                // The width is expanded, then evaluated (zsh's get_intarg).
+                let n_text = expand_string(&arg(&mut i)?).ok()?;
                 let n = eval_arith_str(n_text.trim()).ok()?.max(0) as usize;
                 // Further strings must use the same delimiter.
                 let mut more = Vec::new();
@@ -3513,12 +3527,13 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         // A nested expansion is quoted when the outer one is, so a split
         // in it keeps empty fields.
         val = braced(&body[i + 2..end - 1], mode)?;
-        // In double quotes a nested array joins unless it has its own (@).
+        // In double quotes a nested array joins unless it has its own (@)
+        // or (A).
         let inner_at = body.get(i + 2) == Some(&'(')
             && body[i + 3..end - 1]
                 .iter()
                 .take_while(|&&c| c != ')')
-                .any(|&c| c == '@');
+                .any(|&c| c == '@' || c == 'A');
         if mode != Mode::Unquoted && !inner_at && body.get(end) == Some(&'[') {
             if let Val::List(items, _) = &val {
                 val = Val::Str(items.join(&ifs_first()));
@@ -3809,6 +3824,7 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         apply_operator(val, &name, sub.as_deref(), rest, mode, &text, &flags)?
     };
     let assigned = ASSIGNED.with(|a| a.borrow_mut().take());
+    let did_assign = assigned.is_some();
     if let (true, Some(items)) = (ifs_split, assigned) {
         val = Val::List(items, false);
         flags.ifs_split = false;
@@ -3831,6 +3847,12 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
     }
     if flags.any {
         val = apply_flags(val, &flags, quoted)?;
+    }
+    // "${(A)name=...}": the array assigned joins in double quotes, unless (@).
+    if quoted && did_assign && !flags.at {
+        if let Val::List(items, false) = val {
+            val = Val::List(items, true);
+        }
     }
     if length {
         let v = plain(val);
@@ -4280,6 +4302,16 @@ fn expand_braced(body: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
         Some(false) => ctx.param_tag |= NG,
         None => {}
     }
+    // ${==x:-word}: nor do the word's own expansions split.
+    let val = match val {
+        Val::Tagged(fields) if split == Some(false) => Val::Tagged(
+            fields
+                .into_iter()
+                .map(|f| f.into_iter().map(|(c, t)| (c, t & !S)).collect())
+                .collect(),
+        ),
+        v => v,
+    };
     let val = match val {
         // ${~x-"word"}: even quoted parts of the word become patterns.
         Val::Tagged(fields) if glob == Some(true) => Val::Tagged(

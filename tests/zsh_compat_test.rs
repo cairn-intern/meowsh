@@ -1188,3 +1188,61 @@ fn array_assignment_sets_a_declared_unset_array() {
     let (_, out, _) = sh("setopt typesettounset; typeset -a x; x=(c d); typeset -p x");
     assert_eq!(out, "typeset -a x=( c d )\n");
 }
+
+#[test]
+fn pad_width_is_expanded_before_evaluation() {
+    let (_, out, _) = sh("w=6; x=ab; print -r -- \"[${(r:$w::-:)x}]\"");
+    assert_eq!(out, "[ab----]\n");
+}
+
+#[test]
+fn nested_a_flag_keeps_an_array_in_double_quotes() {
+    let (_, out, _) = sh("o=Option1; print -r -- \"[${${(As:;:)o}[1]}]\"");
+    assert_eq!(out, "[Option1]\n");
+}
+
+#[test]
+fn quoted_array_assignment_expansion_joins() {
+    let (_, out, _) = sh("set a 'b c' d; print -l \"${(A)foo::=$@}\"; print -l $foo");
+    assert_eq!(out, "a b c d\na\nb c\nd\n");
+}
+
+#[test]
+fn escaped_newline_after_dollar_paren_can_still_be_arithmetic() {
+    let (_, out, _) = sh("eval $'echo $(\\\\\\n( 15 / 3 ))'");
+    assert_eq!(out, "5\n");
+}
+
+#[test]
+fn zle_rprompt_indent_is_an_integer() {
+    let (_, out, _) =
+        sh("print ${ZLE_RPROMPT_INDENT-unset}; ZLE_RPROMPT_INDENT=; print $ZLE_RPROMPT_INDENT");
+    assert_eq!(out, "unset\n0\n");
+}
+
+#[test]
+fn doubled_tilde_flag_and_doubled_equals_toggle_off() {
+    let (_, out, _) = sh(
+        "foo=('|' '?'); [[ '|' = ${(~~j.|.)foo} ]] && print yes || print no; \
+         emulate sh; a='1 2' b='3 4'; print -l ${==1:-$a $b}",
+    );
+    assert_eq!(out, "no\n1 2 3 4\n");
+}
+
+#[test]
+fn typeset_t_ties_an_existing_scalar() {
+    let (_, out, _) = sh("S=a:b; typeset -T S s; print -r -- $S $s");
+    assert_eq!(out, "a:b a b\n");
+    let (st, _, err) = sh("typeset -T t1 t2 +; typeset -T t2 t1 +");
+    assert_eq!(st, 1);
+    assert!(err.contains("already tied as non-scalar: t2"), "{}", err);
+}
+
+#[test]
+fn unset_special_tied_pair_stays_tied() {
+    let (_, out, _) = sh(
+        "unset fignore; print $+FIGNORE; fignore=(a b); print $FIGNORE; \
+         unset FIGNORE; FIGNORE=c:d; print $fignore",
+    );
+    assert_eq!(out, "0\na:b\nc d\n");
+}

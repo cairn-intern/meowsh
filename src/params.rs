@@ -288,6 +288,7 @@ impl Shell {
         }
         if let Some(o) = self.tie_partner(name, &other) {
             o.value = derived;
+            o.attrs &= !UNSET;
         }
     }
 

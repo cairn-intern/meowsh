@@ -790,8 +790,14 @@ fn typeset_single(
         }
         on &= !LOCAL;
         if on == 0 && roff == 0 && !has_value(asg) {
-            // Re-tying an existing pair (typeset -T) prints nothing.
-            if tie.is_some() {
+            // typeset -T on an existing parameter prints nothing; one not
+            // tied yet becomes tied.
+            if let Some(t) = &tie {
+                with_shell(|s| {
+                    if let Some(p) = s.param_mut(base_name) {
+                        p.tie = Some(t.clone());
+                    }
+                });
             } else if ops.isset('p') {
                 out(&print_param(
                     pname,
@@ -1168,6 +1174,10 @@ fn typeset_tied(cmd: &str, on: u32, off: u32, roff: u32, ops: &Opts, rest: &[Dec
     let mut old_value = None;
     if let Some(p) = &existing {
         if p.attrs & UNSET == 0 && (level == p.level || on & LOCAL == 0) {
+            if p.tie.is_some() && p.is_array() {
+                warn(cmd, &format!("already tied as non-scalar: {}", sname));
+                return 1;
+            }
             if let Some((other, _)) = &p.tie {
                 if other != &aname {
                     warn(cmd, &format!("can't tie already tied scalar: {}", sname));

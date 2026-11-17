@@ -867,6 +867,30 @@ fn builtin_unset(words: &[String]) -> i32 {
             status = 1;
             continue;
         }
+        // A special tied pair (MANPATH/manpath) stays special and tied:
+        // both sides go unset, and assigning either sets both again.
+        let special_pair = with_shell(|s| {
+            s.param(a.as_str()).and_then(|p| {
+                let t = p.tie.clone()?;
+                (p.attrs & crate::params::SPECIAL != 0).then_some(t.0)
+            })
+        });
+        if let Some(other) = special_pair {
+            with_shell(|s| {
+                for n in [a.as_str(), other.as_str()] {
+                    if let Some(p) = s.param_mut(n) {
+                        p.value = match p.value {
+                            crate::params::Value::Array(_) => {
+                                crate::params::Value::Array(Vec::new())
+                            }
+                            _ => crate::params::Value::Scalar(String::new()),
+                        };
+                        p.attrs = (p.attrs | crate::params::UNSET) & !crate::params::DECLARED;
+                    }
+                }
+            });
+            continue;
+        }
         // A local stays local after unset (zsh): only its value goes.
         with_shell(|s| {
             let local = s
