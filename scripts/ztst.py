@@ -201,6 +201,25 @@ def zsh_glob_to_regex(p):
     return "".join(out)
 
 
+def split_exclusion(p):
+    """Splits `a~b` at a top-level `~` with text on both sides."""
+    depth = 0
+    i = 0
+    while i < len(p):
+        c = p[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "~" and depth == 0 and 0 < i < len(p) - 1:
+            return p[:i], p[i + 1 :]
+        i += 1
+    return p, None
+
+
 def matches(expected, actual, pattern):
     if not pattern:
         return expected == actual
@@ -210,7 +229,11 @@ def matches(expected, actual, pattern):
         return False
     for e, a in zip(el, al):
         try:
-            if not re.fullmatch(zsh_glob_to_regex(e), a, re.S):
+            # EXTENDED_GLOB `pat~excl`: matches pat but not excl.
+            main, excl = split_exclusion(e)
+            if not re.fullmatch(zsh_glob_to_regex(main), a, re.S):
+                return False
+            if excl is not None and re.fullmatch(zsh_glob_to_regex(excl), a, re.S):
                 return False
         except re.error:
             if e != a:

@@ -3814,8 +3814,15 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
                 Some(keys) => Val::List(keys, true),
                 None => param_value(&name, None)?,
             }
-        } else if flags.keys && sub.as_deref().is_some_and(|s| search_flags(s).is_some()) {
-            // ${(k)assoc[(r)pat]}: the key whose value matches.
+        } else if flags.keys
+            && assoc_keys(&name).is_some()
+            && sub
+                .as_deref()
+                .and_then(search_flags)
+                .is_some_and(|(sf, _)| sf.contains(['r', 'R']))
+        {
+            // ${(k)assoc[(r)pat]}: the key whose value matches; (R) all of them.
+            // ((i) and (I) give keys anyway.)
             let s = sub.clone().unwrap();
             let (sf, word) = search_flags(&s).unwrap();
             let sf = sf.as_str();
@@ -3824,12 +3831,10 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             let mut found = keys
                 .into_iter()
                 .filter(|k| hit(&assoc_get(&name, k).unwrap_or_default()));
-            let r = if sf.contains('R') || sf.contains('I') {
-                found.next_back()
-            } else {
-                found.next()
-            };
-            match r {
+            match found.next() {
+                Some(k) if sf.contains('R') && !flags.values => {
+                    Val::List(std::iter::once(k).chain(found).collect(), true)
+                }
                 // (kv): the key and its value.
                 Some(k) if flags.values => {
                     let v = assoc_get(&name, &k).unwrap_or_default();
@@ -5061,7 +5066,10 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
         if f & MARK != 0 {
             continue;
         }
-        if (f & (Q | NG) != 0 && "*?[]()|<>^#~\\!-".contains(c)) || (c == '\\' && f & (Q | NG) == 0)
+        // A backslash from a GLOB_SUBST value quotes the next character,
+        // as in zsh; one in the literal text is itself.
+        if (f & (Q | NG) != 0 && "*?[]()|<>^#~\\!-".contains(c))
+            || (c == '\\' && f & (Q | NG) == 0 && f & B != 0)
         {
             pat.push('\\');
         }

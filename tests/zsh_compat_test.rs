@@ -1492,3 +1492,21 @@ fn glob_qualifier_substitution_sorts_the_modified_names() {
     ));
     assert_eq!(out, "homedir scrunchyfile1 scrunchyfile2 tmpcd\n");
 }
+
+#[test]
+fn glob_subst_backslash_quotes_the_next_character() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("A(B)")).unwrap();
+    let (_, out, _) = sh(&format!(
+        "cd {} && x='A(B)'; y=${{(q)x}}; print -l $~y*",
+        dir.path().display()
+    ));
+    assert_eq!(out, "A(B)\n");
+}
+
+#[test]
+fn keys_flag_with_search_subscripts() {
+    let (_, out, _) =
+        sh("typeset -A h=(path 1 paths 2 x 3 y 3); print ${(k)h[(I)path*]} / ${(k)h[(R)3]} / ${(k)h[(r)3]}");
+    assert_eq!(out, "path paths / x y / x\n");
+}
