@@ -908,7 +908,11 @@ pub fn has_meta(pattern: &str) -> bool {
             {
                 return true
             }
-            '#' | '^' | '~' if crate::options::quick("extendedglob") => return true,
+            '#' | '^' if crate::options::quick("extendedglob") => return true,
+            // An exclusion needs text on both sides: a final `~` is literal.
+            '~' if crate::options::quick("extendedglob") && i > 0 && i + 1 < p.len() => {
+                return true
+            }
             _ => {}
         }
         i += 1;

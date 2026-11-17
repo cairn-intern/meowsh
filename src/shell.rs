@@ -1700,6 +1700,17 @@ fn find_named_dir(p: &str) -> Option<(String, String)> {
             consider(k.clone(), v.clone());
         }
     }
+    // zsh_directory_name d: (name, length of the path it names).
+    if let Some(r) = crate::expand::dynamic_dir('d', p) {
+        if let (Some(name), Some(len)) = (r.first(), r.get(1).and_then(|l| l.parse::<usize>().ok()))
+        {
+            if let Some(dir) = p.get(..len) {
+                if best.as_ref().is_none_or(|(_, d)| len > d.len()) {
+                    best = Some((format!("[{}]", name), dir.to_string()));
+                }
+            }
+        }
+    }
     best
 }
 
@@ -2166,30 +2177,22 @@ fn is_root() -> bool {
 }
 
 fn time_fmt(fmt: &str) -> String {
-    let cfmt = match std::ffi::CString::new(fmt) {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
-    let mut buf = vec![0u8; 128];
-    unsafe {
-        let mut t: libc::time_t = 0;
-        libc::time(&mut t);
+    // zsh's ztrftime, with its %N and %. (fractions of a second).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let t = now.as_secs() as libc::time_t;
+    // SAFETY: localtime_r fills a zeroed tm from a valid time_t.
+    let tm = unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
             return String::new();
         }
-        let n = libc::strftime(
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            cfmt.as_ptr(),
-            &tm,
-        );
-        if n == 0 {
-            return String::new();
-        }
-        buf.truncate(n);
-        String::from_utf8_lossy(&buf).into_owned()
-    }
+        tm
+    };
+    crate::zdatetime::format_time(fmt.as_bytes(), &tm, i64::from(now.subsec_nanos()))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
 }
 
 fn history_count() -> String {
@@ -2220,20 +2223,39 @@ fn color_code(name: &str) -> Option<u16> {
 }
 
 fn color_fg(name: &str) -> String {
+    if let Some((r, g, b)) = hex_color(name) {
+        return format!("\x1b[38;2;{};{};{}m", r, g, b);
+    }
     match color_code(name) {
-        Some(9) => "\x1b[39m".to_string(),
         Some(n) if n < 8 => format!("\x1b[{}m", 30 + n),
-        Some(n) => format!("\x1b[38;5;{}m", n),
-        None => String::new(),
+        Some(n) if n != 9 => format!("\x1b[38;5;{}m", n),
+        // default, and names zsh does not know, give the default colour.
+        _ => "\x1b[39m".to_string(),
     }
 }
 
 fn color_bg(name: &str) -> String {
+    if let Some((r, g, b)) = hex_color(name) {
+        return format!("\x1b[48;2;{};{};{}m", r, g, b);
+    }
     match color_code(name) {
-        Some(9) => "\x1b[49m".to_string(),
         Some(n) if n < 8 => format!("\x1b[{}m", 40 + n),
-        Some(n) => format!("\x1b[48;5;{}m", n),
-        None => String::new(),
+        Some(n) if n != 9 => format!("\x1b[48;5;{}m", n),
+        _ => "\x1b[49m".to_string(),
+    }
+}
+
+// `#rrggbb` or `#rgb`.
+fn hex_color(name: &str) -> Option<(u8, u8, u8)> {
+    let h = name.strip_prefix('#')?;
+    let v = u32::from_str_radix(h, 16).ok()?;
+    match h.len() {
+        6 => Some(((v >> 16) as u8, (v >> 8) as u8, v as u8)),
+        3 => {
+            let d = |x: u32| ((x & 0xf) * 17) as u8;
+            Some((d(v >> 8), d(v >> 4), d(v)))
+        }
+        _ => None,
     }
 }
 

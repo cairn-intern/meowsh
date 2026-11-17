@@ -127,6 +127,8 @@ and builtins include:
 - prompts: `$PROMPT`/`$PS1` and `$PROMPT2`/`$PS2` get parameter and
   command substitution first, then zsh `%` escapes including `%N<..<`
   truncation
+- dynamic named directories: `~[name]` and `%~` call `zsh_directory_name`
+  (and `$zsh_directory_name_functions`)
 - history expansion (`BANG_HIST`): `!!`, `!n`, `!-n`, `!str`, `!?str?`,
   word designators (`!$`, `!*`, `:0`, `:2-4`), modifiers (`:h`,
   `:s/a/b/`, ...) and `^old^new`

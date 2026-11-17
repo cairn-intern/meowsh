@@ -485,6 +485,31 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                     || (ctx.assign && chars[i - 1] == ':')
                     || (ctx.magic_eq && chars[i - 1] == '=')) =>
             {
+                // `~[name]`: a dynamic named directory from zsh_directory_name.
+                if chars.get(i + 1) == Some(&'[') {
+                    if let Some(close) = (i + 2..n).find(|&k| chars[k] == ']') {
+                        let name: String = chars[i + 2..close].iter().collect();
+                        match dynamic_dir('n', &name).and_then(|r| r.into_iter().next()) {
+                            Some(dir) => {
+                                for d in dir.chars() {
+                                    ctx.push(d, Q);
+                                }
+                                i = close + 1;
+                                continue;
+                            }
+                            None if crate::options::is_set("nomatch") => {
+                                return fail(&format!("no directory expansion: ~[{}]", name));
+                            }
+                            None => {
+                                for &d in &chars[i..=close] {
+                                    ctx.push(d, Q);
+                                }
+                                i = close + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 match tilde(chars, i, ctx.assign) {
                     Some((dir, next)) => {
                         for d in dir.chars() {
@@ -505,6 +530,48 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
         }
     }
     Ok(())
+}
+
+/// zsh's dynamic named directories: calls zsh_directory_name and the
+/// functions in $zsh_directory_name_functions with `kind` (n: name to
+/// directory, d: directory to name, c: completion) and `arg`; the $reply
+/// of the first that succeeds.
+pub fn dynamic_dir(kind: char, arg: &str) -> Option<Vec<String>> {
+    let mut names = vec!["zsh_directory_name".to_string()];
+    names.extend(
+        with_shell(|s| s.array("zsh_directory_name_functions").cloned()).unwrap_or_default(),
+    );
+    for f in names {
+        let Some((body, line)) =
+            with_shell(|s| s.functions.get(&f).map(|d| (d.body.clone(), d.line)))
+        else {
+            continue;
+        };
+        let saved = with_shell(|s| s.param("reply").cloned());
+        with_shell(|s| {
+            s.remove_param("reply");
+        });
+        let st = crate::exec::call_function(&body, &[f, kind.to_string(), arg.to_string()], line);
+        let reply = with_shell(|s| {
+            let r = s
+                .array("reply")
+                .cloned()
+                .or_else(|| s.scalar("reply").map(|v| vec![v.to_string()]));
+            match saved {
+                Some(p) => {
+                    s.params.insert("reply".to_string(), p);
+                }
+                None => {
+                    s.remove_param("reply");
+                }
+            }
+            r
+        });
+        if st == 0 {
+            return Some(reply.unwrap_or_default());
+        }
+    }
+    None
 }
 
 fn tilde(chars: &[char], i: usize, assign: bool) -> Option<(String, usize)> {
@@ -1488,7 +1555,21 @@ fn parse_sub_flags(sub: &str) -> Option<(SubSearch, &str)> {
 // A subscript pattern: unlike other patterns, characters that come from
 // parameter values are active (zsh tokenizes the expanded subscript).
 fn subscript_pattern(word: &str) -> ExpResult<String> {
-    let chars: Vec<char> = word.chars().collect();
+    // zsh keeps the backslash of `\"` in a subscript pattern, so `a\"b`
+    // finds the key `a\"b`.
+    let mut text = String::new();
+    let mut bs = 0;
+    for c in word.chars() {
+        if c == '"' && bs % 2 == 1 {
+            text.pop();
+            text.push_str("\\\\\\\\\\\"");
+            bs = 0;
+            continue;
+        }
+        bs = if c == '\\' { bs + 1 } else { 0 };
+        text.push(c);
+    }
+    let chars: Vec<char> = text.chars().collect();
     let mut ctx = Ctx::new(false, false);
     ctx.param_tag &= !NG;
     ctx.subst_tag &= !NG;
@@ -3456,7 +3537,7 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             }
             // `=` splits words, `==` turns SH_WORD_SPLIT off; `~` and
             // `~~` do the same for GLOB_SUBST (see prefix_toggles).
-            '=' if starts_param(next) || matches!(next, Some('=' | ':' | '~' | '^')) => {
+            '=' if starts_param(next) || matches!(next, Some('=' | ':' | '~' | '^' | '"')) => {
                 ifs_split = next != Some('=');
                 if !ifs_split {
                     i += 1;
@@ -3493,7 +3574,16 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
                     == Some(ident.chars().count());
             (simple || nested).then(|| (ident.to_string(), end))
         });
-    if let Some((ident, end)) = p_target {
+    // ${="..."}: a quoted string is the value.
+    let dq_end = (body.get(i) == Some(&'"'))
+        .then(|| crate::lexer::scan_dquote(body, i))
+        .flatten()
+        .filter(|&e| e == body.len());
+    if let Some(end) = dq_end {
+        let text: String = body[i..end].iter().collect();
+        val = Val::Str(expand_string(&text)?);
+        i = end;
+    } else if let Some((ident, end)) = p_target {
         let target = if ident.starts_with('$') {
             expand_string(&ident)?
         } else {
@@ -4404,28 +4494,57 @@ fn pattern_of(word: &[char]) -> ExpResult<String> {
 /// parameter, command and arithmetic substitutions apply.
 pub fn assoc_key(sub: &str) -> ExpResult<String> {
     let mut pre = String::new();
-    let mut it = sub.chars().peekable();
-    while let Some(c) = it.next() {
+    let chars: Vec<char> = sub.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
         if c == '\\' {
-            match it.peek() {
+            match next {
                 Some('[' | ']') => {
-                    pre.push(it.next().unwrap());
+                    pre.push(next.unwrap());
+                    i += 2;
                     continue;
                 }
                 // Kept for the next step, where `\\` is one backslash.
                 Some('\\') => {
                     pre.push_str("\\\\");
-                    it.next();
+                    i += 2;
                     continue;
                 }
                 Some('$' | '`') => {
                     pre.push_str("\\\\");
+                    i += 1;
                     continue;
                 }
                 _ => {}
             }
         }
+        // A nested expansion (`$A[(i)\]]`, `${...}`) keeps its own text.
+        if c == '$' {
+            let end = match next {
+                Some('{') => crate::lexer::scan_brace(&chars, i + 1, false),
+                Some('(') => crate::lexer::scan_paren(&chars, i + 1),
+                Some(n) if crate::lexer::is_name_start(n) => {
+                    let mut e = i + 1;
+                    while chars.get(e).is_some_and(|&x| crate::lexer::is_name_char(x)) {
+                        e += 1;
+                    }
+                    while chars.get(e) == Some(&'[') {
+                        e = scan_bracket_end(&chars, e) + 1;
+                    }
+                    Some(e)
+                }
+                _ => None,
+            };
+            if let Some(end) = end.filter(|&e| e <= chars.len()) {
+                pre.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+        }
         pre.push(c);
+        i += 1;
     }
     expand_heredoc(&pre)
 }

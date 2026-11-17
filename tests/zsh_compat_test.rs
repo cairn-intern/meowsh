@@ -1335,3 +1335,61 @@ fn local_hides_epochseconds_unless_unhidden() {
     assert_eq!(st, 1);
     assert!(err.contains("read-only variable: EPOCHSECONDS"), "{}", err);
 }
+
+#[test]
+fn nested_lookup_in_an_association_subscript_keeps_its_own_text() {
+    let (_, out, _) = sh(
+        "typeset -A A; A[\\\\\\]]=bcb; print -R $A[$A[(i)\\\\\\\\\\]]] ${A[${A[(i)\\\\\\\\\\]]}]}",
+    );
+    assert_eq!(out, "bcb bcb\n");
+}
+
+#[test]
+fn dynamic_named_directories() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo/bar/rod")).unwrap();
+    let (_, out, err) = sh(&format!(
+        "cd {} && zsh_directory_name() {{ \
+           if [[ $1 = d ]]; then [[ $2 = */bar/rod ]] || return 1; reply=(barmy $(( ${{#2}} - 4 ))); \
+           else [[ $2 = barmy ]] || return 1; reply=($PWD/foo/bar); fi }}; \
+         print ~[barmy]/x; cd foo/bar/rod; print -P %~; cd ../../..; print ~[nope]/y",
+        dir.path().display()
+    ));
+    assert_eq!(
+        out,
+        format!("{}/foo/bar/x\n~[barmy]/rod\n", dir.path().display())
+    );
+    assert!(err.contains("no directory expansion: ~[nope]"), "{}", err);
+}
+
+#[test]
+fn final_tilde_is_not_an_exclusion() {
+    let (_, out, _) = sh("setopt extendedglob; print %~ a~");
+    assert_eq!(out, "%~ a~\n");
+}
+
+#[test]
+fn quoted_string_as_expansion_value() {
+    let (_, out, _) = sh("print -l ${=\"$(echo a b)\"}");
+    assert_eq!(out, "a\nb\n");
+}
+
+#[test]
+fn prompt_dates_have_zsh_fraction_escapes() {
+    let (_, out, _) = sh("print -P '%D{%9.} %D{%N}'");
+    let parts: Vec<&str> = out.trim().split(' ').collect();
+    assert_eq!(parts.len(), 2, "{}", out);
+    assert!(
+        parts
+            .iter()
+            .all(|p| p.len() == 9 && p.chars().all(|c| c.is_ascii_digit())),
+        "{}",
+        out
+    );
+}
+
+#[test]
+fn unknown_prompt_colours_reset_to_the_default() {
+    let (_, out, _) = sh("print -r -- ${(V)${(%):-'%F{foo}'}} ${(V)${(%):-'%K{reset}'}}");
+    assert_eq!(out, "^[[39m ^[[49m\n");
+}
