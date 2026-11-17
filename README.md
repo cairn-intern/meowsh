@@ -135,9 +135,16 @@ and builtins include:
   `CDABLE_VARS`, `CHECK_JOBS`, `PRINT_EXIT_VALUE`, and sticky emulation
   for functions defined under `emulate -c`
 - `let`, `limit`/`unlimit`/`ulimit`, `pushd`/`popd`/`dirs`, `hash -d`,
-  `kill`, `getopts` and `shift -p` as zsh has them; modules are built in,
-  so `zmodload` always succeeds, and `zpty` (commands on a
-  pseudo-terminal) and `zselect` work
+  `kill`, `getopts` and `shift -p` as zsh has them; `zpty` (commands on
+  a pseudo-terminal) and `zselect` work
+- zsh's modules are built in: zsh/zutil (`zstyle`, `zformat`,
+  `zparseopts`, `zregexparse`), zsh/datetime (`strftime`), zsh/system
+  (`sysread`, `sysopen`, `zsystem flock`, ...), zsh/mathfunc,
+  zsh/parameter, zsh/random and the completion modules. `zmodload`
+  tracks them as zsh does (features, `-F`, autoloads, `-u`); a module's
+  builtins work without loading it until `zmodload` is given that
+  module. Loading one meowsh does not have (zsh/pcre, zsh/db/gdbm,
+  zsh/compctl, ...) fails
 
 By default meowsh edits lines with its own editor, not zle: `zle`
 widgets and `bindkey` bindings are recorded but not used while typing,

@@ -9,6 +9,7 @@ pub mod jobs;
 pub mod lexer;
 pub mod lineedit;
 pub mod menu;
+pub mod modules;
 pub mod options;
 pub mod params;
 pub mod parser;
@@ -26,6 +27,7 @@ pub mod zmathfunc;
 pub mod zparam;
 pub mod zpty;
 pub mod zregexparse;
+pub mod zstyle;
 pub mod zsystem;
 pub mod zutil;
 

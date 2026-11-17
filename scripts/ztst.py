@@ -442,6 +442,30 @@ def main():
             src_extra = os.path.join(args.zsh_src, extra)
             if os.path.isdir(src_extra):
                 shutil.copytree(src_extra, os.path.join(root, extra), symlinks=True)
+        # The modules meowsh has built in, as a static zsh build lists them
+        # in config.modules (V01zmodload reads it and each .mdd file).
+        provided = {
+            "zsh/main", "zsh/complete", "zsh/complist", "zsh/computil", "zsh/datetime",
+            "zsh/langinfo", "zsh/mathfunc", "zsh/parameter", "zsh/random", "zsh/regex",
+            "zsh/rlimits", "zsh/system", "zsh/zle", "zsh/zleparameter", "zsh/zpty",
+            "zsh/zselect", "zsh/zutil",
+        }
+        config = []
+        for dirpath, _, files in os.walk(os.path.join(args.zsh_src, "Src")):
+            for fname in sorted(files):
+                if not fname.endswith(".mdd"):
+                    continue
+                full = os.path.join(dirpath, fname)
+                with open(full) as f:
+                    m = re.search(r"^name=(\S+)", f.read(), re.M)
+                if not m or m.group(1) not in provided:
+                    continue
+                rel = os.path.relpath(full, args.zsh_src)
+                os.makedirs(os.path.join(root, os.path.dirname(rel)), exist_ok=True)
+                shutil.copy(full, os.path.join(root, rel))
+                config.append(f"name={m.group(1)} modfile={rel} link=static auto=yes load=yes")
+        with open(os.path.join(root, "config.modules"), "w") as f:
+            f.write("\n".join(sorted(config)) + "\n")
         # Build features some tests check before running.
         with open(os.path.join(root, "config.h"), "w") as f:
             f.write("#define PATH_DEV_FD 1\n#define HAVE_FIFOS 1\n#define MULTIBYTE_SUPPORT 1\n")

@@ -31,14 +31,6 @@ pub enum ProcState {
     Done,
 }
 
-#[derive(Clone)]
-pub struct ZStyle {
-    pub pattern: String,
-    pub matcher: Option<glob::Pattern>,
-    pub style: String,
-    pub values: Vec<String>,
-}
-
 #[derive(Clone, Debug)]
 pub struct Job {
     pub id: i32,
@@ -137,9 +129,6 @@ pub struct Shell {
     // lowercase with underscores stripped. Most are stubs for Phase 1;
     // the subset that maps to a legacy OPT_* flag also toggles that flag.
     pub named_opts: HashMap<String, bool>,
-    // zstyle entries in declaration order. Later matching entries override
-    // earlier ones for query operations.
-    pub zstyles: Vec<ZStyle>,
     // Directory stack used by pushd/popd/dirs.
     pub dir_stack: Vec<String>,
     // Coprocess pipes: (write end to its input, read end of its output).
@@ -198,7 +187,6 @@ impl Shell {
             subshell_loop_depth: 0,
             local_scopes: Vec::new(),
             named_opts: HashMap::new(),
-            zstyles: Vec::new(),
             dir_stack: Vec::new(),
             coproc: None,
             source_file: None,

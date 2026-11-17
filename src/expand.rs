@@ -1402,6 +1402,7 @@ fn parse_sub_flags(sub: &str) -> Option<(SubSearch, &str)> {
         ..SubSearch::default()
     };
     let mut i = 0;
+    let mut escapes = false;
     let arg = |i: &mut usize| -> Option<String> {
         let d = *chars.get(*i)?;
         let close = closing_delim(d);
@@ -1425,8 +1426,12 @@ fn parse_sub_flags(sub: &str) -> Option<(SubSearch, &str)> {
                 f.word = true;
                 f.sep = Some("\n".into());
             }
-            'p' => {}
-            's' => f.sep = Some(arg(&mut i)?),
+            // (p): escapes in later separator arguments, as `(ps:\0:)`.
+            'p' => escapes = true,
+            's' => {
+                let a = arg(&mut i)?;
+                f.sep = Some(if escapes { p_flag_arg(&a) } else { a });
+            }
             'n' => {
                 let v = eval_arith_str(&arg(&mut i)?).ok()?;
                 f.num = if v == 0 { 1 } else { v };
@@ -1659,6 +1664,11 @@ fn search_single(items: &[String], list: bool, f: &SubSearch, word: &str) -> Exp
         Some(units) => {
             let hit = unit_matcher(word, f.exact)?;
             let r = search_units_index(&units, f, &hit);
+            // A miss going down is index 0, which KSH_ZERO_SUBSCRIPT reads
+            // as the first element.
+            if !f.ind && r == 0 && list && crate::options::is_set("kshzerosubscript") {
+                return Ok(units.first().map_or(Val::Unset, |v| Val::Str(v.clone())));
+            }
             if !f.ind {
                 return Ok(
                     match units.get((r - 1).max(0) as usize).filter(|_| r >= 1) {
@@ -1690,6 +1700,36 @@ fn search_single(items: &[String], list: bool, f: &SubSearch, word: &str) -> Exp
     // KSH_ARRAYS counts from 0; "not found" past the end stays.
     let r = if ksh_arrays() && r > 0 { r - 1 } else { r };
     Ok(Val::Str(r.to_string()))
+}
+
+/// For an assignment to `name[sub]` whose subscript has search flags
+/// (`a[(R)x,(r)y]=...`): the range as plain indices. None otherwise.
+pub fn search_subscript_range(name: &str, sub: &str) -> Option<ExpResult<String>> {
+    let mut depth = 0;
+    let comma = sub.char_indices().find(|&(_, c)| {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        c == ',' && depth == 0
+    });
+    let (a, b) = match comma {
+        Some((k, _)) => (&sub[..k], Some(&sub[k + 1..])),
+        None => (sub, None),
+    };
+    if parse_sub_flags(a).is_none() && b.is_none_or(|b| parse_sub_flags(b).is_none()) {
+        return None;
+    }
+    let items = with_shell(|s| s.array(name).cloned()).unwrap_or_default();
+    let end = |part: &str, a2: bool| sub_index(part, &items, true, a2);
+    Some((|| {
+        let x = end(a, false)?;
+        Ok(match b {
+            Some(b) => format!("{},{}", x, end(b, true)?),
+            None => x.to_string(),
+        })
+    })())
 }
 
 fn search_flags(sub: &str) -> Option<(String, &str)> {

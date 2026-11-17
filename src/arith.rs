@@ -549,6 +549,15 @@ fn call(name: &str, args: &[Num]) -> R {
     if let Some(m) = math_func(name) {
         return call_user(&m, args.iter().map(|a| a.to_string()).collect());
     }
+    let feature = format!("f:{}", name);
+    if !crate::modules::feature_available(&feature) {
+        // Off in its module: an autoload may turn it on.
+        match crate::modules::autoload_feature(&feature) {
+            Some(Ok(())) => {}
+            Some(Err(msg)) if !msg.is_empty() => return Err(msg),
+            _ => return Err(format!("unknown function: {}", name)),
+        }
+    }
     if let Some(r) = crate::zmathfunc::call(name, args) {
         return r;
     }
@@ -586,7 +595,12 @@ fn call(name: &str, args: &[Num]) -> R {
         "sin" => one(f64::sin),
         "cos" => one(f64::cos),
         "tan" => one(f64::tan),
-        _ => Err(format!("{}: unknown function", name)),
+        _ => match crate::modules::autoload_feature(&feature) {
+            // `zmodload -af module name`: loading it may define name.
+            Some(Ok(())) => call(name, args),
+            Some(Err(msg)) if !msg.is_empty() => Err(msg),
+            _ => Err(format!("{}: unknown function", name)),
+        },
     }
 }
 

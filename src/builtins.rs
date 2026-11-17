@@ -11,7 +11,7 @@ use crate::shell::{
 };
 use crate::sys::{err_line, out, read_byte};
 use crate::trap::{set_trap, signal_name, signal_number, SIGNALS};
-use crate::types::{Flow, FuncDef, Node, ZStyle, VAR_READONLY};
+use crate::types::{Flow, FuncDef, Node, VAR_READONLY};
 use std::sync::Arc;
 
 const SPECIAL: &[&str] = &[
@@ -159,7 +159,9 @@ pub fn is_special_builtin(name: &str) -> bool {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    (SPECIAL.contains(&name) || REGULAR.contains(&name)) && !builtin_disabled(name)
+    (SPECIAL.contains(&name) || REGULAR.contains(&name))
+        && !builtin_disabled(name)
+        && crate::modules::feature_available(&format!("b:{}", name))
 }
 
 // `disable`: (kind, name) pairs, kind `b` builtin, `r` reserved word,
@@ -300,7 +302,7 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "enable" | "disable" => builtin_enable(words),
         "ulimit" => builtin_ulimit(words),
         "umask" => builtin_umask(words),
-        "zstyle" => builtin_zstyle(&words[1..]),
+        "zstyle" => crate::zstyle::builtin_zstyle(words),
         "add-zsh-hook" => builtin_add_zsh_hook(words),
         "print" => crate::print::builtin_print(words),
         "let" => builtin_let(words),
@@ -530,56 +532,22 @@ fn builtin_zmodload(words: &[String]) -> i32 {
     if flags.contains('u') && words.iter().any(|w| w == "zsh/random") {
         crate::typeset::SRANDOM_LOADED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
-    if flags.contains('a')
-        && flags.contains('p')
-        && words.len() == 2
-        && with_shell(|s| s.param("SRANDOM").is_none())
-    {
-        out("SRANDOM (zsh/random)\n");
-    }
-    // Loading a module meowsh does not provide fails, as in a zsh built
-    // without it (zsh's tests then skip what needs it).
-    if !flags.chars().any(|c| "euLldAR".contains(c)) {
-        let names: Vec<&String> = words[1..]
-            .iter()
-            .filter(|w| !w.starts_with(['-', '+']))
-            .collect();
-        if let Some(m) = names.iter().find(|n| MISSING_MODULES.contains(&n.as_str())) {
-            shell_err(&format!("failed to load module `{}': no such module", m));
-            return 1;
-        }
-    }
-    // Loading zsh/complist switches the completion listing to its
-    // colored version and adds menu selection.
-    if !flags.contains('e')
-        && !flags.contains('u')
-        && words[1..].iter().any(|w| w == "zsh/complist")
+    let status = crate::modules::builtin_zmodload(words);
+    run_module_setup();
+    status
+}
+
+// Setup code of modules that just loaded: zsh/complist switches the
+// completion listing to its colored version and adds menu selection.
+pub fn run_module_setup() {
+    if crate::modules::take_newly_loaded()
+        .iter()
+        .any(|m| m == "zsh/complist")
         && !crate::zle::comp::complist::is_loaded()
     {
         crate::zle::comp::complist::setup();
     }
-    // `zmodload -e name...`: whether each is loaded. Modules meowsh does
-    // not provide are not; completion functions test for zsh/compctl.
-    if flags.contains('e') {
-        let names: Vec<&String> = words[1..].iter().filter(|w| !w.starts_with('-')).collect();
-        return i32::from(names.iter().any(|n| MISSING_MODULES.contains(&n.as_str())));
-    }
-    0
 }
-
-const MISSING_MODULES: &[&str] = &[
-    "zsh/attr",
-    "zsh/cap",
-    "zsh/clone",
-    "zsh/compctl",
-    "zsh/curses",
-    "zsh/db/gdbm",
-    "zsh/example",
-    "zsh/net/socket",
-    "zsh/net/tcp",
-    "zsh/pcre",
-    "zsh/zftp",
-];
 
 fn builtin_exit(words: &[String]) -> i32 {
     let code = match words.get(1) {
@@ -4133,125 +4101,6 @@ fn builtin_setopt(words: &[String], value: bool) -> i32 {
 
 fn toggle_named_opt(name: &str, value: bool) {
     crate::options::set(name, value);
-}
-
-fn builtin_zstyle(args: &[String]) -> i32 {
-    if args.is_empty() {
-        return 0;
-    }
-    match args[0].as_str() {
-        "-L" => {
-            print_zstyles(&args[1..]);
-            0
-        }
-        "-s" => {
-            if args.len() < 4 {
-                return 1;
-            }
-            match zstyle_lookup(&args[1], &args[2]) {
-                Some(values) => {
-                    var_set(&args[3], &values.join(" "), false);
-                    0
-                }
-                None => 1,
-            }
-        }
-        "-a" => {
-            if args.len() < 4 {
-                return 1;
-            }
-            match zstyle_lookup(&args[1], &args[2]) {
-                Some(values) if array_set(&args[3], values.clone()) => 0,
-                _ => 1,
-            }
-        }
-        "-b" => {
-            if args.len() < 4 {
-                return 1;
-            }
-            let value = zstyle_lookup(&args[1], &args[2])
-                .map(|values| zstyle_truthy(&values))
-                .unwrap_or(false);
-            var_set(&args[3], if value { "yes" } else { "no" }, false);
-            if value {
-                0
-            } else {
-                1
-            }
-        }
-        "-t" => {
-            if args.len() < 3 {
-                return 1;
-            }
-            match zstyle_lookup(&args[1], &args[2]) {
-                Some(values) if zstyle_truthy(&values) => 0,
-                _ => 1,
-            }
-        }
-        _ => {
-            if args.len() < 2 {
-                return 1;
-            }
-            let entry = ZStyle {
-                pattern: args[0].clone(),
-                matcher: glob::Pattern::new(&args[0]).ok(),
-                style: args[1].clone(),
-                values: args[2..].to_vec(),
-            };
-            with_shell(|s| {
-                match s
-                    .zstyles
-                    .iter_mut()
-                    .find(|z| z.pattern == entry.pattern && z.style == entry.style)
-                {
-                    Some(existing) => *existing = entry,
-                    None => s.zstyles.push(entry),
-                }
-            });
-            0
-        }
-    }
-}
-
-fn zstyle_lookup(context: &str, style: &str) -> Option<Vec<String>> {
-    with_shell(|s| {
-        s.zstyles
-            .iter()
-            .rev()
-            .find(|e| {
-                e.style == style
-                    && (e.pattern == context
-                        || e.matcher
-                            .as_ref()
-                            .map(|p| p.matches(context))
-                            .unwrap_or(false))
-            })
-            .map(|e| e.values.clone())
-    })
-}
-
-fn zstyle_truthy(values: &[String]) -> bool {
-    let first = values.first().map(|s| s.to_ascii_lowercase());
-    matches!(first.as_deref(), Some("yes" | "true" | "on" | "1"))
-}
-
-fn print_zstyles(filters: &[String]) {
-    let text: String = with_shell(|s| {
-        s.zstyles
-            .iter()
-            .filter(|e| {
-                filters.is_empty() || filters.iter().any(|f| f == &e.pattern || f == &e.style)
-            })
-            .map(|e| {
-                if e.values.is_empty() {
-                    format!("zstyle {} {}\n", e.pattern, e.style)
-                } else {
-                    format!("zstyle {} {} {}\n", e.pattern, e.style, e.values.join(" "))
-                }
-            })
-            .collect()
-    });
-    out(&text);
 }
 
 /// Calls a shell function by name if one is defined (used for hooks).

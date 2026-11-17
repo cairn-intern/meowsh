@@ -815,7 +815,8 @@ fn test_zstyle_later_match_overrides_earlier() {
 fn test_zstyle_list_styles() {
     let (status, stdout, _) = run_script(r#"zstyle ':completion:*' menu select; zstyle -L"#);
     assert_eq!(status, 0);
-    assert!(stdout.contains("zstyle :completion:* menu select"));
+    // Quoted as zsh's zstyle -L does.
+    assert!(stdout.contains("zstyle ':completion:*' menu select"));
 }
 
 #[test]

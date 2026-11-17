@@ -145,6 +145,10 @@ pub fn shell_init() {
     shell
         .assoc_entry("langinfo")
         .insert("CODESET".to_string(), codeset.to_string());
+    // zsh/langinfo's parameter: zmodload must not see it as the user's.
+    if let Some(p) = shell.param_mut("langinfo") {
+        p.attrs |= crate::params::SPECIAL;
+    }
     for (scalar, array) in DEFAULT_TIES {
         if shell.has_param(scalar) || matches!(*scalar, "PATH" | "FPATH") {
             shell.tie(scalar, array, ":");

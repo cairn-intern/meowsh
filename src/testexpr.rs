@@ -633,7 +633,8 @@ impl DbParser<'_> {
                 };
             }
         }
-        // zsh: `-word arg` with an unknown -word is an unknown condition.
+        // zsh: `-word arg` with an unknown -word is an unknown condition,
+        // unless a module autoload (zmodload -ac) defines it.
         if t.starts_with('-')
             && t.len() > 1
             && !is_unary(&t)
@@ -642,6 +643,11 @@ impl DbParser<'_> {
                     && !is_binary(n)
             })
         {
+            if let Some(Err(msg)) = crate::modules::autoload_feature(&format!("c:{}", &t[1..])) {
+                if !msg.is_empty() {
+                    crate::shell::shell_err(&msg);
+                }
+            }
             return Err(format!("unknown condition: {}", t));
         }
         if let Some(op) =

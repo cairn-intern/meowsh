@@ -846,7 +846,7 @@ fn zsh_parameter_module_specials() {
 
 #[test]
 fn zmodload_e_reports_missing_modules() {
-    let (_, out, _) = sh("zmodload -e zsh/compctl; a=$?; zmodload -e zsh/zle; print $a $?");
+    let (_, out, _) = sh("zmodload -e zsh/compctl; a=$?; zmodload -e zsh/main; print $a $?");
     assert_eq!(out, "1 0\n");
 }
 
@@ -941,4 +941,23 @@ fn loading_an_unavailable_module_fails() {
     let (st, _, err) = sh("zmodload zsh/pcre");
     assert_eq!(st, 1);
     assert!(err.contains("failed to load module `zsh/pcre'"), "{}", err);
+}
+
+#[test]
+fn subscript_flag_p_splits_on_nul() {
+    let (_, out, _) = sh("s=$'foo\\0bar'; print -r -- ${s[(pws:\\0:)2]}");
+    assert_eq!(out, "bar\n");
+}
+
+#[test]
+fn search_flags_as_assignment_range() {
+    let (_, out, _) = sh("a=(x y z); a[(R)none,(r)none]=(n m); print -r -- $a");
+    assert_eq!(out, "n m\n");
+}
+
+#[test]
+fn module_builtins_work_until_zmodload_manages_the_module() {
+    let (_, out, _) = sh("TZ=UTC0; strftime -s t %Y 0; print -r -- $t; \
+         zmodload -F zsh/datetime -b:strftime; strftime %Y 0 2>/dev/null || print gone");
+    assert_eq!(out, "1970\ngone\n");
 }

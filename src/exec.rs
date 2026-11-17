@@ -1240,7 +1240,10 @@ fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
                 )
             }
             _ => {
-                let sub = expand_string(sub).map_err(|e| e.status)?;
+                let sub = match crate::expand::search_subscript_range(&a.name, sub) {
+                    Some(r) => r.map_err(|e| e.status)?,
+                    None => expand_string(sub).map_err(|e| e.status)?,
+                };
                 crate::shell::array_splice(&a.name, &sub, crate::shell::plain_items(items))
             }
         },
@@ -2175,6 +2178,18 @@ fn run_command(
         return st;
     }
 
+    // A module builtin that is off may have an autoload (zmodload -ab).
+    if !external_only && !crate::builtins::is_builtin(&name) {
+        if let Some(r) = crate::modules::autoload_feature(&format!("b:{}", name)) {
+            crate::builtins::run_module_setup();
+            if let Err(msg) = r {
+                if !msg.is_empty() {
+                    shell_err(&msg);
+                }
+                return 1;
+            }
+        }
+    }
     if builtin_only || (crate::builtins::is_builtin(&name) && !external_only) {
         let export = matches!(
             name.as_str(),
@@ -3892,9 +3907,9 @@ mod tests {
     }
 
     fn reset_shell() {
+        crate::zstyle::clear();
         let mut shell = SHELL.shell.lock().unwrap_or_else(|e| e.into_inner());
         shell.params.clear();
-        shell.zstyles.clear();
         shell.functions.clear();
         shell.local_scopes.clear();
         shell.alias_map(false).clear();

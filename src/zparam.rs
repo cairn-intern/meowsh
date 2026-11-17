@@ -68,20 +68,7 @@ pub fn ensure(name: &str) {
             Value::Assoc(m)
         }
         "userdirs" => assoc(user_dirs().into_iter()),
-        "modules" => assoc(
-            [
-                "zsh/complete",
-                "zsh/complist",
-                "zsh/computil",
-                "zsh/main",
-                "zsh/parameter",
-                "zsh/zle",
-                "zsh/zpty",
-                "zsh/zutil",
-            ]
-            .iter()
-            .map(|m| (m.to_string(), "loaded".to_string())),
-        ),
+        "modules" => Value::Assoc(crate::modules::modules_param()),
         "history" => {
             let h = with_shell(|s| s.history.lock().map(|h| h.clone()).unwrap_or_default());
             assoc(
