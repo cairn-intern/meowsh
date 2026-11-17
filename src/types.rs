@@ -128,6 +128,12 @@ pub struct Shell {
     // Private parameters (zsh/param/private) set aside while a function
     // their owner calls runs: (owner depth, name, parameter).
     pub private_stash: Vec<(usize, String, crate::params::Param)>,
+    // For each function call running: (scope depth, the caller's
+    // private_base).
+    pub private_frames: Vec<(usize, usize)>,
+    // Level of the running function's own parameters: its privates stay
+    // visible in its nofork substitutions.
+    pub private_base: usize,
     // Zsh-style named options (setopt/unsetopt). Keys are normalized to
     // lowercase with underscores stripped. Most are stubs for Phase 1;
     // the subset that maps to a legacy OPT_* flag also toggles that flag.
@@ -190,6 +196,8 @@ impl Shell {
             subshell_loop_depth: 0,
             local_scopes: Vec::new(),
             private_stash: Vec::new(),
+            private_frames: Vec::new(),
+            private_base: 0,
             named_opts: HashMap::new(),
             dir_stack: Vec::new(),
             coproc: None,

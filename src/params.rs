@@ -25,6 +25,9 @@ pub const UNSET: u32 = 1 << 17; // declared but without a value
 pub const DECLARED: u32 = 1 << 18;
 // zsh/param/private: a local only its own function sees.
 pub const PRIVATE: u32 = 1 << 19;
+// Stands in for a private parameter hidden from the code running, when
+// nothing lies beneath it.
+pub const PRIVATE_HIDDEN: u32 = 1 << 20;
 
 pub const NUMERIC: u32 = INTEGER | FLOAT_E | FLOAT_F;
 
@@ -257,10 +260,10 @@ impl Shell {
         let Some((other, sep)) = p.tie.clone() else {
             return;
         };
-        let unique = p.attrs & UNIQUE != 0
+        let (value, my_unique) = (p.value.clone(), p.attrs & UNIQUE != 0);
+        let unique = my_unique
             || self
-                .params
-                .get(&other)
+                .tie_partner(name, &other)
                 .is_some_and(|o| o.attrs & UNIQUE != 0);
         let dedup = |mut a: Vec<String>| {
             if unique {
@@ -269,7 +272,7 @@ impl Shell {
             }
             a
         };
-        let (mine, derived) = match &p.value {
+        let (mine, derived) = match &value {
             Value::Scalar(s) => {
                 let a = dedup(split_tied(s, &sep));
                 (Value::Scalar(a.join(&sep)), Value::Array(a))
@@ -283,9 +286,23 @@ impl Shell {
         if let Some(me) = self.params.get_mut(name) {
             me.value = mine;
         }
-        if let Some(o) = self.params.get_mut(&other) {
+        if let Some(o) = self.tie_partner(name, &other) {
             o.value = derived;
         }
+    }
+
+    // The parameter `name` is tied to: `other`, or, when a local hides it,
+    // the one that local saved (zsh ties by reference, not by name).
+    fn tie_partner(&mut self, name: &str, other: &str) -> Option<&mut Param> {
+        let points_back = |o: &Param| o.tie.as_ref().is_some_and(|t| t.0 == name);
+        if self.params.get(other).is_none_or(points_back) {
+            return self.params.get_mut(other);
+        }
+        self.local_scopes.iter_mut().rev().find_map(|s| {
+            s.get_mut(other)
+                .and_then(Option::as_mut)
+                .filter(|o| points_back(o))
+        })
     }
 
     /// Started as sh or ksh, zsh has no special arrays tied to the colon
@@ -334,20 +351,43 @@ impl Shell {
             return true;
         }
         let prev = self.params.get(name).cloned();
+        // A special tied pair (PATH/path) is localized together; a pair
+        // from `typeset -T` keeps the other side, still tied to the hidden
+        // parameter.
+        let special = DEFAULT_TIES.iter().any(|(s, a)| *s == name || *a == name);
         let partner = prev
             .as_ref()
             .and_then(|p| p.tie.as_ref())
+            .filter(|_| special)
             .map(|(o, _)| (o.clone(), self.params.get(o).cloned()));
         let Some(scope) = self.local_scopes.last_mut() else {
             return false;
         };
         scope.entry(name.to_string()).or_insert(prev);
-        if let Some((o, op)) = partner {
-            scope.entry(o.clone()).or_insert(op);
-            self.params.remove(&o);
-        }
         let mut fresh = Param::scalar("");
         fresh.level = depth;
+        if let Some((o, op)) = partner {
+            // Both sides start empty, still special and tied.
+            let sep = prev_sep(&op, name);
+            scope.entry(o.clone()).or_insert(op);
+            let array_side = DEFAULT_TIES.iter().any(|(_, a)| *a == name);
+            let (scalar, array) = if array_side {
+                (o.as_str(), name)
+            } else {
+                (name, o.as_str())
+            };
+            let mut sp = Param::scalar("");
+            sp.tie = Some((array.to_string(), sep.clone()));
+            let mut ap = Param::with(Value::Array(Vec::new()));
+            ap.tie = Some((scalar.to_string(), sep));
+            for p in [&mut sp, &mut ap] {
+                p.level = depth;
+                p.attrs = SPECIAL;
+            }
+            self.params.insert(scalar.to_string(), sp);
+            self.params.insert(array.to_string(), ap);
+            return true;
+        }
         self.params.insert(name.to_string(), fresh);
         true
     }
@@ -395,28 +435,48 @@ impl Shell {
     }
 
     pub fn push_scope(&mut self) {
-        // The caller's private parameters are hidden from the function it
-        // calls, which sees (and may change) what they hid.
+        self.push_scope_for(false);
+    }
+
+    /// Enters a scope: a function call when `function` (zsh's
+    /// wrap_private), which hides every private parameter from the code it
+    /// runs; otherwise a nofork substitution, which still sees its
+    /// function's privates but not those declared in other inner scopes.
+    pub fn push_scope_for(&mut self, function: bool) {
         let depth = self.local_scopes.len();
-        if depth > 0 {
-            let private: Vec<String> = self
-                .params
-                .iter()
-                .filter(|(_, p)| p.attrs & PRIVATE != 0 && p.level == depth)
-                .map(|(n, _)| n.clone())
-                .collect();
-            for name in private {
-                let p = self.params.remove(&name).unwrap();
-                if let Some(under) = self.local_scopes[depth - 1]
-                    .get_mut(&name)
-                    .and_then(Option::take)
-                {
-                    self.params.insert(name.clone(), under);
-                }
-                self.private_stash.push((depth, name, p));
-            }
+        let base = self.private_base;
+        let hide: Vec<String> = self
+            .params
+            .iter()
+            .filter(|(_, p)| {
+                p.attrs & PRIVATE != 0
+                    && p.attrs & PRIVATE_HIDDEN == 0
+                    && (function || p.level > base)
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in hide {
+            let p = self.params.remove(&name).unwrap();
+            let under = self
+                .local_scopes
+                .get_mut(p.level.wrapping_sub(1))
+                .and_then(|s| s.get_mut(&name))
+                .and_then(Option::take);
+            // Nothing beneath: the name stays taken, so assigning to it
+            // fails as in zsh rather than creating a global.
+            let shown = under.unwrap_or_else(|| {
+                let mut h = Param::with(Value::Scalar(String::new()));
+                h.attrs = READONLY | UNSET | PRIVATE_HIDDEN;
+                h
+            });
+            self.params.insert(name.clone(), shown);
+            self.private_stash.push((depth, name, p));
         }
         self.local_scopes.push(HashMap::new());
+        if function {
+            self.private_frames.push((depth, base));
+            self.private_base = depth + 1;
+        }
     }
 
     pub fn pop_scope(&mut self) {
@@ -433,16 +493,31 @@ impl Shell {
                 }
             }
         }
-        // Back in the function that owns them: its private parameters
-        // return, over whatever the called function left in their place.
         let depth = self.local_scopes.len();
+        if let Some(f) = self.private_frames.pop_if(|f| f.0 == depth) {
+            self.private_base = f.1;
+        }
+        // Back where they are visible: hidden private parameters return,
+        // over whatever the inner code left in their place.
         while self.private_stash.last().is_some_and(|e| e.0 == depth) {
             let (_, name, p) = self.private_stash.pop().unwrap();
-            let under = self.params.remove(&name);
-            if let Some(scope) = self.local_scopes.get_mut(depth - 1) {
+            let under = self
+                .params
+                .remove(&name)
+                .filter(|u| u.attrs & PRIVATE_HIDDEN == 0);
+            if let Some(scope) = self.local_scopes.get_mut(p.level.wrapping_sub(1)) {
                 scope.insert(name.clone(), under);
             }
             self.params.insert(name, p);
         }
     }
+}
+
+// The join string of a tied pair, from the partner's tie back to `name`.
+fn prev_sep(partner: &Option<Param>, name: &str) -> String {
+    partner
+        .as_ref()
+        .and_then(|p| p.tie.as_ref())
+        .filter(|t| t.0 == name)
+        .map_or_else(|| ":".to_string(), |t| t.1.clone())
 }

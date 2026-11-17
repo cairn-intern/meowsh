@@ -463,7 +463,8 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
             DeclArg::Assign { name, .. } | DeclArg::Array { name, .. } => name.clone(),
         };
         if ops.isset('p') {
-            let found = with_shell(|s| s.param(&name).cloned());
+            let found = with_shell(|s| s.param(&name).cloned())
+                .filter(|p| p.attrs & crate::params::PRIVATE_HIDDEN == 0);
             match found {
                 Some(p) => {
                     out(&print_param(&name, &p, &pf, locallevel()));
@@ -508,11 +509,68 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
             },
             other => other.clone(),
         };
+        if on & crate::params::PRIVATE != 0
+            && !ops.bare_plus
+            && !private_allowed(cmd, &name, on, ops.minus('h'))
+        {
+            status = 1;
+            continue;
+        }
         if !typeset_single(cmd, &name, on, off, roff, &asg, &ops, None) {
             status = 1;
         }
     }
     status
+}
+
+// zsh/param/private's makeprivate checks: a special parameter (unless
+// hidden with -h) or a local of this scope can't become private, and a
+// private can't change type.
+fn private_allowed(cmd: &str, name: &str, on: u32, hide: bool) -> bool {
+    let level = locallevel();
+    let existing = with_shell(|s| s.param(name).cloned());
+    let special = crate::shell::DYNAMIC_NAMES.contains(&name)
+        || crate::params::DEFAULT_TIES
+            .iter()
+            .any(|(sc, ar)| *sc == name || *ar == name)
+        || existing.as_ref().is_some_and(|p| p.attrs & SPECIAL != 0);
+    if special && !hide {
+        warn(
+            cmd,
+            &format!("can't change scope of existing param: {}", name),
+        );
+        crate::exec::abort_command(1);
+        return false;
+    }
+    let Some(p) = existing.filter(|p| p.level == level && level > 0) else {
+        return true;
+    };
+    if p.attrs & crate::params::PRIVATE == 0 {
+        warn(
+            cmd,
+            &format!("can't change scope of existing param: {}", name),
+        );
+        crate::exec::abort_command(1);
+        return false;
+    }
+    let kind = |array: bool, assoc: bool, attrs: u32| {
+        (
+            array,
+            assoc,
+            attrs & (INTEGER | FLOAT_E | FLOAT_F | NAMEREF),
+        )
+    };
+    let want = kind(on & K_ARRAY != 0, on & K_ASSOC != 0, on);
+    let have = kind(p.is_array(), p.is_assoc(), p.attrs);
+    if want != have {
+        warn(
+            cmd,
+            &format!("can't change type of private param: {}", name),
+        );
+        crate::exec::abort_command(1);
+        return false;
+    }
+    true
 }
 
 fn locallevel() -> usize {
@@ -804,19 +862,8 @@ fn typeset_single(
                 p.tie = Some((other.clone(), sep.clone()));
             }
             // -U on a tied scalar uniquifies the array it is tied to.
-            let tied_array = match (&p.value, &p.tie) {
-                (Value::Scalar(_), Some((other, _))) if on & UNIQUE != 0 => Some(other.clone()),
-                _ => None,
-            };
-            if let Some(other) = tied_array {
-                if let Some(items) = s.array(&other).cloned() {
-                    let mut seen = std::collections::HashSet::new();
-                    let items: Vec<String> = items
-                        .into_iter()
-                        .filter(|x| seen.insert(x.clone()))
-                        .collect();
-                    s.store(&other, Value::Array(items));
-                }
+            if on & UNIQUE != 0 && p.tie.is_some() {
+                s.sync_tie(base_name);
             }
         });
         if !assign_value(base_name, asg) {
@@ -874,9 +921,16 @@ fn typeset_single(
         if new_local {
             s.make_local(base_name);
         }
+        // A local special tied pair (PATH/path): make_local tied it.
+        let made_tie = if new_local {
+            s.param(base_name)
+                .and_then(|p| p.tie.clone().map(|t| (t, p.is_array())))
+        } else {
+            None
+        };
         let value = if on & K_ASSOC != 0 {
             Value::Assoc(Default::default())
-        } else if on & K_ARRAY != 0 {
+        } else if on & K_ARRAY != 0 || made_tie.as_ref().is_some_and(|m| m.1) {
             Value::Array(Vec::new())
         } else {
             Value::Scalar(String::new())
@@ -906,6 +960,10 @@ fn typeset_single(
         };
         set_width_base(&mut p, on, ops);
         p.tie = tie.clone();
+        if let Some((t, _)) = made_tie.filter(|_| p.tie.is_none()) {
+            p.tie = Some(t);
+            p.attrs |= SPECIAL;
+        }
         s.params.insert(base_name.to_string(), p);
     });
     let asg = match (carried, asg) {

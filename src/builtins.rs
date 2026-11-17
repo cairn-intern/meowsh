@@ -813,7 +813,7 @@ fn builtin_unset(words: &[String]) -> i32 {
             match kind {
                 None => {}
                 Some((_, _, true)) => {
-                    crate::shell::shell_err(&format!("read-only variable: {}", target));
+                    crate::shell::shell_err(&crate::shell::readonly_message(&target));
                     status = 1;
                 }
                 Some((true, _, _)) => {
@@ -863,7 +863,7 @@ fn builtin_unset(words: &[String]) -> i32 {
                 .is_some_and(|p| p.attrs & VAR_READONLY != 0)
         });
         if readonly {
-            crate::shell::shell_err(&format!("read-only variable: {}", a));
+            crate::shell::shell_err(&crate::shell::readonly_message(a));
             status = 1;
             continue;
         }
@@ -874,8 +874,20 @@ fn builtin_unset(words: &[String]) -> i32 {
                 .is_some_and(|p| p.level > 0 && p.tie.is_none());
             if local {
                 if let Some(p) = s.param_mut(a.as_str()) {
-                    p.value = crate::params::Value::Scalar(String::new());
-                    p.attrs = crate::params::UNSET;
+                    // A private keeps its kind, as its own unset function
+                    // leaves it declared.
+                    let private = p.attrs & crate::params::PRIVATE != 0;
+                    p.value = match &p.value {
+                        crate::params::Value::Array(_) if private => {
+                            crate::params::Value::Array(Vec::new())
+                        }
+                        crate::params::Value::Assoc(_) if private => {
+                            crate::params::Value::Assoc(Default::default())
+                        }
+                        _ => crate::params::Value::Scalar(String::new()),
+                    };
+                    p.attrs = crate::params::UNSET
+                        | (p.attrs & (crate::params::PRIVATE | crate::params::HIDE));
                 }
             } else {
                 s.remove_param(a.as_str());

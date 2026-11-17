@@ -2749,6 +2749,10 @@ fn type_of(name: &str) -> String {
             return String::new();
         };
         let a = p.attrs;
+        // An unset parameter has no type, unless declared (TYPESET_TO_UNSET).
+        if a & PRIVATE_HIDDEN != 0 || (a & UNSET != 0 && a & DECLARED == 0) {
+            return String::new();
+        }
         let mut t = String::from(match &p.value {
             Value::Array(_) => "array",
             Value::Assoc(_) => "association",
@@ -2781,7 +2785,8 @@ fn type_of(name: &str) -> String {
             (UNIQUE, "-unique"),
             (HIDE, "-hide"),
             (HIDEVAL, "-hideval"),
-            (SPECIAL, "-special"),
+            // zsh makes a private parameter special.
+            (SPECIAL | PRIVATE, "-special"),
         ] {
             if a & bit != 0 {
                 t.push_str(word);
@@ -3675,6 +3680,11 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         return bad();
     }
     if flags.type_of {
+        // (Pt): the type of the parameter the value names.
+        let name = match (&val, flags.indirect) {
+            (Val::Str(s), true) => s.clone(),
+            _ => name,
+        };
         // A bound reference reports the type of what it refers to.
         let _swap = crate::shell::RefSwap::enter(&name);
         let target = crate::shell::split_target_pub(&crate::shell::resolve_ref(&name));

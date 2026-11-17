@@ -1052,3 +1052,90 @@ fn typeset_m_lists_in_zsh_hash_order() {
     let (_, out, _) = sh("typeset tqa=1 tqz=2; typeset -m 'tq*'");
     assert_eq!(out, "tqz=2\ntqa=1\n");
 }
+
+#[test]
+fn private_hidden_from_a_function_rejects_assignment() {
+    let (_, out, err) = sh("() { private q=outer; () { q=new; print reached }; print -r -- $q }");
+    assert_eq!(out, "");
+    assert!(
+        err.contains("q: can't modify read-only parameter"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn nofork_sees_its_functions_private() {
+    let (_, out, _) = sh("() { private z=outer; print -r -- ${(t)z} ${| REPLY=$z } }");
+    assert_eq!(out, "scalar-local-hide-special outer\n");
+}
+
+#[test]
+fn private_errors_for_specials_locals_and_type_changes() {
+    let (_, _, err) = sh("() { private path }");
+    assert!(
+        err.contains("can't change scope of existing param: path"),
+        "{}",
+        err
+    );
+    let (_, _, err) = sh("() { local h=s; private -A h }");
+    assert!(
+        err.contains("can't change scope of existing param: h"),
+        "{}",
+        err
+    );
+    let (_, _, err) = sh("() { private x=1; private -a x }");
+    assert!(
+        err.contains("can't change type of private param: x"),
+        "{}",
+        err
+    );
+    let (_, _, err) = sh("() { private x; x=(a b) }");
+    assert!(
+        err.contains("x: attempt to assign array value to non-array"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn private_survives_unset_and_redeclaration() {
+    let (_, out, _) = sh("() { private x=1; unset x; private x=2; print -r -- $x }");
+    assert_eq!(out, "2\n");
+}
+
+#[test]
+fn exported_private_reaches_commands_run_by_called_functions() {
+    let (_, out, _) = sh("inner() { print $+v; sh -c 'echo X $v' }; () { private -x v=w; inner }");
+    assert_eq!(out, "0\nX w\n");
+}
+
+#[test]
+fn unset_local_has_no_type() {
+    let (_, out, _) = sh("f() { local x; unset x; print -r -- A${(t)x} }; f");
+    assert_eq!(out, "A\n");
+}
+
+#[test]
+fn tied_partner_shadowed_by_a_local_stays_tied() {
+    let (_, out, _) = sh("typeset -T VAR var=(a b c b a); \
+         () { typeset -i var=1; typeset -g -U VAR; typeset -p VAR var }; typeset -p VAR var");
+    assert_eq!(
+        out,
+        "typeset -g -UT VAR var=1\ntypeset -i var=1\n\
+         typeset -UT VAR var=( a b c )\ntypeset -aT VAR var=( a b c )\n"
+    );
+}
+
+#[test]
+fn special_tied_pairs_exist_and_localize_together() {
+    let (_, out, _) = sh("print -r -- ${(t)fignore} ${(t)FIGNORE}; \
+         f() { typeset MANPATH; manpath=(/ /); typeset -UT MANPATH manpath; print -r -- $manpath }; f");
+    assert_eq!(out, "array-tied-special scalar-tied-special\n/\n");
+}
+
+#[test]
+fn p_and_t_flags_give_the_named_parameters_type() {
+    let (_, out, _) = sh("typeset -a arr; v=arr; print -r -- ${(Pt)v} ${(t)v}");
+    assert_eq!(out, "array scalar\n");
+}

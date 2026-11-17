@@ -1,6 +1,6 @@
 use crate::params::{
-    Param, Value, DEFAULT_TIES, EXPORT, FLOAT_E, FLOAT_F, INTEGER, LEFT, READONLY, RIGHT_B,
-    RIGHT_Z, UNIQUE, UNSET,
+    Param, Value, DEFAULT_TIES, EXPORT, FLOAT_E, FLOAT_F, INTEGER, LEFT, PRIVATE_HIDDEN, READONLY,
+    RIGHT_B, RIGHT_Z, UNIQUE, UNSET,
 };
 use crate::types::{Shell, OPT_ALLEXPORT};
 use std::collections::{BTreeMap, HashSet};
@@ -149,9 +149,13 @@ pub fn shell_init() {
     if let Some(p) = shell.param_mut("langinfo") {
         p.attrs |= crate::params::SPECIAL;
     }
+    // zsh has each pair from the start, empty unless inherited.
     for (scalar, array) in DEFAULT_TIES {
-        if shell.has_param(scalar) || matches!(*scalar, "PATH" | "FPATH") {
-            shell.tie(scalar, array, ":");
+        shell.tie(scalar, array, ":");
+        for n in [scalar, array] {
+            if let Some(p) = shell.param_mut(n) {
+                p.attrs |= crate::params::SPECIAL;
+            }
         }
     }
 }
@@ -231,6 +235,16 @@ pub fn build_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
                 Value::Scalar(v) => Some((k.clone(), v.clone())),
                 _ => None,
             })
+            // A hidden exported private stays in the environment, as
+            // zsh does not take it out.
+            .chain(
+                s.private_stash
+                    .iter()
+                    .filter_map(|(_, k, p)| match &p.value {
+                        Value::Scalar(v) if p.attrs & EXPORT != 0 => Some((k.clone(), v.clone())),
+                        _ => None,
+                    }),
+            )
             .collect()
     });
     for (k, v) in overrides {
@@ -532,8 +546,23 @@ pub fn var_get_if_exists(name: &str) -> Option<i64> {
     shell.scalar(name).and_then(|v| v.parse::<i64>().ok())
 }
 
-fn readonly_error(name: &str) {
-    shell_err(&format!("read-only variable: {}", name));
+/// The error for assigning to read-only `name`: a private parameter
+/// hidden from this scope has its own (call without the shell locked).
+pub fn readonly_message(name: &str) -> String {
+    let attrs = with_shell(|s| s.param(name).map_or(0, |p| p.attrs));
+    readonly_text(name, attrs)
+}
+
+fn readonly_text(name: &str, attrs: u32) -> String {
+    if attrs & PRIVATE_HIDDEN != 0 {
+        format!("{}: can't modify read-only parameter", name)
+    } else {
+        format!("read-only variable: {}", name)
+    }
+}
+
+fn readonly_error(name: &str, attrs: u32) {
+    shell_err(&readonly_text(name, attrs));
 }
 
 /// Converts a value for a numeric parameter at assignment: integers
@@ -984,7 +1013,7 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
     assign_warning(name, "scalar");
     let attrs = with_shell(|s| s.param(name).map(|p| p.attrs).unwrap_or(0));
     if attrs & READONLY != 0 {
-        readonly_error(name);
+        readonly_error(name, attrs);
         return false;
     }
     let value = match convert_for(attrs, value) {
@@ -1076,6 +1105,19 @@ pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool
     let _swap = crate::shell::RefSwap::enter(name);
     if placeholder_ref(name) {
         shell_err(&format!("{}: can't change type of a named reference", name));
+        return false;
+    }
+    // A private parameter keeps its type.
+    let resolved = resolve_ref(name);
+    if with_shell(|s| {
+        s.param(&resolved).is_some_and(|p| {
+            p.attrs & crate::params::PRIVATE != 0 && !p.is_array() && !p.is_assoc()
+        })
+    }) {
+        shell_err(&format!(
+            "{}: attempt to assign array value to non-array",
+            name
+        ));
         return false;
     }
     // zsh/parameter's $functions: each name and body defines a function.
@@ -1413,8 +1455,12 @@ pub fn assoc_keys(name: &str) -> Option<Vec<String>> {
 }
 
 fn prepare_array_mutation(shell: &mut Shell, name: &str) -> bool {
-    if shell.param(name).is_some_and(|p| p.attrs & READONLY != 0) {
-        readonly_error(name);
+    if let Some(attrs) = shell
+        .param(name)
+        .map(|p| p.attrs)
+        .filter(|a| a & READONLY != 0)
+    {
+        readonly_error(name, attrs);
         return false;
     }
     true
@@ -1470,6 +1516,11 @@ pub fn push_scope() {
 
 pub fn pop_scope() {
     SHELL.shell.lock().unwrap().pop_scope();
+}
+
+/// Enters a function call's scope (which hides private parameters).
+pub fn push_func_scope() {
+    SHELL.shell.lock().unwrap().push_scope_for(true);
 }
 
 pub fn in_function_scope() -> bool {

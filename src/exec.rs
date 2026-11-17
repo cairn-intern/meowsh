@@ -9,7 +9,7 @@ use crate::lexer::assignment_split;
 use crate::parser::{ParseError, Parser};
 use crate::shell::{
     array_append, array_set_subscript, build_env, find_command, is_array, opt_set, pop_scope,
-    push_scope, shell_err, var_get, var_get_opt, var_set, with_shell,
+    shell_err, var_get, var_get_opt, var_set, with_shell,
 };
 use crate::sys::{close, dup_high, err_line, pipe_cloexec, read_all, temp_file_with};
 use crate::types::{
@@ -858,6 +858,14 @@ fn redir_to_var(r: &Redir, var: &str) -> Result<(), RedirError> {
             .is_some_and(|p| p.attrs & crate::params::READONLY != 0)
     });
     let closing = matches!(r.op, RedirOp::DupIn | RedirOp::DupOut) && r.target == "-";
+    let hidden = with_shell(|s| {
+        s.param(var)
+            .is_some_and(|p| p.attrs & crate::params::PRIVATE_HIDDEN != 0)
+    });
+    if readonly && hidden {
+        shell_err(&crate::shell::readonly_message(var));
+        return Err(RedirError);
+    }
     if readonly {
         shell_err(&if closing {
             format!(
@@ -1211,7 +1219,7 @@ pub fn set_subscripted(name: &str, sub: &str, v: &str, append: bool) -> Result<b
 
 fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
     if is_readonly(&a.name) {
-        shell_err(&format!("read-only variable: {}", a.name));
+        shell_err(&crate::shell::readonly_message(&a.name));
         return Err(1);
     }
     let ok = match (&a.subscript, &a.value) {
@@ -1340,7 +1348,7 @@ impl TempVars {
                 continue;
             }
             if is_readonly(&a.name) {
-                shell_err(&format!("read-only variable: {}", a.name));
+                shell_err(&crate::shell::readonly_message(&a.name));
                 saved.restore();
                 return Err(1);
             }
@@ -2652,7 +2660,7 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
             *c = sticky.clone();
         }
     }
-    push_scope();
+    crate::shell::push_func_scope();
     // A `{ cmd }` body: the trap sees cmd, as zsh's body is the list.
     let inner = match body.as_ref() {
         Node::Brace(b) => b.as_ref(),
