@@ -1393,3 +1393,45 @@ fn unknown_prompt_colours_reset_to_the_default() {
     let (_, out, _) = sh("print -r -- ${(V)${(%):-'%F{foo}'}} ${(V)${(%):-'%K{reset}'}}");
     assert_eq!(out, "^[[39m ^[[49m\n");
 }
+
+#[test]
+fn cat_in_a_pipeline_brace_group_reads_its_own_redirection() {
+    let (_, out, _) = sh("echo 1 | { cat </dev/null; read b; print B$b }");
+    assert_eq!(out, "B1\n");
+}
+
+#[test]
+fn equals_subst_files_use_tmpprefix() {
+    let dir = TempDir::new().unwrap();
+    let (_, out, _) = sh(&format!(
+        "TMPPREFIX={}/eq; () {{ print -r -- ${{1:h}} }} =(true)",
+        dir.path().display()
+    ));
+    assert_eq!(out, format!("{}\n", dir.path().display()));
+}
+
+#[test]
+fn history_file_round_trip_with_backslashes_and_newlines() {
+    let dir = TempDir::new().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_meowsh"))
+        .args(["-fgis"])
+        .env("PS1", "")
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(b"  print -rs 'one\\'\n  print -s 'a\\nb'\n  fc -W hist\n  fc -p -R hist\n  fc -l\n")
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "    1  one\\\n    2  a\\nb\n"
+    );
+}

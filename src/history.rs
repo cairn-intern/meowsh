@@ -270,6 +270,76 @@ fn no_event(n: i64) -> String {
     format!("no such event: {}", n)
 }
 
+/// Writes `entries` in zsh's history file format (savehistfile): a
+/// newline inside an entry is backslash-newline, an entry ending in a
+/// backslash gets a space so it does not continue, and a leading `:` is
+/// escaped.
+pub fn write_zsh_file(path: &str, entries: &[String], append: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut text = String::new();
+    for e in entries {
+        if e.starts_with(':') {
+            text.push('\\');
+        }
+        let mut end_backslashes = false;
+        for c in e.chars() {
+            if c == '\n' {
+                text.push('\\');
+            }
+            end_backslashes = c == '\\' || (end_backslashes && c == ' ');
+            text.push(c);
+        }
+        if end_backslashes {
+            text.push(' ');
+        }
+        text.push('\n');
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(append)
+        .truncate(!append)
+        .open(path)?;
+    f.write_all(text.as_bytes())
+}
+
+/// Reads a zsh history file (readhistline): backslash-newline continues
+/// an entry, and the space after a final backslash goes.
+pub fn read_zsh_file(path: &str) -> std::io::Result<Vec<String>> {
+    let data = std::fs::read(path)?;
+    let text = String::from_utf8_lossy(&data);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for line in text.split_inclusive('\n') {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        cur.push_str(line);
+        if line.ends_with('\\') {
+            cur.pop();
+            cur.push('\n');
+            continue;
+        }
+        let trimmed = cur.trim_end_matches(' ');
+        if trimmed.len() != cur.len() && trimmed.ends_with('\\') {
+            cur.pop();
+        }
+        // Extended history: `: start:elapsed;command`.
+        let entry = match cur.strip_prefix(": ") {
+            Some(rest) if rest.contains(';') => rest.split_once(';').unwrap().1.to_string(),
+            _ => cur
+                .strip_prefix('\\')
+                .filter(|r| r.starts_with(':'))
+                .unwrap_or(&cur)
+                .to_string(),
+        };
+        out.push(entry);
+        cur.clear();
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

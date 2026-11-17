@@ -250,11 +250,17 @@ static EQ_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new(
 /// the result.
 pub fn output_file_subst(src: &str) -> Option<String> {
     let (out, _) = crate::shell::in_eval_context("equalsubst", || command_subst_in(src));
-    let dir = std::env::var("TMPDIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| "/tmp".to_string());
-    let mut buf = format!("{}/meowsh-eqXXXXXX", dir.trim_end_matches('/')).into_bytes();
+    // zsh names it $TMPPREFIX and a unique suffix.
+    let prefix = var_get_opt("TMPPREFIX")
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| {
+            let dir = std::env::var("TMPDIR")
+                .ok()
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| "/tmp".to_string());
+            format!("{}/meowsh-eq", dir.trim_end_matches('/'))
+        });
+    let mut buf = format!("{}XXXXXX", prefix).into_bytes();
     buf.push(0);
     let fd = unsafe { libc::mkstemp(buf.as_mut_ptr() as *mut libc::c_char) };
     if fd < 0 {
@@ -818,7 +824,20 @@ pub fn apply_redirs(redirs: &[Redir], save: bool) -> Result<SavedFds, RedirError
             }
         }
     }
+    // Only the stage's own redirections join its pipes, not those of
+    // the commands inside it.
+    PIPE_IN.store(false, std::sync::atomic::Ordering::SeqCst);
+    PIPE_OUT.store(false, std::sync::atomic::Ordering::SeqCst);
     Ok(saved)
+}
+
+// Whether a pipeline stage has redirections of its own (for MULTIOS).
+fn own_redirs(cmd: &Node) -> bool {
+    match cmd {
+        Node::Simple(s) => !s.redirs.is_empty(),
+        Node::Redirected { .. } => true,
+        _ => false,
+    }
 }
 
 // Copying processes started without saved descriptors (in a child about
@@ -2852,7 +2871,7 @@ fn run_pipeline(cmds: &[Node]) -> i32 {
                 libc::dup2(prev_read, 0);
             }
             close(prev_read);
-            PIPE_IN.store(true, std::sync::atomic::Ordering::SeqCst);
+            PIPE_IN.store(own_redirs(cmd), std::sync::atomic::Ordering::SeqCst);
             let st = exec_node(cmd);
             PIPE_IN.store(false, std::sync::atomic::Ordering::SeqCst);
             unsafe {
@@ -2886,8 +2905,14 @@ fn run_pipeline(cmds: &[Node]) -> i32 {
         let pid = fork_process(ForkKind::Foreground(pgid));
         if pid == 0 {
             // MULTIOS joins a stage's redirections with its pipes.
-            PIPE_IN.store(prev_read >= 0, std::sync::atomic::Ordering::SeqCst);
-            PIPE_OUT.store(w >= 0, std::sync::atomic::Ordering::SeqCst);
+            PIPE_IN.store(
+                prev_read >= 0 && own_redirs(cmd),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            PIPE_OUT.store(
+                w >= 0 && own_redirs(cmd),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             unsafe {
                 if prev_read >= 0 {
                     libc::dup2(prev_read, 0);
@@ -3675,7 +3700,23 @@ pub fn execute_line(line: &str) {
     run_string(line);
 }
 
-pub fn history_add(line: &str) {
+/// Adds a typed command line to the history; false when HIST_IGNORE_SPACE
+/// drops it (a leading space). The text kept has no leading blanks.
+pub fn history_add(line: &str) -> bool {
+    let kept = !(line.starts_with(' ') && crate::options::is_set("histignorespace"));
+    LINE_IN_HISTORY.store(kept, std::sync::atomic::Ordering::Relaxed);
+    if kept {
+        history_push(line.trim_start());
+    }
+    kept
+}
+
+// Whether the command line running now is the last history entry.
+pub static LINE_IN_HISTORY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Adds `line` to the history as it is (`print -s`).
+pub fn history_push(line: &str) {
     with_shell(|s| {
         let mut h = s.history.lock().unwrap_or_else(|e| e.into_inner());
         h.push(line.to_string());
@@ -3871,9 +3912,15 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                     };
                     lines_done += used.matches('\n').count();
                     let text = used.trim().to_string();
+                    // The leading space HIST_IGNORE_SPACE looks for.
+                    let spaced = used.trim_start_matches('\n').starts_with([' ', '\t']);
                     buf = rest;
                     if is_interactive {
-                        on_command(&text);
+                        if spaced {
+                            on_command(&format!(" {}", text));
+                        } else {
+                            on_command(&text);
+                        }
                         crate::builtins::run_hooks("preexec", &[text.clone(), text.clone(), text]);
                         crate::zle::termctl::mark_output(true);
                     }

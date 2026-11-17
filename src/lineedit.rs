@@ -813,7 +813,9 @@ pub fn run_fd(fd: i32, prompts: bool) -> i32 {
                 None => InputLine::Eof,
             }
         },
-        crate::exec::history_add,
+        |text| {
+            crate::exec::history_add(text);
+        },
     )
 }
 
@@ -890,7 +892,10 @@ pub fn run_interactive() -> i32 {
         },
         |text| {
             let clean = strip_ansi(text);
-            crate::exec::history_add(&clean);
+            if !crate::exec::history_add(&clean) {
+                return;
+            }
+            let clean = clean.trim_start().to_string();
             let mut rl = rl.borrow_mut();
             let _ = rl.add_history_entry(clean.as_str());
             if !history_file.is_empty() {
@@ -1019,9 +1024,11 @@ fn run_zle() -> i32 {
             }
         },
         |text| {
-            crate::exec::history_add(text);
+            if !crate::exec::history_add(text) {
+                return;
+            }
             if !history_file.is_empty() {
-                append_history_file(&history_file, text);
+                append_history_file(&history_file, text.trim_start());
             }
         },
     );

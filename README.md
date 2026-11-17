@@ -115,7 +115,8 @@ and builtins include:
   `-r`, `-R`, `-X`), `functions -c` and `-M` math functions, anonymous
   `function { ... } args`, `command_not_found_handler`, `$FUNCNEST`, `$argv`,
   `print`, `emulate`, `is-at-least`,
-  `zparseopts`, `fc -l`, `colors`, `unfunction`, `builtin`, `read -k`/`-q`,
+  `zparseopts`, `fc -l`, `fc -W`/`-A`/`-R` (zsh's history file format), `fc -p`/`-P`,
+  `print -s`, `HIST_IGNORE_SPACE`, `colors`, `unfunction`, `builtin`, `read -k`/`-q`,
   global aliases (`alias -g`) and the `$aliases`/`$galiases` arrays
 - function-scoped EXIT traps, `LOCAL_OPTIONS`/`LOCAL_TRAPS` (also set by
   `emulate -L`), `AUTO_CD`, `$0` as the function or sourced file name
@@ -178,8 +179,9 @@ back the word as typed, and typing anything else carries on from the
 selection. A grid taller than the terminal scrolls with the selection.
 
 History is kept in
-`~/.meowsh_history`; `$HISTFILE` is not used, so zsh's history file is
-never rewritten in a different format.
+`~/.meowsh_history`; `$HISTFILE` is not used for it, so zsh's history file is
+never rewritten in a different format. Only an explicit `fc -W` or `fc -A`
+without a file name writes `$HISTFILE`, in zsh's own format.
 
 ## Using meowsh as your shell
 

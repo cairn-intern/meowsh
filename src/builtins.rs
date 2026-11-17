@@ -4207,6 +4207,7 @@ pub fn run_hooks(hook: &str, args: &[String]) {
 fn builtin_fc(words: &[String]) -> i32 {
     let (mut list, mut numbers, mut reverse) = (false, true, false);
     let (mut push, mut pop) = (false, false);
+    let (mut write, mut read, mut append) = (false, false, false);
     let mut range = Vec::new();
     let mut i = 1;
     while let Some(a) = words.get(i) {
@@ -4226,6 +4227,9 @@ fn builtin_fc(words: &[String]) -> i32 {
                         'r' => reverse = true,
                         'p' => push = true,
                         'P' => pop = true,
+                        'W' => write = true,
+                        'R' => read = true,
+                        'A' => append = true,
                         't' => i += 1,
                         _ => {}
                     }
@@ -4236,7 +4240,11 @@ fn builtin_fc(words: &[String]) -> i32 {
         }
         i += 1;
     }
-    // fc -p [file [histsize [savehist]]]: the sizes must be integers.
+    let history = || with_shell(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone());
+    let set_history =
+        |h: Vec<String>| with_shell(|s| *s.history.lock().unwrap_or_else(|e| e.into_inner()) = h);
+    // fc -p [file [histsize [savehist]]]: a new history, the old one kept
+    // on a stack for fc -P; the sizes must be integers.
     if push {
         for (arg, var) in range.iter().skip(1).zip(["HISTSIZE", "SAVEHIST"]) {
             if arg.parse::<i64>().is_err() {
@@ -4244,15 +4252,76 @@ fn builtin_fc(words: &[String]) -> i32 {
                 return 1;
             }
         }
+        let file = var_get_opt("HISTFILE");
+        if let Ok(mut st) = HIST_STACK.lock() {
+            st.push((history(), file));
+        }
+        // The command running now stays in the old history.
+        crate::exec::LINE_IN_HISTORY.store(false, std::sync::atomic::Ordering::Relaxed);
+        set_history(Vec::new());
+        if let Some(f) = range.first() {
+            crate::shell::var_set("HISTFILE", f, false);
+            if let Ok(h) = crate::history::read_zsh_file(f) {
+                set_history(h);
+            }
+        }
+        if !read && !write && !append {
+            return 0;
+        }
+    }
+    if pop {
+        let Some((h, file)) = HIST_STACK.lock().ok().and_then(|mut s| s.pop()) else {
+            builtin_err("fc", "history stack empty");
+            return 1;
+        };
+        set_history(h);
+        match file {
+            Some(f) => {
+                crate::shell::var_set("HISTFILE", &f, false);
+            }
+            None => {
+                with_shell(|s| s.remove_param("HISTFILE"));
+            }
+        }
         return 0;
     }
-    if pop || !list {
+    // fc -W / -A / -R [file]: write, append or read the history file.
+    if write || append || read {
+        let file = if push { None } else { range.first().cloned() };
+        let Some(file) = file
+            .or_else(|| var_get_opt("HISTFILE"))
+            .filter(|f| !f.is_empty())
+        else {
+            return 0;
+        };
+        if read {
+            if !push {
+                if let Ok(h) = crate::history::read_zsh_file(&file) {
+                    let mut cur = history();
+                    cur.extend(h);
+                    set_history(cur);
+                }
+            }
+            return 0;
+        }
+        let mut entries = history();
+        // The command running now is not saved.
+        if crate::shell::with_err_ctx(|e| e.interactive) && current_in_history() {
+            entries.pop();
+        }
+        if crate::history::write_zsh_file(&file, &entries, append).is_err() {
+            builtin_err("fc", &format!("can't write history file {}", file));
+            return 1;
+        }
+        return 0;
+    }
+    if !list {
         return 0;
     }
     let mut lines = with_shell(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone());
     // An interactive shell has already added the line running now; it is
     // the current event, and -1 is the one before it.
-    if crate::shell::with_err_ctx(|e| e.interactive) {
+    if crate::shell::with_err_ctx(|e| e.interactive) && current_in_history() {
         lines.pop();
     }
     let n = lines.len() as i64;
@@ -4288,6 +4357,8 @@ fn builtin_fc(words: &[String]) -> i32 {
     let text: String = picked
         .iter()
         .map(|(k, l)| {
+            // A newline in an event shows as \n.
+            let l = l.replace('\n', "\\n");
             if numbers {
                 format!("{:5}  {}\n", k, l)
             } else {
@@ -5028,6 +5099,16 @@ fn builtin_add_zsh_hook(words: &[String]) -> i32 {
 
 // zsh `print`: echo-style escapes unless -r; -n no newline, -l one
 // argument per line, -N NUL-separated, -P prompt escapes, -u fd.
+// `fc -p`: the histories (and $HISTFILE) set aside, for `fc -P`.
+static HIST_STACK: std::sync::Mutex<Vec<(Vec<String>, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+// Whether the command running now was added to the history (it is not
+// with HIST_IGNORE_SPACE, nor after `fc -p`).
+fn current_in_history() -> bool {
+    crate::exec::LINE_IN_HISTORY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

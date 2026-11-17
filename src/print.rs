@@ -336,7 +336,7 @@ fn print_main(name: &str, ops: &Ops, mut args: Vec<String>, printf: bool) -> i32
                 return 0;
             }
             if o('s') || o('S') {
-                // No history to add to here.
+                crate::exec::history_push(&args.join(" "));
                 return 0;
             }
             let sep = if o('l') {
