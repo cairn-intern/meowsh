@@ -1479,7 +1479,42 @@ fn xtrace_line(text: &str) {
     }
     let ps4 = var_get_opt("PS4").unwrap_or_else(|| "+ ".to_string());
     let ps4 = crate::shell::render_prompt(&ps4);
-    err_line(&format!("{}{}", ps4, text));
+    let line = format!("{}{}\n", ps4, text);
+    match XTRACE_FD.with(|t| t.get()) {
+        Some(fd) => {
+            let _ = crate::sys::write_fd(fd, line.as_bytes());
+        }
+        None => err_line(line.trim_end_matches('\n')),
+    }
+}
+
+// Runs a builtin whose redirections are in place (`saved` holds what
+// they replaced). The code `.` runs traces to the shell's standard error,
+// not the one redirected for the `.` command (as zsh's xtrerr).
+fn run_builtin_traced(
+    name: &str,
+    words: &[String],
+    decl: &Option<Vec<DeclArg>>,
+    saved: &SavedFds,
+) -> i32 {
+    let trace = matches!(name, "." | "source")
+        .then(|| {
+            saved
+                .iter()
+                .find(|&&(f, copy)| f == 2 && copy >= 0)
+                .map(|&(_, c)| c)
+        })
+        .flatten();
+    let outer = XTRACE_FD.with(|t| t.replace(trace.or(t.get())));
+    let st = run_builtin(name, words, decl);
+    XTRACE_FD.with(|t| t.set(outer));
+    st
+}
+
+thread_local! {
+    // Where xtrace goes while a sourced file runs under its own stderr
+    // redirection: the standard error from before it.
+    static XTRACE_FD: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 // Declaration utilities take assignment arguments, which expand like
@@ -2199,7 +2234,7 @@ fn run_command(
                 return 1;
             }
         };
-        let st = run_builtin(&name, &words, &decl);
+        let st = run_builtin_traced(&name, &words, &decl, &saved);
         restore_redirs(saved);
         return st;
     }
@@ -2252,7 +2287,7 @@ fn run_command(
         };
         let st = match apply_redirs(redirs, true) {
             Ok(saved) => {
-                let st = run_builtin(&name, &words, &decl);
+                let st = run_builtin_traced(&name, &words, &decl, &saved);
                 restore_redirs(saved);
                 st
             }
@@ -2626,12 +2661,17 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
     let def = def.unwrap_or_else(|| format!("{}:{}", code_origin(), line));
     // A body that is one simple command (`f() g`) has no lines of its own:
     // zsh keeps the caller's line number while it runs.
-    let one_line =
-        matches!(**body, Node::Simple(_)) && !crate::builtins::is_autoload_stub(&words[0]);
+    let one_line = matches!(**body, Node::Simple(_))
+        && words[0] != "(anon)"
+        && !crate::builtins::is_autoload_stub(&words[0]);
     let saved_line = push_frame(&words[0], if one_line { 0 } else { line }, Some(def));
-    if one_line {
-        crate::shell::with_err_ctx(|e| e.frozen += 1);
-    }
+    // A function with lines of its own counts them, even when called from
+    // one that keeps its caller's line.
+    let outer_frozen = crate::shell::with_err_ctx(|e| {
+        let outer = e.frozen;
+        e.frozen = if one_line { outer + 1 } else { 0 };
+        outer
+    });
     if let Ok(mut o) = FUNC_ORIGINS.lock() {
         o.push(origin);
     }
@@ -2783,9 +2823,7 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
         e.stack.pop();
         e.calls.pop();
         e.lineno = saved_line;
-        if one_line {
-            e.frozen -= 1;
-        }
+        e.frozen = outer_frozen;
     });
     if let Ok(mut o) = FUNC_ORIGINS.lock() {
         o.pop();

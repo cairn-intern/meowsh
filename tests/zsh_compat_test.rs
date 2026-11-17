@@ -1557,3 +1557,21 @@ fn zsh_parameter_reloads_over_alias_and_option_tables() {
     let (st, _, err) = sh("alias x=y; zmodload -u zsh/parameter; zmodload zsh/parameter");
     assert_eq!(st, 0, "{}", err);
 }
+
+#[test]
+fn sourced_code_traces_to_the_shells_stderr() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("xt.in"), "print \"$*\"\n").unwrap();
+    let (_, out, err) = sh(&format!(
+        "cd {} && PS4='+%N:%i> '; set -x; . ./xt.in hi 2>>e; set +x; cat e",
+        dir.path().display()
+    ));
+    assert_eq!(out, "hi\n");
+    assert!(err.contains("+./xt.in:1> print hi"), "{}", err);
+}
+
+#[test]
+fn functions_called_from_one_command_functions_count_their_own_lines() {
+    let (_, _, err) = sh("f() g\ng() { () : }\nfunctions -t f\nf");
+    assert_eq!(err, "+f:4> g\n+g:0> '(anon)'\n+(anon):0> :\n");
+}
