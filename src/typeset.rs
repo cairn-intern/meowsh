@@ -112,6 +112,33 @@ fn special_typeset(
     }
     let autoload = name == "SRANDOM";
     let global = on & LOCAL == 0 || level == 0;
+    // zsh/datetime's parameters are hidden specials: a local replaces one,
+    // unless `typeset +h` unhid it, when it stays read-only.
+    if matches!(name, "EPOCHSECONDS" | "EPOCHREALTIME") {
+        let unhidden = |set: Option<bool>| {
+            let mut u = UNHIDDEN.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = set {
+                if v {
+                    u.insert(name.to_string());
+                } else {
+                    u.remove(name);
+                }
+            }
+            u.contains(name)
+        };
+        if global && off & HIDE != 0 {
+            unhidden(Some(true));
+            return Some(true);
+        }
+        if !global {
+            if unhidden(None) {
+                crate::shell::shell_err(&format!("read-only variable: {}", name));
+                crate::exec::abort_command(1);
+                return Some(false);
+            }
+            return None;
+        }
+    }
     if on & HIDE != 0 {
         if global {
             warn(cmd, &format!("{}: can't change parameter attribute", name));
@@ -1568,3 +1595,7 @@ fn list_params(flags: u32, exclude: u32, pf: &PrintFlags, pattern: Option<&str>)
     }
     out(&text);
 }
+
+// Module specials made visible to locals with `typeset +h`.
+static UNHIDDEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());

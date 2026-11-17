@@ -1300,3 +1300,38 @@ fn print_tab_expansion_counts_wide_characters_as_two_columns() {
     let (_, out, _) = sh("print -X8 -r -- $'one\\tＺＳＨ\\tthree'");
     assert_eq!(out, "one     ＺＳＨ  three\n");
 }
+
+#[test]
+fn one_command_function_keeps_the_callers_line() {
+    let (_, _, err) = sh("f() g\ng() :\nfunctions -t f\nf");
+    assert_eq!(err, "+f:4> g\n+g:4> :\n");
+}
+
+#[test]
+fn invalid_namespace_assignment_is_not_an_identifier() {
+    for (word, name) in [
+        (".k.=x", ".k."),
+        (".2.b=x", ".2.b"),
+        (".not.2b=x", ".not.2b"),
+    ] {
+        let (st, _, err) = sh(word);
+        assert_eq!(st, 1, "{}", word);
+        assert!(
+            err.contains(&format!("not an identifier: {}", name)),
+            "{}",
+            err
+        );
+    }
+    let (st, _, _) = sh(".n.s.k=x");
+    assert_eq!(st, 127);
+}
+
+#[test]
+fn local_hides_epochseconds_unless_unhidden() {
+    let (_, out, _) =
+        sh("fn() { local EPOCHSECONDS=s; print $EPOCHSECONDS ${(t)EPOCHSECONDS} }; fn");
+    assert_eq!(out, "s scalar-local\n");
+    let (st, _, err) = sh("typeset +h EPOCHSECONDS; fn() { local EPOCHSECONDS=s }; fn");
+    assert_eq!(st, 1);
+    assert!(err.contains("read-only variable: EPOCHSECONDS"), "{}", err);
+}

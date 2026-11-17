@@ -3790,7 +3790,7 @@ fn autoload_stub(dir: Option<&str>, default_too: bool) -> String {
     stub
 }
 
-fn is_autoload_stub(name: &str) -> bool {
+pub fn is_autoload_stub(name: &str) -> bool {
     with_shell(|s| {
         s.functions.get(name).is_some_and(|f| {
             crate::deparse::Deparser::new(None)

@@ -2097,6 +2097,10 @@ fn run_command(
     let mut via_command = false;
     // A function named `command` or `builtin` overrides the builtin.
     let shadowed = |w: &str| with_shell(|s| s.functions.contains_key(w));
+    if let Some(bad) = bad_namespace_assignment(&words[0]) {
+        shell_err(&format!("not an identifier: {}", bad));
+        return 1;
+    }
     if words[0] == "command" && !shadowed("command") {
         let mut i = 1;
         let mut describe = None;
@@ -2596,7 +2600,14 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
         )
     });
     let def = def.unwrap_or_else(|| format!("{}:{}", code_origin(), line));
-    let saved_line = push_frame(&words[0], line, Some(def));
+    // A body that is one simple command (`f() g`) has no lines of its own:
+    // zsh keeps the caller's line number while it runs.
+    let one_line =
+        matches!(**body, Node::Simple(_)) && !crate::builtins::is_autoload_stub(&words[0]);
+    let saved_line = push_frame(&words[0], if one_line { 0 } else { line }, Some(def));
+    if one_line {
+        crate::shell::with_err_ctx(|e| e.frozen += 1);
+    }
     if let Ok(mut o) = FUNC_ORIGINS.lock() {
         o.push(origin);
     }
@@ -2748,6 +2759,9 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
         e.stack.pop();
         e.calls.pop();
         e.lineno = saved_line;
+        if one_line {
+            e.frozen -= 1;
+        }
     });
     if let Ok(mut o) = FUNC_ORIGINS.lock() {
         o.pop();
@@ -3915,6 +3929,19 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
         }
     }
     last_status()
+}
+
+// `.ns.name=value` that zsh's lexer takes as an assignment but whose name
+// is invalid (`.k.`, `.2.b`, `.not.2b`): the name, for the error.
+fn bad_namespace_assignment(word: &str) -> Option<&str> {
+    let name = word.split_once('=')?.0;
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let (ns, id) = name.strip_prefix('.')?.split_once('.')?;
+    let word_chars = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ns.is_empty() || id.contains('.') || !word_chars(ns) || !word_chars(id) {
+        return None;
+    }
+    (!crate::lexer::is_valid_name(name)).then_some(name)
 }
 
 #[cfg(test)]
