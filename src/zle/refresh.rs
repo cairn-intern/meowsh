@@ -9,6 +9,8 @@ use super::*;
 use std::cell::RefCell;
 
 thread_local! {
+    // Set while zrefresh draws a completion list, which refreshes again.
+    static INLIST: Cell<bool> = const { Cell::new(false) };
     static TTYBUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static TTYFD: Cell<i32> = const { Cell::new(1) };
 }
@@ -109,6 +111,9 @@ impl Zle {
             self.refresh.vcs = 0;
             self.refresh.nlnct = 0;
             write_tty("\r");
+            if self.showinglist > 0 {
+                self.showinglist = -2;
+            }
         } else {
             let vln = self.refresh.vln;
             if vln > 0 {
@@ -210,13 +215,31 @@ impl Zle {
             lastrow += col / cols;
             col %= cols;
         }
-        out.push_str("\x1b[J");
+        // A completion list below the line stays.
+        if self.showinglist == 0 {
+            out.push_str("\x1b[J");
+        }
         write_tty(&out);
         self.refresh.vln = lastrow;
         self.refresh.vcs = col;
         self.refresh.nlnct = lastrow + 1;
         self.moveto(cur.0, cur.1);
         flush_tty();
+        // A new list, or one the line has grown over, is drawn now.
+        let nlnct = self.refresh.nlnct as i32;
+        if (self.showinglist == -2 || (self.showinglist > 0 && self.showinglist < nlnct))
+            && !INLIST.with(|i| i.get())
+        {
+            INLIST.with(|i| i.set(true));
+            crate::zle::comp::result::list_matches(self);
+            INLIST.with(|i| i.set(false));
+            if !self.errflag {
+                self.zrefresh();
+            }
+        }
+        if self.showinglist == -1 {
+            self.showinglist = nlnct;
+        }
     }
 
     /// Escape sequences for each display position, from region_highlight

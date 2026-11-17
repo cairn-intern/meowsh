@@ -332,6 +332,10 @@ fn command_position(before: &[char]) -> bool {
     while let Some(r) = t.strip_suffix("\\\n") {
         t = r.trim_end_matches([' ', '\t']);
     }
+    // `name=(`: array elements follow, not a command.
+    if t.ends_with("=(") {
+        return false;
+    }
     if t.is_empty() || t.ends_with(['(', ';', '&', '|', '\n', '{', '!']) {
         return true;
     }

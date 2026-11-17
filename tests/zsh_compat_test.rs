@@ -849,3 +849,66 @@ fn zmodload_e_reports_missing_modules() {
     let (_, out, _) = sh("zmodload -e zsh/compctl; a=$?; zmodload -e zsh/zle; print $a $?");
     assert_eq!(out, "1 0\n");
 }
+
+#[test]
+fn argv_assignments_edit_the_positional_parameters() {
+    let (_, out, _) = sh("f() { argv+=(h:$1); argv[1]=x; print -r -- $# $@ }; f a b");
+    assert_eq!(out, "3 x b h:a\n");
+}
+
+#[test]
+fn set_a_takes_every_later_word_as_a_value() {
+    let (_, out, _) = sh("o=(); set -A a \"$o[@]\" -J y; print -r -- $#a $a");
+    assert_eq!(out, "2 -J y\n");
+}
+
+#[test]
+fn typeset_plus_fm_lists_matching_functions() {
+    let (_, out, _) = sh("_q() {}; _x() {}; y() {}; print -r -- $(typeset +fm '_*')");
+    assert_eq!(out, "_q _x\n");
+}
+
+#[test]
+fn indirect_keys_and_values_of_an_association() {
+    let (_, out, _) = sh("typeset -A h; h=(a 1 b 2); n=h; print -r -- ${(@Pkv)n} / ${(@Pk)n}");
+    assert_eq!(out, "a 1 b 2 / a b\n");
+}
+
+#[test]
+fn tilde_join_separator_is_pattern_text() {
+    let (_, out, _) = sh("f=(/a/_x /a/_y /b/_z); a=(_x _z); print -r -- ${(M)f:#*/(${(~j.|.)a})}");
+    assert_eq!(out, "/a/_x /b/_z\n");
+}
+
+#[test]
+fn quoted_outer_expansion_joins_a_nested_at_list() {
+    let (_, out, _) = sh("f() { print -rl -- \"x ${${(@q+)@}} y\" }; f a 'b c'");
+    assert_eq!(out, "x a 'b c' y\n");
+}
+
+#[test]
+fn zformat_formats_and_aligns() {
+    let (_, out, _) = sh(
+        "zformat -f r '<%d:%-5n>' d:file n:ab; zformat -a l . aa:x b:y; \
+         print -r -- $r $l",
+    );
+    assert_eq!(out, "<file:   ab> aa.x b .y\n");
+}
+
+#[test]
+fn close_brace_may_follow_a_quoted_word() {
+    let (_, out, _) = sh("f () { echo -n 'a'}; f; { echo \"b\"}; { echo '}'}");
+    assert_eq!(out, "ab\n}\n");
+}
+
+#[test]
+fn a_lone_semicolon_is_an_empty_command() {
+    let (st, out, _) = sh("; echo a; ; echo b; f () { echo c; ; }; f");
+    assert_eq!((st, out.as_str()), (0, "a\nb\nc\n"));
+}
+
+#[test]
+fn braces_expand_as_the_first_array_element() {
+    let (_, out, _) = sh("a=({a,b} x); local -a c; c=( {1..2} ); print -r -- $a $c");
+    assert_eq!(out, "a b x 1 2\n");
+}

@@ -247,14 +247,22 @@ impl Parser {
     // newlines separate commands and the list ends at a terminator word.
     fn parse_list(&mut self, top_level: bool) -> PResult<Node> {
         let mut items: Vec<ListItem> = Vec::new();
+        let mut saw_semicolon = false;
         loop {
             if !top_level {
                 self.skip_newlines()?;
-                // zsh: a nested list may start with `;` (`do; ...`).
-                while items.is_empty() && self.peek_is_op(";")? {
-                    self.next()?;
+            }
+            // zsh: `;` with no command before it is an empty command
+            // (`do; ...`, `a; ; b`, `; b`).
+            while self.peek_is_op(";")? {
+                self.next()?;
+                saw_semicolon = true;
+                if !top_level {
                     self.skip_newlines()?;
                 }
+            }
+            if top_level && matches!(self.peek()?, Tok::Newline | Tok::Eof) {
+                break;
             }
             if self.at_list_end()? {
                 break;
@@ -296,6 +304,8 @@ impl Parser {
         }
         if items.is_empty() {
             return match self.peek()? {
+                // A line of just `;`.
+                Tok::Newline | Tok::Eof if top_level && saw_semicolon => Ok(Node::Empty),
                 Tok::Eof => Err(self.eof_error("a command")),
                 t => {
                     let t = t.clone();
@@ -864,9 +874,7 @@ impl Parser {
             // zsh: in a group, `cmd}` ends it (unless the braces pair up).
             if self.brace_depth > 0
                 && word.len() > 1
-                && word.ends_with('}')
-                && word.matches('}').count() > word.matches('{').count()
-                && !word.contains(['\'', '"', '\\', '$'])
+                && ends_with_unpaired_close(&word)
                 && braces_split()
             {
                 self.peeked = Some(Tok::Word(word[..word.len() - 1].to_string()));
@@ -1562,6 +1570,49 @@ fn fill_heredocs(node: &mut Node, bodies: &mut HashMap<usize, String>) {
         }
         Node::DBracket(..) | Node::Arith(..) | Node::Empty => {}
     }
+}
+
+// Whether `word` ends with a `}` outside quotes that no unquoted `{`
+// in it opened: zsh then reads that `}` as the end of a brace group
+// (`{ echo 'a'}`).
+fn ends_with_unpaired_close(word: &str) -> bool {
+    let c: Vec<char> = word.chars().collect();
+    let (mut depth, mut i) = (0i32, 0);
+    let mut last_unquoted_close = false;
+    while i < c.len() {
+        last_unquoted_close = false;
+        match c[i] {
+            '\\' => i += 1,
+            '\'' => {
+                // $'...' allows backslash escapes inside.
+                let ansi = i > 0 && c[i - 1] == '$';
+                i += 1;
+                while i < c.len() && c[i] != '\'' {
+                    if ansi && c[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            '"' => {
+                i += 1;
+                while i < c.len() && c[i] != '"' {
+                    if c[i] == '\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                last_unquoted_close = true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    last_unquoted_close && depth < 0
 }
 
 #[cfg(test)]

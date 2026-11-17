@@ -1164,6 +1164,9 @@ pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool
 /// `name[a,b]=(items)`: replaces elements a through b (1-based,
 /// negatives from the end) with `items`. `name[n]=(items)` replaces one.
 pub fn array_splice(name: &str, sub: &str, items: Vec<String>) -> bool {
+    if let Some(ok) = on_argv(name, || array_splice(name, sub, items.clone())) {
+        return ok;
+    }
     let _swap = crate::shell::RefSwap::enter(name);
     without_assign_warnings(|| array_splice_inner(name, sub, items))
 }
@@ -1227,7 +1230,33 @@ pub fn array_append(name: &str, items: Vec<String>) -> bool {
     true
 }
 
+// zsh: $argv is the positional parameters. Edits to it as an array run
+// `f` on a parameter holding them, then move the result back. None when
+// `name` is not that $argv.
+fn on_argv(name: &str, f: impl FnOnce() -> bool) -> Option<bool> {
+    if name != "argv"
+        || crate::exec::sh_emulation_pub()
+        || with_shell(|s| s.param("argv").is_some())
+    {
+        return None;
+    }
+    let pos = with_shell(|s| s.pos_params.clone());
+    with_shell(|s| s.store("argv", Value::Array(pos)));
+    let ok = f();
+    with_shell(|s| {
+        if let Some(Value::Array(a)) = s.remove_param("argv").map(|p| p.value) {
+            s.pos_params = a;
+        }
+    });
+    Some(ok)
+}
+
 pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: bool) -> bool {
+    if let Some(ok) = on_argv(name, || {
+        array_set_subscript(name, subscript, value.clone(), append)
+    }) {
+        return ok;
+    }
     let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();

@@ -12,6 +12,9 @@
 use std::rc::Rc;
 
 pub mod complete;
+pub mod complist;
+pub mod computil_args;
+pub mod computil_rest;
 pub mod core;
 pub mod matching;
 pub mod result;

@@ -91,6 +91,15 @@ const REGULAR: &[&str] = &[
     "compadd",
     "compset",
     "compcall",
+    "zformat",
+    "compdescribe",
+    "comparguments",
+    "compvalues",
+    "compquote",
+    "comptags",
+    "comptry",
+    "compfiles",
+    "compgroups",
 ];
 
 const KEYWORDS: &[&str] = &[
@@ -309,6 +318,15 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "compadd" => crate::zle::comp::complete::builtin_compadd(words),
         "compset" => crate::zle::comp::complete::builtin_compset(words),
         "compcall" => crate::zle::comp::complete::builtin_compcall(words),
+        "zformat" => crate::zutil::builtin_zformat(words),
+        "compdescribe" => crate::zle::comp::computil_args::builtin_compdescribe(words),
+        "comparguments" => crate::zle::comp::computil_args::builtin_comparguments(words),
+        "compvalues" => crate::zle::comp::computil_rest::builtin_compvalues(words),
+        "compquote" => crate::zle::comp::computil_rest::builtin_compquote(words),
+        "comptags" => crate::zle::comp::computil_rest::builtin_comptags(words),
+        "comptry" => crate::zle::comp::computil_rest::builtin_comptry(words),
+        "compfiles" => crate::zle::comp::computil_rest::builtin_compfiles(words),
+        "compgroups" => crate::zle::comp::computil_rest::builtin_compgroups(words),
         "compdef" | "zcompile" | "zrecompile" | "complete" | "compctl" => 0,
         _ => {
             builtin_err(name, "not a builtin");
@@ -502,6 +520,15 @@ fn builtin_zmodload(words: &[String]) -> i32 {
         && with_shell(|s| s.param("SRANDOM").is_none())
     {
         out("SRANDOM (zsh/random)\n");
+    }
+    // Loading zsh/complist switches the completion listing to its
+    // colored version and adds menu selection.
+    if !flags.contains('e')
+        && !flags.contains('u')
+        && words[1..].iter().any(|w| w == "zsh/complist")
+        && !crate::zle::comp::complist::is_loaded()
+    {
+        crate::zle::comp::complist::setup();
     }
     // `zmodload -e name...`: whether each is loaded. Modules meowsh does
     // not provide are not; completion functions test for zsh/compctl.
@@ -896,7 +923,8 @@ fn builtin_set(words: &[String]) -> i32 {
     }
     let mut i = 0;
     let mut array: Option<(String, bool)> = None;
-    while i < args.len() {
+    // As in zsh, the words after `-A name` are all values.
+    while i < args.len() && array.is_none() {
         let a = args[i].as_str();
         if a == "--" {
             i += 1;
@@ -1129,7 +1157,9 @@ pub fn functions_cmd(
         }
         return 0;
     }
-    functions_listing(&names, minus.contains(&'m'), !plus.is_empty(), None)
+    // `m` (match patterns) counts whether given with - or +.
+    let patterns = minus.contains(&'m') || plus.contains(&'m');
+    functions_listing(&names, patterns, !plus.is_empty(), None)
 }
 
 fn functions_listing(
@@ -3873,9 +3903,7 @@ fn autoload_exec(dir: Option<&str>, default_too: bool) -> i32 {
         }
         return 1;
     }
-    let Some((body, line)) =
-        with_shell(|s| s.functions.get(&name).map(|f| (f.body.clone(), f.line)))
-    else {
+    let Some(body) = with_shell(|s| s.functions.get(&name).map(|f| f.body.clone())) else {
         return 1;
     };
     // Functions it defines come from its file.
@@ -3898,7 +3926,13 @@ fn autoload_exec(dir: Option<&str>, default_too: bool) -> i32 {
             None => last_status(),
         }
     } else {
-        call_function(&body, &words, line)
+        // The definition runs in the stub's own call, as in zsh, so it is
+        // as deep as later calls (comptags keys its state by depth).
+        let inner = match body.as_ref() {
+            Node::Brace(b) => b.as_ref(),
+            b => b,
+        };
+        crate::exec::exec_node(inner)
     };
     with_shell(|s| s.source_file = saved);
     st

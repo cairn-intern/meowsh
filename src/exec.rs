@@ -1247,7 +1247,10 @@ fn apply_assign(a: &Expanded, export: bool) -> Result<(), i32> {
         (None, Value::Array(items)) => {
             // A declared but unset parameter (TYPESET_TO_UNSET) has no
             // value to append to.
-            let append = a.append && param_kind(&a.name) != ParamKind::Unset;
+            // $argv (the positional parameters) has no parameter of its own.
+            let append = a.append
+                && (param_kind(&a.name) != ParamKind::Unset
+                    || (a.name == "argv" && with_shell(|s| s.param("argv").is_none())));
             crate::shell::array_assign_items(&a.name, items.clone(), append)
         }
         (None, Value::Scalar(v)) if a.append && param_kind(&a.name) == ParamKind::Numeric => {

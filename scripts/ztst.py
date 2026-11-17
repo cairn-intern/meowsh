@@ -323,6 +323,15 @@ def kill_session(sid):
 
 
 def run_file(meowsh, testdir, path, timeout, verbose):
+    # As zsh's harness (ztst.zsh) does, start each file without the
+    # *.tmp files and directories an earlier one left.
+    for entry in os.listdir(testdir):
+        if entry.endswith(".tmp"):
+            full = os.path.join(testdir, entry)
+            if os.path.isdir(full) and not os.path.islink(full):
+                shutil.rmtree(full, ignore_errors=True)
+            else:
+                os.remove(full)
     prep, tests, clean = parse(path)
     work = tempfile.mkdtemp(prefix="ztst.", dir=testdir)
     build_driver(work, testdir, prep, tests, clean)

@@ -954,6 +954,9 @@ struct PFlags {
     keys: bool,
     values: bool,
     join: Option<String>,
+    // `~` came before the j flag: its separator is pattern text.
+    join_pattern: bool,
+    tilde: bool,
     split: Option<String>,
     zsplit: bool,
     quote: u8,
@@ -1043,7 +1046,10 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             'j' => {
                 let a = arg(&mut i)?;
                 f.join = Some(if f.escapes { p_flag_arg(&a) } else { a });
+                f.join_pattern = f.tilde;
             }
+            // Strings later flags insert are patterns.
+            '~' => f.tilde = true,
             's' => {
                 let a = arg(&mut i)?;
                 f.split = Some(if f.escapes { p_flag_arg(&a) } else { a });
@@ -1122,7 +1128,7 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             'A' => f.assign_array += 1,
             '#' => f.charcode = true,
             'X' => f.report = true,
-            '~' | 'm' => {}
+            'm' => {}
             _ => {
                 FLAG_ERR_AT.with(|e| e.set(Some(i - 1)));
                 return None;
@@ -2950,6 +2956,17 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
     }
     if f.indirect {
         val = match val {
+            // (Pk), (Pkv): the keys (and values) of the named association.
+            Val::Str(name) if f.keys => match assoc_keys(&name) {
+                Some(keys) if f.values => Val::List(
+                    keys.iter()
+                        .flat_map(|k| [k.clone(), assoc_get(&name, k).unwrap_or_default()])
+                        .collect(),
+                    false,
+                ),
+                Some(keys) => Val::List(keys, true),
+                None => lookup(&name),
+            },
             Val::Str(name) => lookup(&name),
             v => v,
         };
@@ -2960,7 +2977,14 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
     // apart for splitting.
     if (f.join.is_some() || (splitting && !f.at)) && is_list(&val) {
         let sep = f.join.clone().unwrap_or_else(ifs_first);
-        val = Val::Str(val_items(&val).join(&sep));
+        // (~j): the words stay literal around a separator that is pattern
+        // text; the whole value is then substituted as a pattern.
+        let items: Vec<String> = if f.join_pattern && !quoted {
+            val_items(&val).iter().map(|w| escape_pattern(w)).collect()
+        } else {
+            val_items(&val)
+        };
+        val = Val::Str(items.join(&sep));
         list = false;
     }
     if let Some(sep) = &f.split {
@@ -3358,6 +3382,7 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
     let mut sub = None;
     let mut val;
     let nested = body.get(i) == Some(&'$');
+    let nested_brace = nested && body.get(i + 1) == Some(&'{');
     // `${${(P)name}[sub]}`: the parameter name holds, subscripted as
     // itself (a hash keeps its keys).
     let p_target = (body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'{'))
@@ -3743,6 +3768,19 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         };
         return Ok(Val::Str(n.to_string()));
     }
+    // In double quotes an outer expansion without (@) joins what a
+    // nested one kept as separate words: "${${(@)a}}" is one word.
+    if quoted
+        && nested_brace
+        && !flags.at
+        && flags.split.is_none()
+        && flags.join.is_none()
+        && !ifs_split
+    {
+        if let Val::List(items, false) = val {
+            val = Val::List(items, true);
+        }
+    }
     if rc {
         // In double quotes only an array kept as separate words ("$a[@]",
         // (@)) is expanded element by element.
@@ -3753,6 +3791,18 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         };
     }
     Ok(val)
+}
+
+// Backslash-quotes pattern characters, so `s` matches only itself.
+fn escape_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\*?[]()|~#^<>{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn plain_clone(v: &Val) -> Val {
@@ -4097,13 +4147,19 @@ fn apply_operator(
 // to force word splitting and pattern characters on or off.
 fn prefix_toggles(body: &[char]) -> (Option<bool>, Option<bool>) {
     let mut i = 0;
+    let mut glob = None;
     if body.first() == Some(&'(') {
         match parse_flags(body) {
-            Some((_, end)) => i = end,
+            Some((f, end)) => {
+                i = end;
+                if f.join_pattern {
+                    glob = Some(true);
+                }
+            }
             None => return (None, None),
         }
     }
-    let (mut split, mut glob) = (None, None);
+    let mut split = None;
     while let Some(&c) = body.get(i) {
         let doubled = body.get(i + 1) == Some(&c);
         match c {
