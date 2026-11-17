@@ -1510,3 +1510,29 @@ fn keys_flag_with_search_subscripts() {
         sh("typeset -A h=(path 1 paths 2 x 3 y 3); print ${(k)h[(I)path*]} / ${(k)h[(R)3]} / ${(k)h[(r)3]}");
     assert_eq!(out, "path paths / x y / x\n");
 }
+
+#[test]
+fn status_is_a_read_only_special() {
+    let (_, out, _) = sh("false; print $status; typeset -p status");
+    assert_eq!(out, "1\ntypeset -i10 -r status=0\n");
+    let (st, out, err) = sh("f() { local status; typeset -p status; status=3 }; f; print after");
+    assert_eq!(st, 1);
+    assert_eq!(out, "typeset -i10 -r status=0\n");
+    assert!(err.contains("read-only variable: status"), "{}", err);
+    let (_, out, _) = sh("f() { local -h status; typeset -p status }; f");
+    assert_eq!(out, "typeset -h status=''\n");
+}
+
+#[test]
+fn failed_module_autoloads_stop_the_command_line() {
+    for (code, st) in [
+        ("zmodload -u zsh/parameter; zmodload -aF zsh/parameter b:fail; fail; print reached", 1),
+        ("zmodload -u zsh/parameter; zmodload -aF zsh/parameter p:fail; print $fail; print reached", 1),
+        ("zmodload -u zsh/parameter; zmodload -aF zsh/parameter c:fail; [[ -fail x ]]; print reached", 2),
+    ] {
+        let (s, out, err) = sh(code);
+        assert_eq!(s, st, "{}", code);
+        assert_eq!(out, "", "{}", code);
+        assert!(err.contains("autoload cancelled"), "{}", err);
+    }
+}

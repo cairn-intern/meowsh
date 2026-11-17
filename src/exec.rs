@@ -2234,6 +2234,8 @@ fn run_command(
             if let Err(msg) = r {
                 if !msg.is_empty() {
                     shell_err(&msg);
+                    // zsh treats it as an error that stops the command line.
+                    return abort_command(1);
                 }
                 return 1;
             }

@@ -960,6 +960,13 @@ fn assign_warning(name: &str, kind: &str) {
 }
 
 pub fn var_set(name: &str, value: &str, export: bool) -> bool {
+    if name == "status"
+        && !crate::exec::sh_emulation_pub()
+        && with_shell(|s| s.param("status").is_none())
+    {
+        shell_err("read-only variable: status");
+        return false;
+    }
     // zsh reserves the .zsh namespace for its own read-only parameters.
     if name.starts_with(".zsh.") {
         shell_err(&format!("{}: can't modify read-only parameter", name));

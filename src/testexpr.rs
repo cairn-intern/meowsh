@@ -650,6 +650,8 @@ impl DbParser<'_> {
                 if !msg.is_empty() {
                     crate::shell::shell_err(&msg);
                 }
+                // A failed autoload stops the command line, as in zsh.
+                crate::exec::abort_command(2);
             }
             return Err(format!("unknown condition: {}", t));
         }

@@ -456,6 +456,11 @@ pub fn feature_available(feature: &str) -> bool {
 /// for conditions the caller reports its usual "unknown condition", for
 /// a builtin whose module failed to load the command just fails.
 /// Must not be called with the shell lock held.
+/// Whether `name` has a parameter autoload waiting (zmodload -ap).
+pub fn has_autoparam(name: &str) -> bool {
+    with_state(|st| st.autoparams.contains_key(name))
+}
+
 pub fn autoload_feature(feature: &str) -> Option<Result<(), String>> {
     let (kind, name) = match feature.as_bytes() {
         [k, b':', ..] if k.is_ascii() => (*k as char, &feature[2..]),

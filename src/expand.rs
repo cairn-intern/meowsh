@@ -164,6 +164,16 @@ fn pos_params() -> Vec<String> {
 fn lookup(name: &str) -> Val {
     let _swap = crate::shell::RefSwap::enter(name);
     crate::zparam::ensure(name);
+    // A parameter autoload (zmodload -ap) loads its module on first use.
+    if crate::modules::has_autoparam(name) && !crate::shell::var_exists(name) {
+        if let Some(Err(msg)) = crate::modules::autoload_feature(&format!("p:{}", name)) {
+            if !msg.is_empty() {
+                crate::shell::shell_err(&msg);
+                crate::exec::abort_command(1);
+            }
+            return Val::Unset;
+        }
+    }
     match name {
         "@" => return Val::List(pos_params(), false),
         "*" => return Val::List(pos_params(), true),
@@ -179,6 +189,10 @@ fn lookup(name: &str) -> Val {
                 .filter_map(crate::jobs::job_state_text)
                 .collect();
             return Val::List(v, true);
+        }
+        // zsh's $status is $? (not in sh, where it is an ordinary name).
+        "status" if !crate::shell::var_exists("status") && !crate::exec::sh_emulation_pub() => {
+            return Val::Str(with_shell(|s| s.last_status).to_string());
         }
         "zsh_eval_context" if !crate::shell::var_exists("zsh_eval_context") => {
             return Val::List(crate::shell::eval_context(), true)

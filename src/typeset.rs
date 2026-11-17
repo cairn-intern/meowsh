@@ -506,6 +506,13 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
                         locallevel(),
                     ));
                 }
+                // zsh's $status: a read-only integer special.
+                None if name == "status" && !crate::exec::sh_emulation_pub() => {
+                    out(&format!(
+                        "typeset -i10 -r status={}\n",
+                        with_shell(|s| s.last_status)
+                    ));
+                }
                 None if crate::shell::DYNAMIC_NAMES.contains(&name.as_str())
                     && !crate::exec::sh_emulation_pub()
                     && crate::shell::var_exists(&name) =>
@@ -651,6 +658,19 @@ fn typeset_single(
             warn(cmd, &format!("not valid in this context: {}", pname));
         }
         return false;
+    }
+    // $status stays the read-only special, even made local (but -h hides it).
+    if base_name == "status"
+        && on & HIDE == 0
+        && !crate::exec::sh_emulation_pub()
+        && with_shell(|s| s.param("status").is_none())
+    {
+        if has_value(asg) {
+            crate::shell::shell_err("read-only variable: status");
+            crate::exec::abort_command(1);
+            return false;
+        }
+        return true;
     }
     if subscript.is_some() && on & NAMEREF != 0 {
         warn(cmd, "reference variable cannot be an array");
