@@ -3816,6 +3816,8 @@ fn define_stub(name: &str, dir: Option<&str>, default_too: bool) {
                 },
             )
         });
+        // Under `emulate -c`, the function loads and runs in that emulation.
+        crate::options::set_sticky(name);
         // An autoloaded TRAPxxx sets its trap now, as a defined one does.
         crate::trap::function_defined(name);
     }
@@ -3933,12 +3935,40 @@ fn builtin_autoload(words: &[String]) -> i32 {
 fn autoload_exec(dir: Option<&str>, default_too: bool) -> i32 {
     let (name, args) = with_shell(|s| (s.argv0.clone(), s.pos_params.clone()));
     if !autoload_now(&name, dir, default_too || dir.is_none()) {
-        // Reported where the function was called.
-        let top = crate::shell::with_err_ctx(|e| e.stack.pop());
-        shell_err(&format!("{}: function definition file not found", name));
-        if let Some(t) = top {
-            crate::shell::with_err_ctx(|e| e.stack.push(t));
+        // A file that did not parse has been reported already.
+        if AUTOLOAD_PARSE_FAILED.with(|f| f.replace(false)) {
+            return 1;
         }
+        // Reported under the caller's name, with the line in the function
+        // (zsh's own numbering here).
+        // An autoload stub of our own has no lines: the caller's line.
+        let stub = is_autoload_stub(&name);
+        let top = crate::shell::with_err_ctx(|e| {
+            let top = e.stack.pop();
+            let caller_base = e.stack.last().map_or(0, |f| f.1);
+            let saved = e.lineno;
+            let call_line = e
+                .calls
+                .last()
+                .and_then(|c| c.0.rsplit_once(':'))
+                .and_then(|(_, l)| l.parse::<usize>().ok());
+            match (&top, call_line) {
+                (Some(_), Some(l)) if stub => e.lineno = caller_base + l,
+                // zsh counts from 1 here, even on the definition's line.
+                (Some((_, base)), _) => {
+                    e.lineno = caller_base + e.lineno.saturating_sub(*base).max(1)
+                }
+                _ => {}
+            }
+            (top, saved)
+        });
+        shell_err(&format!("{}: function definition file not found", name));
+        crate::shell::with_err_ctx(|e| {
+            e.lineno = top.1;
+            if let Some(t) = top.0 {
+                e.stack.push(t);
+            }
+        });
         return 1;
     }
     let Some(body) = with_shell(|s| s.functions.get(&name).map(|f| f.body.clone())) else {
@@ -4012,7 +4042,15 @@ fn autoload_now(name: &str, dir: Option<&str>, fpath_too: bool) -> bool {
                 crate::parser::ParseError::Syntax(m) => m,
                 crate::parser::ParseError::Incomplete => "unexpected end of file".to_string(),
             };
-            builtin_err(name, &msg);
+            // zsh reports it as the function's, at the line in its file.
+            let line = parser.line();
+            let saved = crate::shell::with_err_ctx(|e| {
+                let base = e.stack.last().map_or(0, |f| f.1);
+                std::mem::replace(&mut e.lineno, base + line)
+            });
+            shell_err(&msg);
+            crate::shell::with_err_ctx(|e| e.lineno = saved);
+            AUTOLOAD_PARSE_FAILED.with(|f| f.set(true));
             return false;
         }
     };
@@ -5107,6 +5145,11 @@ static HIST_STACK: std::sync::Mutex<Vec<(Vec<String>, Option<String>)>> =
 // with HIST_IGNORE_SPACE, nor after `fc -p`).
 fn current_in_history() -> bool {
     crate::exec::LINE_IN_HISTORY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    // Set when an autoloaded file failed to parse (and was reported).
+    static AUTOLOAD_PARSE_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]

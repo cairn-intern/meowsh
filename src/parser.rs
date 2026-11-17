@@ -897,9 +897,12 @@ impl Parser {
                 self.queued.push(Tok::Word("}".to_string()));
                 continue;
             }
+            // After arguments only when braces are special (not with
+            // IGNORE_BRACES or in sh, where `}` must start a command).
             if word == "}"
                 && self.brace_depth > 0
                 && !(cmd.words.is_empty() && cmd.assigns.is_empty() && cmd.redirs.is_empty())
+                && braces_split()
             {
                 break;
             }

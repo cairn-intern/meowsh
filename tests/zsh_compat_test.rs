@@ -1435,3 +1435,39 @@ fn history_file_round_trip_with_backslashes_and_newlines() {
         "    1  one\\\n    2  a\\nb\n"
     );
 }
+
+#[test]
+fn funcnest_error_names_the_function() {
+    let (_, _, err) = sh("FUNCNEST=0; fn() { true; }; fn");
+    assert!(
+        err.starts_with("fn:1: maximum nested function level reached"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn ignore_braces_needs_closing_brace_in_command_position() {
+    let (st, _, err) = sh("setopt ignorebraces; eval '{ echo OK }'");
+    assert_eq!(st, 1);
+    assert!(err.contains("parse error near `}'"), "{}", err);
+    let (_, out, _) = sh("setopt ignorebraces; eval '{ echo OK; }'");
+    assert_eq!(out, "OK\n");
+}
+
+#[test]
+fn autoload_in_emulate_c_is_sticky_and_parse_errors_name_the_function() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("emu"),
+        "{ echo OK }\n[[ -o ignorebraces ]] || print off\n",
+    )
+    .unwrap();
+    let (_, out, err) = sh(&format!(
+        "cd {} && setopt ignorebraces; fpath=(.); (autoload -z emu; emu); \
+         emulate zsh -c 'autoload -Uz emu'; emu; [[ -o ignorebraces ]] && print on",
+        dir.path().display()
+    ));
+    assert_eq!(out, "OK\noff\non\n");
+    assert_eq!(err, "emu:3: parse error near `\\n'\n");
+}

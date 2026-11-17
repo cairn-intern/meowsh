@@ -2599,7 +2599,10 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(MAX_FUNC_DEPTH);
     if depth >= limit {
+        // zsh names the function it could not enter, at the caller's line.
+        crate::shell::with_err_ctx(|e| e.stack.push((words[0].clone(), 0)));
         shell_err("maximum nested function level reached; increase FUNCNEST?");
+        crate::shell::with_err_ctx(|e| e.stack.pop());
         with_shell(|s| {
             if s.flow == Flow::None && !s.interactive {
                 s.flow = Flow::Exit(1);
