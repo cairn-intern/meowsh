@@ -158,6 +158,15 @@ const DESCS: &[ModDesc] = &[
         name: "zsh/mathfunc",
         features: Some(MATHFUNC_FEATURES),
     },
+    // Colour approximation: refresh maps colours itself once it is loaded.
+    ModDesc {
+        name: "zsh/nearcolor",
+        features: Some(&[]),
+    },
+    ModDesc {
+        name: "zsh/param/private",
+        features: Some(&["b:private"]),
+    },
     ModDesc {
         name: "zsh/parameter",
         features: Some(PARAMETER_FEATURES),

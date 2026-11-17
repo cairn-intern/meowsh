@@ -448,7 +448,7 @@ def main():
             "zsh/main", "zsh/complete", "zsh/complist", "zsh/computil", "zsh/datetime",
             "zsh/langinfo", "zsh/mathfunc", "zsh/parameter", "zsh/random", "zsh/regex",
             "zsh/rlimits", "zsh/system", "zsh/zle", "zsh/zleparameter", "zsh/zpty",
-            "zsh/zselect", "zsh/zutil",
+            "zsh/zselect", "zsh/zutil", "zsh/param/private", "zsh/nearcolor",
         }
         config = []
         for dirpath, _, files in os.walk(os.path.join(args.zsh_src, "Src")):

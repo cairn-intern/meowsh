@@ -130,6 +130,11 @@ fn startvitext(z: &mut Zle, im: i32) {
 /// Reads a character argument for a vi command; None aborts.
 pub fn vigetkey(z: &mut Zle) -> Option<char> {
     let mn = keymap::open_keymap("main");
+    // The cursor shows that a character is wanted.
+    let saved = z.vichgflag;
+    z.vichgflag = 2;
+    crate::zle::termctl::cursor_form(z);
+    z.vichgflag = saved;
     let b = z.getbyte(false).ok()?;
     let cmd = match &mn {
         Some(km) => km.borrow().keybind(&[b]).cloned(),
@@ -191,6 +196,7 @@ pub fn getvirange(z: &mut Zle, wf: bool) -> Option<usize> {
         z.virangeflag = 1;
         set_wordflag(wf);
         z.mark = NOMARK;
+        crate::zle::termctl::cursor_form(z);
         if let Some(km) = keymap::open_keymap("viopp") {
             z.selectlocalmap(Some(km));
         }

@@ -140,7 +140,9 @@ and builtins include:
 - zsh's modules are built in: zsh/zutil (`zstyle`, `zformat`,
   `zparseopts`, `zregexparse`), zsh/datetime (`strftime`), zsh/system
   (`sysread`, `sysopen`, `zsystem flock`, ...), zsh/mathfunc,
-  zsh/parameter, zsh/random and the completion modules. `zmodload`
+  zsh/parameter (assigning to `$functions` defines functions;
+  `$funcsourcetrace`, `$functions_source`), zsh/param/private (`private`,
+  `local -P`), zsh/random and the completion modules. `zmodload`
   tracks them as zsh does (features, `-F`, autoloads, `-u`); a module's
   builtins work without loading it until `zmodload` is given that
   module. Loading one meowsh does not have (zsh/pcre, zsh/db/gdbm,
@@ -156,7 +158,10 @@ function of that name when `$fpath` holds one and otherwise does nothing;
 A port of zsh's own line editor (zle: keymaps, widgets, vi mode, the
 `$BUFFER`/`$CURSOR` parameters) is in progress. Set `MEOWSH_ZLE=1` in the
 environment to use it instead; `+Z` or `unsetopt zle` then reads lines
-without editing, as in zsh. It does not yet have meowsh's suggestions,
+without editing, as in zsh. It queries the terminal as zsh does (`.term.*`
+parameters, OSC 133 prompt marks, cursor forms from `zle_cursorform`,
+OSC 52 for the `"+` and `"*` vi registers) and redraws with zsh's
+screen-update code. It does not yet have meowsh's suggestions,
 highlighting or Tab menu.
 zsh options meowsh does not implement are recorded by `setopt` but have
 no effect. Up and Down

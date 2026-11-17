@@ -1167,7 +1167,8 @@ pub fn set_subscripted(name: &str, sub: &str, v: &str, append: bool) -> Result<b
     if append {
         return append_subscripted(name, sub, v);
     }
-    let is_assoc = with_shell(|s| s.assoc(name).is_some());
+    let is_assoc = with_shell(|s| s.assoc(name).is_some())
+        || (name == "functions" && crate::zparam::functions_special());
     if sub.contains(',') && !is_assoc {
         let sub = expand_string(sub).map_err(|e| e.status)?;
         return Ok(crate::shell::array_splice(name, &sub, vec![v.to_string()]));
@@ -2473,10 +2474,24 @@ fn restore_function_frame(entry: Frame, status: i32, posix_traps: bool) -> i32 {
     status
 }
 
+thread_local! {
+    // For a sourced file: the file it is sourced from, as $funcfiletrace
+    // names it (the shell has already switched to the new file).
+    static NEXT_FRAME_FILE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Names the file the next frame is entered from.
+pub fn set_next_frame_file(file: String) {
+    NEXT_FRAME_FILE.with(|f| f.replace(Some(file)));
+}
+
 // Enters a function, eval or sourced file `name` whose lines count from
-// `base`, recording where it was called from. Returns the caller's line.
-fn push_frame(name: &str, base: usize) -> usize {
-    let file = code_origin();
+// `base`, recording where it was called from and where it was defined
+// (`def`; an eval is defined where it runs). Returns the caller's line.
+fn push_frame(name: &str, base: usize, def: Option<String>) -> usize {
+    let file = NEXT_FRAME_FILE
+        .with(|f| f.take())
+        .unwrap_or_else(code_origin);
     crate::shell::with_err_ctx(|e| {
         let (caller, caller_base) = e
             .stack
@@ -2484,9 +2499,20 @@ fn push_frame(name: &str, base: usize) -> usize {
             .map(|(n, b)| (n.clone(), *b))
             .unwrap_or_else(|| (e.name.clone(), 0));
         let here = e.lineno;
+        // Lines of an eval count from 1 in its text: in the file they
+        // follow on from the line the eval ran at.
+        let file_line = match (e.stack.last(), e.calls.last()) {
+            (Some((n, 0)), Some((_, at, _))) if n == "(eval)" => at
+                .rsplit_once(':')
+                .and_then(|(_, l)| l.parse::<usize>().ok())
+                .map_or(here, |l| l + here.saturating_sub(1)),
+            _ => here,
+        };
+        let filetrace = format!("{}:{}", file, file_line);
         e.calls.push((
             format!("{}:{}", caller, here.saturating_sub(caller_base)),
-            format!("{}:{}", file, here),
+            filetrace.clone(),
+            def.unwrap_or(filetrace),
         ));
         e.stack.push((name.to_string(), base));
         here
@@ -2533,15 +2559,19 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
         });
         return 1;
     }
-    let saved_line = push_frame(&words[0], line);
     // The file the function was defined in, for the prompt's %x.
-    let origin = with_shell(|s| {
+    let (origin, def) = with_shell(|s| {
         let f = s
             .functions
             .get(&words[0])
             .filter(|f| Arc::ptr_eq(&f.body, body));
-        (f.map(|f| f.origin.clone()), s.source_depth)
+        (
+            (f.map(|f| f.origin.clone()), s.source_depth),
+            f.map(|f| format!("{}:{}", f.origin, f.line)),
+        )
     });
+    let def = def.unwrap_or_else(|| format!("{}:{}", code_origin(), line));
+    let saved_line = push_frame(&words[0], line, Some(def));
     if let Ok(mut o) = FUNC_ORIGINS.lock() {
         o.push(origin);
     }
@@ -3485,7 +3515,7 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
     let frozen = ctx == Some("(eval)") && !crate::options::is_set("evallineno");
     let ctx = ctx.filter(|_| !frozen);
     let saved_line = match ctx {
-        Some(c) => push_frame(c, 0),
+        Some(c) => push_frame(c, 0, (c != "(eval)").then(|| format!("{}:0", c))),
         None => crate::shell::with_err_ctx(|e| e.lineno),
     };
     if frozen {
@@ -3806,8 +3836,12 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                     if is_interactive {
                         on_command(&text);
                         crate::builtins::run_hooks("preexec", &[text.clone(), text.clone(), text]);
+                        crate::zle::termctl::mark_output(true);
                     }
                     let st = exec_with_debug(&node);
+                    if is_interactive {
+                        crate::zle::termctl::mark_output(false);
+                    }
                     // PRINT_EXIT_VALUE: report a command line's failure.
                     if st != 0 && crate::options::is_set("printexitvalue") {
                         let name = crate::shell::with_err_ctx(|e| e.name.clone());

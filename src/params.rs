@@ -23,6 +23,8 @@ pub const NAMEREF: u32 = 1 << 15; // -n: the value names another parameter
 pub const SPECIAL: u32 = 1 << 16;
 pub const UNSET: u32 = 1 << 17; // declared but without a value
 pub const DECLARED: u32 = 1 << 18;
+// zsh/param/private: a local only its own function sees.
+pub const PRIVATE: u32 = 1 << 19;
 
 pub const NUMERIC: u32 = INTEGER | FLOAT_E | FLOAT_F;
 
@@ -393,6 +395,27 @@ impl Shell {
     }
 
     pub fn push_scope(&mut self) {
+        // The caller's private parameters are hidden from the function it
+        // calls, which sees (and may change) what they hid.
+        let depth = self.local_scopes.len();
+        if depth > 0 {
+            let private: Vec<String> = self
+                .params
+                .iter()
+                .filter(|(_, p)| p.attrs & PRIVATE != 0 && p.level == depth)
+                .map(|(n, _)| n.clone())
+                .collect();
+            for name in private {
+                let p = self.params.remove(&name).unwrap();
+                if let Some(under) = self.local_scopes[depth - 1]
+                    .get_mut(&name)
+                    .and_then(Option::take)
+                {
+                    self.params.insert(name.clone(), under);
+                }
+                self.private_stash.push((depth, name, p));
+            }
+        }
         self.local_scopes.push(HashMap::new());
     }
 
@@ -409,6 +432,17 @@ impl Shell {
                     self.params.remove(&name);
                 }
             }
+        }
+        // Back in the function that owns them: its private parameters
+        // return, over whatever the called function left in their place.
+        let depth = self.local_scopes.len();
+        while self.private_stash.last().is_some_and(|e| e.0 == depth) {
+            let (_, name, p) = self.private_stash.pop().unwrap();
+            let under = self.params.remove(&name);
+            if let Some(scope) = self.local_scopes.get_mut(depth - 1) {
+                scope.insert(name.clone(), under);
+            }
+            self.params.insert(name, p);
         }
     }
 }

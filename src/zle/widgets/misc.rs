@@ -505,6 +505,21 @@ pub fn pastebuf(z: &mut Zle, buf: &CutBuffer, mut mult: i64, mut position: i32) 
     }
 }
 
+// The `"+` or `"*` register's text, from the terminal; None when empty.
+fn clipboard(z: &mut Zle) -> Option<CutBuffer> {
+    let clip = if z.zmod.flags & MOD_CLIP != 0 {
+        'c'
+    } else {
+        'p'
+    };
+    let text = crate::zle::termctl::clip_get(z, clip).filter(|t| !t.is_empty())?;
+    Some(CutBuffer {
+        buf: text.chars().collect(),
+        flags: 0,
+        set: true,
+    })
+}
+
 fn viput(z: &mut Zle, position: i32) -> i32 {
     let n = z.zmod.mult;
     vi::startvichange(z, -1);
@@ -515,8 +530,14 @@ fn viput(z: &mut Zle, position: i32) -> i32 {
         return 0;
     }
     if z.zmod.flags & MOD_OSSEL != 0 {
-        // No system clipboard to read from.
-        return 1;
+        // The system clipboard, asked of the terminal (OSC 52).
+        let Some(buf) = clipboard(z) else {
+            return 1;
+        };
+        z.kct = None;
+        z.yankcs = z.cs;
+        pastebuf(z, &buf, n, position);
+        return 0;
     }
     let k = if z.zmod.flags & MOD_VIBUF != 0 {
         KctBuf::Vi(z.zmod.vibuf)
@@ -553,8 +574,13 @@ pub fn putreplaceselection(z: &mut Zle, _args: &[String]) -> i32 {
         return 1;
     }
     if z.zmod.flags & MOD_OSSEL != 0 {
-        // No system clipboard to read from.
-        return 1;
+        let Some(prevbuf) = clipboard(z) else {
+            return 1;
+        };
+        z.zmod.flags = 0;
+        killregion(z, &[]);
+        pastebuf(z, &prevbuf, n, pos);
+        return 0;
     }
     let putbuf = if isvibuf {
         &mut z.vibuf[z.zmod.vibuf]

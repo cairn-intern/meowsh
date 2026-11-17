@@ -34,11 +34,13 @@ const REGULAR: &[&str] = &[
     "fg",
     "getopts",
     "hash",
+    "rehash",
     "history",
     "jobs",
     "disown",
     "kill",
     "local",
+    "private",
     "popd",
     "pushd",
     "pwd",
@@ -289,9 +291,10 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "echo" => builtin_echo(words),
         "getopts" => builtin_getopts(words),
         "hash" => builtin_hash(words),
+        "rehash" => builtin_hash(&["hash".to_string(), "-r".to_string()]),
         "history" => builtin_history(),
         "kill" => builtin_kill(words),
-        "local" | "typeset" | "declare" | "integer" | "float" => decl_from_words(words),
+        "local" | "private" | "typeset" | "declare" | "integer" | "float" => decl_from_words(words),
         "functions" => builtin_functions(words),
         "pwd" => builtin_pwd(words),
         "read" => builtin_read(words),
@@ -657,6 +660,7 @@ pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
     }
     let saved = args.map(|a| with_shell(|s| std::mem::replace(&mut s.pos_params, a.to_vec())));
     // zsh: $0 is the sourced file while it runs.
+    crate::exec::set_next_frame_file(crate::exec::code_origin());
     let (saved_argv0, saved_source) = with_shell(|s| {
         s.source_depth += 1;
         (
@@ -2213,6 +2217,7 @@ fn cd_new_pwd(
     if !quiet {
         run_hooks("chpwd", &[]);
     }
+    crate::zle::termctl::notify_pwd();
     0
 }
 
@@ -3769,7 +3774,8 @@ fn define_stub(name: &str, dir: Option<&str>, default_too: bool) {
                 name.to_string(),
                 FuncDef {
                     body: Arc::new(body),
-                    origin: s.argv0.clone(),
+                    // Known only when autoloaded by its path.
+                    origin: dir.map(|d| format!("{}/{}", d, name)).unwrap_or_default(),
                     line: 0,
                 },
             )
@@ -3904,6 +3910,15 @@ fn autoload_exec(dir: Option<&str>, default_too: bool) -> i32 {
     };
     // Functions it defines come from its file.
     let origin = with_shell(|s| s.functions.get(&name).map(|f| f.origin.clone()));
+    // The stub's call now runs the loaded function: $funcsourcetrace
+    // names its file.
+    if let Some(o) = &origin {
+        crate::shell::with_err_ctx(|e| {
+            if let Some(c) = e.calls.last_mut() {
+                c.2 = format!("{}:0", o);
+            }
+        });
+    }
     let saved = with_shell(|s| std::mem::replace(&mut s.source_file, origin));
     let mut words = vec![name.clone()];
     words.extend(args);
@@ -4353,9 +4368,23 @@ fn builtin_zparseopts(words: &[String]) -> i32 {
             return 1;
         }
         Some(n) => n.clone(),
-        None => crate::shell::with_err_ctx(|e| e.name.clone()),
+        // zsh's scriptname: the function or sourced file running (eval
+        // keeps it), else the script.
+        None => crate::shell::with_err_ctx(|e| {
+            e.stack
+                .iter()
+                .rev()
+                .map(|f| &f.0)
+                .find(|n| *n != "(eval)")
+                .unwrap_or(&e.name)
+                .clone()
+        }),
     };
     let paramsname = ops.get(&'v').cloned().unwrap_or_else(|| "argv".to_string());
+    if paramsname.is_empty() {
+        builtin_err("zparseopts", "missing array name for -v");
+        return 1;
+    }
     let params: Vec<String> = if paramsname == "argv" {
         with_shell(|s| s.pos_params.clone())
     } else {

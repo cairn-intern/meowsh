@@ -961,3 +961,94 @@ fn module_builtins_work_until_zmodload_manages_the_module() {
          zmodload -F zsh/datetime -b:strftime; strftime %Y 0 2>/dev/null || print gone");
     assert_eq!(out, "1970\ngone\n");
 }
+
+#[test]
+fn private_parameters_are_hidden_from_called_functions() {
+    let (_, out, _) = sh("a=top; f() { private a=mine; g; print -r -- $a }; \
+         g() { print -r -- ${a:-unset} }; f; print -r -- $a");
+    assert_eq!(out, "top\nmine\ntop\n");
+}
+
+#[test]
+fn local_dash_capital_p_is_private() {
+    let (_, out, _) = sh("a=top; f() { local -P a=mine; g }; g() { print -r -- $a }; f");
+    assert_eq!(out, "top\n");
+}
+
+#[test]
+fn nested_p_flag_keeps_the_parameter_for_outer_flags() {
+    let (_, out, _) = sh(
+        "typeset -A h=(k v); f() { print -r -- ${(k)${(P)1}} ${${(P)1}[k]} \
+         ${(t)${(P)1}} }; f h",
+    );
+    assert_eq!(out, "k v association\n");
+}
+
+#[test]
+fn zparseopts_errors_name_the_running_function() {
+    let (_, _, err) = sh("f() { local -a o; zparseopts -F -a o - a }; f -x");
+    assert_eq!(err, "f: bad option: -x\n");
+}
+
+#[test]
+fn assigning_to_functions_defines_them() {
+    let (_, out, _) = sh("functions[a]='echo foo'; a; functions+=(a 'echo bar'); a");
+    assert_eq!(out, "foo\nbar\n");
+}
+
+#[test]
+fn rehash_is_a_builtin() {
+    let (st, _, _) = sh("rehash");
+    assert_eq!(st, 0);
+}
+
+#[test]
+fn funcsourcetrace_names_definitions() {
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("s.zsh");
+    std::fs::write(
+        &script,
+        "f() {\n eval 'print -r -- $funcsourcetrace $funcfiletrace'\n}\nf\n",
+    )
+    .unwrap();
+    let (_, out, _) = sh(&format!("cd {} && . ./s.zsh", dir.path().display()));
+    // The sourced file's own frame: defined at line 0, run from the
+    // -c string (not from itself).
+    let rest = out
+        .strip_prefix("./s.zsh:2 ./s.zsh:1 ./s.zsh:0 ./s.zsh:2 ./s.zsh:4 ")
+        .unwrap_or_else(|| panic!("{}", out));
+    assert!(!rest.starts_with("./s.zsh"), "{}", out);
+}
+
+#[test]
+fn equals_expansion_in_assignments_and_after_braces() {
+    let (_, out, _) = sh(
+        "x==sh; [[ $x == /* ]] && print a; print ={sh,} | grep -c '^/'; \
+         foo='=sh'; print -r -- ${~foo} | grep -c '^/'",
+    );
+    assert_eq!(out, "a\n1\n1\n");
+}
+
+#[test]
+fn second_rc_expand_combines_with_every_field() {
+    let (_, out, _) = sh("a=(1 2); b=(x y); print -r -- ${^a}-${^b}");
+    assert_eq!(out, "1-x 1-y 2-x 2-y\n");
+}
+
+#[test]
+fn dollar_quote_drops_backslash_of_unknown_escape() {
+    let (_, out, _) = sh("print -r -- $'\\]\\q'; echo '\\q'");
+    assert_eq!(out, "]q\n\\q\n");
+}
+
+#[test]
+fn glob_subst_trailing_backslash_stays_in_its_value() {
+    let (_, out, _) = sh("p=$'a\\\\'; v='a\\b'; print -r -- ${v##($~p|x)}");
+    assert_eq!(out, "b\n");
+}
+
+#[test]
+fn typeset_m_lists_in_zsh_hash_order() {
+    let (_, out, _) = sh("typeset tqa=1 tqz=2; typeset -m 'tq*'");
+    assert_eq!(out, "tqz=2\ntqa=1\n");
+}

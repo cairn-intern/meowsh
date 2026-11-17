@@ -21,6 +21,7 @@ const NAMES: &[&str] = &[
     "keymaps",
     "errnos",
     "epochtime",
+    "functions_source",
 ];
 
 /// Brings special parameter `name` up to date, if it is one.
@@ -87,6 +88,15 @@ pub fn ensure(name: &str) {
             )
         }
         "errnos" => Value::Array(crate::zsystem::errnos()),
+        "functions_source" => assoc(
+            with_shell(|s| {
+                s.functions
+                    .iter()
+                    .map(|(n, f)| (n.clone(), f.origin.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .into_iter(),
+        ),
         "epochtime" => {
             crate::zdatetime::epoch_param("epochtime").unwrap_or(Value::Array(Vec::new()))
         }
@@ -127,4 +137,16 @@ fn user_dirs() -> Vec<(String, String)> {
         libc::endpwent();
     }
     out
+}
+
+/// Whether `$functions` is zsh/parameter's (not a parameter the user
+/// made), so assigning to it defines functions.
+pub fn functions_special() -> bool {
+    with_shell(|s| s.param("functions").is_none())
+}
+
+/// `functions[name]=body`: defines function `name` from its body text.
+pub fn set_function(name: &str, body: &str) -> bool {
+    let quoted = format!("'{}'", name.replace('\'', "'\\''"));
+    crate::exec::run_string(&format!("function {} {{\n{}\n}}", quoted, body)) == 0
 }

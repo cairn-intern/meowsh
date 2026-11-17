@@ -125,6 +125,9 @@ pub struct Shell {
     // before it was made local (None = unset). Pushed on function entry,
     // popped on return.
     pub local_scopes: Vec<HashMap<String, Option<crate::params::Param>>>,
+    // Private parameters (zsh/param/private) set aside while a function
+    // their owner calls runs: (owner depth, name, parameter).
+    pub private_stash: Vec<(usize, String, crate::params::Param)>,
     // Zsh-style named options (setopt/unsetopt). Keys are normalized to
     // lowercase with underscores stripped. Most are stubs for Phase 1;
     // the subset that maps to a legacy OPT_* flag also toggles that flag.
@@ -186,6 +189,7 @@ impl Shell {
             getopts_pos: 0,
             subshell_loop_depth: 0,
             local_scopes: Vec::new(),
+            private_stash: Vec::new(),
             named_opts: HashMap::new(),
             dir_stack: Vec::new(),
             coproc: None,

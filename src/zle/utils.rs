@@ -98,8 +98,13 @@ impl Zle {
         }
         let lineflag = if self.vilinerange { CUTBUFFER_LINE } else { 0 };
         if self.zmod.flags & MOD_OSSEL != 0 {
-            // No system clipboard: the text is dropped, as zsh does when
-            // it has none.
+            // The system clipboard, through the terminal (OSC 52).
+            let clip = if self.zmod.flags & MOD_CLIP != 0 {
+                'c'
+            } else {
+                'p'
+            };
+            termctl::clip_put(clip, &line.iter().collect::<String>());
         } else if self.zmod.flags & MOD_VIBUF != 0 {
             let vl = self.vilinerange;
             let b = &mut self.vibuf[self.zmod.vibuf];

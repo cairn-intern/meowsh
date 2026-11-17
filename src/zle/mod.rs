@@ -9,6 +9,7 @@ pub mod comp;
 pub mod keymap;
 pub mod params;
 pub mod refresh;
+pub mod termctl;
 pub mod thingy;
 pub mod utils;
 pub mod widgets;
@@ -577,6 +578,14 @@ impl Zle {
                     Bind::Str(_) => false,
                 };
                 timeout = !(self.virangeflag == 0 && self.region_active == 0 && vioper);
+                // A vi operator waits for its motion: show the
+                // operator-pending cursor meanwhile.
+                if !timeout {
+                    let n = self.vichgflag;
+                    self.vichgflag = 2;
+                    termctl::cursor_form(self);
+                    self.vichgflag = n;
+                }
                 let selfins = matches!(fb, Bind::Widget(w) if w == "self-insert" || w == "self-insert-unmeta" || w == ".self-insert");
                 if selfins && !self.lastchar_wide_valid && !ispfx {
                     self.getrestchar_keybuf();
@@ -1077,6 +1086,10 @@ fn restore_term(fd: i32, t: &libc::termios) {
     }
 }
 
+thread_local! {
+    static PENDING_INPUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Reads a line with the line editor, as zsh's zleread. None at end of
 /// input or on interrupt (then `interrupted` is set).
 pub fn zleread(
@@ -1090,6 +1103,8 @@ pub fn zleread(
 ) -> ReadResult {
     let fd = refresh::tty_fd();
     let mut z = Zle::new(fd);
+    // Type-ahead left over from the last line (as zsh's ungetbytes keeps it).
+    z.unget = PENDING_INPUT.with(|p| p.take());
     z.keytimeout = crate::shell::var_get("KEYTIMEOUT")
         .trim()
         .parse()
@@ -1114,6 +1129,8 @@ pub fn zleread(
     {
         widgets::vi::viinsert_init(&mut z);
     }
+    // Terminal queries set their own modes, so this comes before raw mode.
+    termctl::on_read_start(&mut z);
     z.saved_termios = set_raw(fd);
     ZLE_ACTIVE.with(|a| a.set(true));
     if crate::options::is_set("promptcr") {
@@ -1125,6 +1142,7 @@ pub fn zleread(
     if !z.line.is_empty() {
         z.redrawhook();
     }
+    termctl::start_edit();
     z.zrefresh();
     z.zlecore();
     let interrupted = z.errflag;
@@ -1137,6 +1155,7 @@ pub fn zleread(
         let l: String = z.line.iter().collect();
         crate::shell::var_set(name, &l, false);
     }
+    termctl::end_edit();
     if z.done && !exit_pending() && !z.errflag {
         z.callhook(finish, None);
     }
@@ -1147,6 +1166,7 @@ pub fn zleread(
         restore_term(fd, &t);
     }
     ZLE_ACTIVE.with(|a| a.set(false));
+    PENDING_INPUT.with(|p| p.replace(std::mem::take(&mut z.unget)));
     if z.eofsent || z.errflag || exit_pending() {
         if interrupted {
             ReadResult::Interrupted

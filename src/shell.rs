@@ -1078,6 +1078,17 @@ pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool
         shell_err(&format!("{}: can't change type of a named reference", name));
         return false;
     }
+    // zsh/parameter's $functions: each name and body defines a function.
+    if name == "functions" && crate::zparam::functions_special() {
+        let plain = plain_items(&items);
+        if !plain.len().is_multiple_of(2) {
+            shell_err("bad set of key/value pairs for associative array");
+            return false;
+        }
+        return plain
+            .chunks(2)
+            .all(|kv| crate::zparam::set_function(&kv[0], &kv[1]));
+    }
     if !items.iter().any(|i| matches!(i, ArrItem::Key(..))) {
         let plain = plain_items(&items);
         // zsh: $argv is the positional parameters.
@@ -1260,6 +1271,9 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
         array_set_subscript(name, subscript, value.clone(), append)
     }) {
         return ok;
+    }
+    if name == "functions" && crate::zparam::functions_special() {
+        return crate::zparam::set_function(subscript, &value);
     }
     let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
@@ -2201,9 +2215,10 @@ pub struct ErrCtx {
     // `(eval)` or sourced file being run.
     pub stack: Vec<(String, usize)>,
     // For each entry of `stack`, where it was called from: zsh's
-    // $functrace entry (caller:line in the caller) and $funcfiletrace
-    // entry (file:line in the file).
-    pub calls: Vec<(String, String)>,
+    // $functrace entry (caller:line in the caller), $funcfiletrace entry
+    // (file:line in the file) and $funcsourcetrace entry (file:line of
+    // its definition).
+    pub calls: Vec<(String, String, String)>,
     // Line of the command running, in its input.
     pub lineno: usize,
     // The script, or the shell's name for `-c` and standard input.

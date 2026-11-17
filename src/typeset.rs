@@ -63,7 +63,8 @@ fn spec(cmd: &str) -> (&'static str, &'static str) {
         "readonly" => ("AEFHLRTUZafghilptux", "r"),
         "integer" => ("HLRZghilprtux", "i"),
         "float" => ("EFHLRZghlprtux", "E"),
-        "local" => ("AEFHLRTUZahilnprtux", ""),
+        "local" => ("AEFHLPRTUZahilnprtux", ""),
+        "private" => ("AEFHLPRTUZahilnprtux", ""),
         _ => ("AEFHLRTUZafghiklmnprtuxz", ""),
     }
 }
@@ -383,7 +384,10 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
         return 0;
     }
 
-    if cmd == "local" || ops.plus('g') {
+    if cmd == "private" || (cmd == "local" && ops.minus('P')) {
+        // A hidden local that functions it calls do not see.
+        on |= LOCAL | HIDE | crate::params::PRIVATE;
+    } else if cmd == "local" || ops.plus('g') {
         on |= LOCAL;
     } else if !ops.isset('g') {
         if ops.minus('x') {
@@ -431,7 +435,14 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
                     .collect()
             });
             names.retain(|k| crate::pattern::matches(&pat, k));
-            names.sort();
+            // zsh walks its parameter hash table here, unsorted: bucket
+            // order of its string hash in the initial 151-slot table.
+            let bucket = |n: &str| {
+                n.bytes()
+                    .fold(0u32, |h, c| h.wrapping_add(h << 5).wrapping_add(c as u32))
+                    % 151
+            };
+            names.sort_by(|a, b| bucket(a).cmp(&bucket(b)).then(a.cmp(b)));
             for n in names {
                 let asg = DeclArg::Assign {
                     name: n.clone(),

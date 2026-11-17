@@ -68,6 +68,8 @@ struct Ctx {
     subst_tag: u8,
     // MAGIC_EQUAL_SUBST argument: `~` may follow `=`.
     magic_eq: bool,
+    // Brace expansion follows: an `=cmd` holding braces waits for it.
+    braces_after: bool,
 }
 
 impl Ctx {
@@ -84,6 +86,7 @@ impl Ctx {
             param_tag: 0,
             subst_tag: 0,
             magic_eq: false,
+            braces_after: false,
         }
         .with_option_tags()
     }
@@ -193,12 +196,15 @@ fn lookup(name: &str) -> Val {
         }
         // $functrace / $funcfiletrace: where each of those was called
         // from, innermost first.
-        "functrace" | "funcfiletrace" if !crate::shell::var_exists(name) => {
-            let file = name == "funcfiletrace";
+        "functrace" | "funcfiletrace" | "funcsourcetrace" if !crate::shell::var_exists(name) => {
             let mut v: Vec<String> = crate::shell::with_err_ctx(|e| {
                 e.calls
                     .iter()
-                    .map(|(t, f)| if file { f.clone() } else { t.clone() })
+                    .map(|(t, f, d)| match name {
+                        "functrace" => t.clone(),
+                        "funcfiletrace" => f.clone(),
+                        _ => d.clone(),
+                    })
                     .collect()
             });
             v.reverse();
@@ -250,8 +256,13 @@ fn emit_subst(ctx: &mut Ctx, s: &str, quoted: bool) {
 }
 
 fn emit_tagged(ctx: &mut Ctx, s: &str, flag: u8) {
-    for c in s.chars() {
-        ctx.push(c, flag);
+    // A pattern value's backslash quotes within the value only: a final
+    // unpaired one is literal, not an escape of the text after it.
+    let trailing = s.chars().rev().take_while(|&c| c == '\\').count();
+    let lone = flag & (Q | NG) == 0 && trailing % 2 == 1;
+    let n = s.chars().count();
+    for (k, c) in s.chars().enumerate() {
+        ctx.push(c, if lone && k + 1 == n { flag | Q } else { flag });
     }
     ctx.content += 1;
 }
@@ -307,15 +318,16 @@ fn emit_val(ctx: &mut Ctx, val: &Val, quoted: bool) {
                 ctx.rc_dead = true;
                 return;
             }
-            let prefix = ctx.fields.last().cloned().unwrap_or_default();
-            let start = ctx.fields.len() - 1;
+            // After an earlier `${^...}` in the word, every field it made
+            // combines with every item.
+            let start = ctx.rc_from.unwrap_or(ctx.fields.len() - 1);
+            let prefixes = ctx.fields.split_off(start);
             let tag = if quoted { Q } else { ctx.param_tag };
-            for (k, item) in items.iter().enumerate() {
-                if k > 0 {
-                    ctx.fields.push(prefix.clone());
-                }
-                for c in item.chars() {
-                    ctx.fields.last_mut().unwrap().push((c, tag));
+            for prefix in prefixes {
+                for item in items {
+                    let mut f = prefix.clone();
+                    f.extend(item.chars().map(|c| (c, tag)));
+                    ctx.fields.push(f);
                 }
             }
             ctx.rc_from = Some(start);
@@ -425,7 +437,8 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                 && chars
                     .get(1)
                     .is_some_and(|c| c.is_alphanumeric() || "_-.".contains(*c))
-                && !ctx.assign
+                && !ctx.magic_eq
+                && !(ctx.braces_after && chars.contains(&'{'))
                 && crate::options::is_set("equals") =>
             {
                 let end = (1..n)
@@ -3428,43 +3441,65 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
     let mut val;
     let nested = body.get(i) == Some(&'$');
     let nested_brace = nested && body.get(i + 1) == Some(&'{');
-    // `${${(P)name}[sub]}`: the parameter name holds, subscripted as
-    // itself (a hash keeps its keys).
+    // `${${(P)name}[sub]}` and `${(k)${(P)name}}`: the parameter name holds
+    // stays a parameter, so the outer subscript and flags act on it (a
+    // hash keeps its keys).
     let p_target = (body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'{'))
         .then(|| scan_brace(body, i + 1, false))
         .flatten()
-        .filter(|&end| body.get(end) == Some(&'['))
+        .filter(|&end| body.get(end).is_none_or(|&c| c == '['))
         .and_then(|end| {
             let inner: String = body[i + 2..end - 1].iter().collect();
             let ident = inner.strip_prefix("(P)")?;
-            crate::lexer::is_valid_name(ident).then(|| (ident.to_string(), end))
+            let simple = crate::lexer::is_valid_name(ident)
+                || (!ident.is_empty() && ident.bytes().all(|b| b.is_ascii_digit()));
+            let nested = ident.starts_with("${")
+                && scan_brace(&ident.chars().collect::<Vec<_>>(), 1, false)
+                    == Some(ident.chars().count());
+            (simple || nested).then(|| (ident.to_string(), end))
         });
     if let Some((ident, end)) = p_target {
-        let target = match with_shell(|s| s.array(&ident).cloned()) {
-            Some(a) if a.len() == 1 => a[0].clone(),
-            Some(_) => return fail("parameter name reference used with array"),
-            None => var_get(&ident),
-        };
-        let (n, s) = match target.find('[') {
-            Some(k) if target.ends_with(']') => (
-                target[..k].to_string(),
-                Some(target[k + 1..target.len() - 1].to_string()),
-            ),
-            _ => (target.clone(), None),
-        };
-        val = match &s {
-            Some(sub) => param_value(&n, Some(sub))?,
-            None => {
-                // Let the outer subscript act on the parameter itself.
-                name = n;
-                let k = scan_bracket_end(body, end);
-                sub = Some(body[end + 1..k].iter().collect());
-                i = k + 1;
-                param_value(&name, sub.as_deref())?
+        let target = if ident.starts_with('$') {
+            expand_string(&ident)?
+        } else {
+            match with_shell(|s| s.array(&ident).cloned()) {
+                Some(a) if a.len() == 1 => a[0].clone(),
+                Some(_) => return fail("parameter name reference used with array"),
+                None => var_get(&ident),
             }
         };
-        if s.is_some() {
+        if body.get(end).is_none() {
+            // No outer subscript: the outer flags apply to the referenced
+            // parameter, as if it were named in place of the nested one.
+            let base = target.split('[').next().unwrap_or_default();
+            if crate::lexer::is_valid_name(base) {
+                let nb: Vec<char> = body[..i].iter().copied().chain(target.chars()).collect();
+                return braced_inner(&nb, mode);
+            }
+            val = Val::Str(String::new());
             i = end;
+        } else {
+            let (n, s) = match target.find('[') {
+                Some(k) if target.ends_with(']') => (
+                    target[..k].to_string(),
+                    Some(target[k + 1..target.len() - 1].to_string()),
+                ),
+                _ => (target.clone(), None),
+            };
+            val = match &s {
+                Some(sub) => param_value(&n, Some(sub))?,
+                None => {
+                    // Let the outer subscript act on the parameter itself.
+                    name = n;
+                    let k = scan_bracket_end(body, end);
+                    sub = Some(body[end + 1..k].iter().collect());
+                    i = k + 1;
+                    param_value(&name, sub.as_deref())?
+                }
+            };
+            if s.is_some() {
+                i = end;
+            }
         }
     } else if body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'{') {
         let Some(end) = scan_brace(body, i + 1, false) else {
@@ -4372,7 +4407,8 @@ fn pattern_text(ctx: &Ctx) -> String {
     out
 }
 
-fn ansi_c(chars: &[char]) -> String {
+// `keep_unknown`: an unknown escape keeps its backslash (echo); `$'...'` drops it, as zsh does.
+fn ansi_c(chars: &[char], keep_unknown: bool) -> String {
     let mut out = String::new();
     let mut i = 0;
     let n = chars.len();
@@ -4462,7 +4498,9 @@ fn ansi_c(chars: &[char]) -> String {
                 i += 1;
             }
             _ => {
-                out.push('\\');
+                if keep_unknown {
+                    out.push('\\');
+                }
                 out.push(c);
             }
         }
@@ -4473,7 +4511,7 @@ fn ansi_c(chars: &[char]) -> String {
 
 // `$'...'`: with POSIX_STRINGS a null character ends the string.
 fn dollar_squote_text(chars: &[char]) -> String {
-    let mut s = ansi_c(chars);
+    let mut s = ansi_c(chars, false);
     if crate::options::is_set("posixstrings") {
         if let Some(k) = s.find('\0') {
             s.truncate(k);
@@ -4485,7 +4523,7 @@ fn dollar_squote_text(chars: &[char]) -> String {
 /// Decodes backslash escapes the way `$'...'` does (used by `echo -e`).
 pub fn decode_escapes(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
-    ansi_c(&chars)
+    ansi_c(&chars, true)
 }
 
 // ---- brace expansion ------------------------------------------------------
@@ -4731,6 +4769,34 @@ fn unclosed_bracket(pat: &str) -> bool {
     false
 }
 
+// EQUALS on an expanded field starting with an unquoted `=cmd`: the
+// command's path. None when the field is not one.
+fn equals_field(field: &[(char, u8)]) -> ExpResult<Option<Vec<(char, u8)>>> {
+    let unquoted = |k: usize| field.get(k).is_some_and(|&(_, f)| f & (Q | NG | MARK) == 0);
+    let starts = field.first().is_some_and(|&(c, _)| c == '=')
+        && unquoted(0)
+        && field
+            .get(1)
+            .is_some_and(|&(c, _)| c.is_alphanumeric() || "_-.".contains(c))
+        && crate::options::is_set("equals");
+    if !starts {
+        return Ok(None);
+    }
+    let end = (1..field.len())
+        .find(|&k| field[k].0 == '/')
+        .unwrap_or(field.len());
+    let name: String = field[1..end].iter().map(|&(c, _)| c).collect();
+    match crate::shell::find_command(&name) {
+        Some(p) => Ok(Some(
+            p.chars()
+                .map(|c| (c, Q))
+                .chain(field[end..].iter().copied())
+                .collect(),
+        )),
+        None => fail(&format!("{} not found", name)),
+    }
+}
+
 fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
     // GLOB_SUBST: a substituted `~name` at the start is expanded too.
     let expanded;
@@ -4818,7 +4884,13 @@ fn finish_all(ctxs: Vec<Ctx>, do_glob: bool) -> ExpResult<Vec<String>> {
     let (mut any_match, mut failed) = (false, None::<String>);
     for ctx in ctxs.iter().filter(|c| !c.rc_dead) {
         for field in &ctx.fields {
-            for piece in split_field(field, &ifs) {
+            for mut piece in split_field(field, &ifs) {
+                // GLOB_SUBST: a substituted `=cmd` is expanded too.
+                if do_glob && !crate::options::is_set("shfileexpansion") {
+                    if let Some(e) = equals_field(&piece)? {
+                        piece = e;
+                    }
+                }
                 match glob_piece(&piece, do_glob) {
                     Globbed::Word(w) => out.push(w),
                     Globbed::Bad(w) => return fail(&format!("bad pattern: {}", w)),
@@ -4884,9 +4956,18 @@ pub fn expand_words(words: &[String]) -> ExpResult<Vec<String>> {
             ctx.assign = true;
             ctx.magic_eq = true;
         }
+        ctx.braces_after = braces && !crate::options::is_set("shfileexpansion");
         walk(&chars, Mode::Unquoted, &mut ctx)?;
         if braces {
             ctx.fields = ctx.fields.iter().flat_map(|f| brace_expand(f)).collect();
+            // Filename expansion follows brace expansion: `={ls,}`.
+            if ctx.braces_after && word.starts_with('=') && word.contains('{') {
+                for f in ctx.fields.iter_mut() {
+                    if let Some(e) = equals_field(f)? {
+                        *f = e;
+                    }
+                }
+            }
         }
         ctxs.push(ctx);
     }
