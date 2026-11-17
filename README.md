@@ -139,10 +139,18 @@ and builtins include:
   so `zmodload` always succeeds, and `zpty` (commands on a
   pseudo-terminal) and `zselect` work
 
-There is no zle: `zle`, `bindkey`, `compinit`, `compdef` and `zcompile`
-are accepted and do nothing, so zle plugins such as zsh-autosuggestions
-load but stay inactive (meowsh shows its own history suggestions), and
-zsh completion scripts (`#compdef`) are not run.
+By default meowsh edits lines with its own editor, not zle: `zle`
+widgets and `bindkey` bindings are recorded but not used while typing,
+so zle plugins such as zsh-autosuggestions load but stay inactive
+(meowsh shows its own history suggestions). `compinit` runs zsh's
+function of that name when `$fpath` holds one and otherwise does nothing;
+`compdef` and `zcompile` do nothing.
+
+A port of zsh's own line editor (zle: keymaps, widgets, vi mode, the
+`$BUFFER`/`$CURSOR` parameters) is in progress. Set `MEOWSH_ZLE=1` in the
+environment to use it instead; `+Z` or `unsetopt zle` then reads lines
+without editing, as in zsh. It does not yet have meowsh's suggestions,
+highlighting or Tab menu.
 zsh options meowsh does not implement are recorded by `setopt` but have
 no effect. Up and Down
 search history for lines starting with the typed text.
@@ -202,3 +210,6 @@ cargo build --release
 python3 scripts/ztst.py --zsh-src ../zsh            # summary per file
 python3 scripts/ztst.py --zsh-src ../zsh -v D04parameter  # show failures
 ```
+
+The script sets `MEOWSH_ZLE=1`, so the shells the tests start on a
+pseudo-terminal (the `X` and `Y` files) use the zle port.

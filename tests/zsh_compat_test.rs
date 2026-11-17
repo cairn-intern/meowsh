@@ -792,3 +792,31 @@ fn rprompt_is_drawn_at_the_right_edge() {
     // 60 columns, 7 wide, one column of indent: column 53 (1-based).
     assert!(out.contains("\x1b[53G[right]"), "output: {:?}", out);
 }
+
+#[test]
+fn read_k_honours_its_timeout() {
+    // The harness for zsh's ZLE tests waits this way between keys; it
+    // used to block until the writer went away.
+    let (_, out, _) = sh("typeset -F SECONDS; s=$SECONDS; \
+         { sleep 2 >/dev/null 2>&1 & } | read -t 0.05 -u 0 -k 1; r=$?; \
+         print $r $(( SECONDS - s < 1 ))");
+    assert_eq!(out, "1 1\n");
+}
+
+#[test]
+fn rc_expand_and_glob_subst_flags_combine() {
+    let (_, out, err) = sh("a=(x .); print -r ${^~a:/.}");
+    assert_eq!((out.as_str(), err.as_str()), ("x\n", ""));
+}
+
+#[test]
+fn quoted_nested_split_keeps_empty_fields() {
+    let (_, out, _) = sh("x=:a:b; print -l \"${(@)${(@s.:.)x}[1,2]}\"");
+    assert_eq!(out, "\na\n");
+}
+
+#[test]
+fn arithmetic_output_base_may_come_from_a_parameter() {
+    let (_, out, _) = sh("f='##8'; print $(( [$f] 8#7 + 1 ))");
+    assert_eq!(out, "10\n");
+}

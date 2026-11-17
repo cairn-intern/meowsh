@@ -10,10 +10,14 @@ const PRINTF_OPTS: &str = "v:";
 // The editor buffer stack: `print -z` pushes, `read -z` pops.
 static BUFFER_STACK: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-fn push_buffer_stack(s: String) {
+pub fn push_buffer_stack(s: String) {
     if let Ok(mut b) = BUFFER_STACK.lock() {
         b.push(s);
     }
+}
+
+pub fn buffer_stack_len() -> usize {
+    BUFFER_STACK.lock().map(|b| b.len()).unwrap_or(0)
 }
 
 pub fn pop_buffer_stack() -> Option<String> {

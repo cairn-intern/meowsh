@@ -296,8 +296,10 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "fc" => builtin_fc(words),
         "colors" => builtin_colors(),
         "zmodload" => builtin_zmodload(words),
-        "bindkey" | "compinit" | "compdef" | "compaudit" | "zle" | "zcompile" | "zrecompile"
-        | "bashcompinit" | "complete" | "compctl" => 0,
+        "bindkey" => crate::zle::keymap::builtin_bindkey(words),
+        "zle" => crate::zle::thingy::builtin_zle(words),
+        "compinit" | "compaudit" | "bashcompinit" => run_fpath_function(words),
+        "compdef" | "zcompile" | "zrecompile" | "complete" | "compctl" => 0,
         _ => {
             builtin_err(name, "not a builtin");
             1
@@ -1457,6 +1459,17 @@ fn builtin_read(words: &[String]) -> i32 {
         }
     }
 
+    if let Some(t) = timeout {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = (t * 1000.0).round().clamp(0.0, i32::MAX as f64) as i32;
+        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
+            return 1;
+        }
+    }
     if let Some(n) = keys {
         let text = match read_chars(fd, n) {
             Some(t) => t,
@@ -1474,17 +1487,6 @@ fn builtin_read(words: &[String]) -> i32 {
         return if var_set(&target, &text, false) { 0 } else { 2 };
     }
 
-    if let Some(t) = timeout {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ms = (t * 1000.0).round().clamp(0.0, i32::MAX as f64) as i32;
-        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
-            return 1;
-        }
-    }
     let mut bytes: Vec<u8> = Vec::new();
     let mut escaped: Vec<bool> = Vec::new();
     let mut got_delim = false;
@@ -3719,6 +3721,22 @@ fn define_stub(name: &str, dir: Option<&str>, default_too: bool) {
         // An autoloaded TRAPxxx sets its trap now, as a defined one does.
         crate::trap::function_defined(name);
     }
+}
+
+// compinit and friends: zsh's functions when $fpath has them (then
+// they replace these builtins), otherwise nothing, so startup files that
+// call them still work without zsh's function library.
+fn run_fpath_function(words: &[String]) -> i32 {
+    let name = &words[0];
+    if fpath_dir(name).is_none() || !autoload_now(name, None, true) {
+        return 0;
+    }
+    let Some((body, line)) =
+        with_shell(|s| s.functions.get(name).map(|f| (f.body.clone(), f.line)))
+    else {
+        return 0;
+    };
+    call_function(&body, words, line)
 }
 
 // The directory of $fpath holding `name`, made absolute.

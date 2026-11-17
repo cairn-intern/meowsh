@@ -245,6 +245,10 @@ impl Shell {
 
     /// Re-derives the tied partner of `name` from its value.
     pub fn sync_tie(&mut self, name: &str) {
+        if crate::zle::params::is_linked(name) {
+            crate::zle::params::reconcile(self, name);
+            return;
+        }
         let Some(p) = self.params.get(name) else {
             return;
         };

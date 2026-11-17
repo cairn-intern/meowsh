@@ -603,6 +603,17 @@ fn group_digits(d: &str, g: usize, from_left: bool) -> String {
 fn arith_text(expr: &[char]) -> ExpResult<String> {
     let s: String = expr.iter().collect();
     let t = s.trim_start();
+    // `[$fmt]`: the base spec may come from a parameter.
+    if t.starts_with('[') && !t.starts_with("[#") {
+        if let Some(close) = t.find(']') {
+            let inner: Vec<char> = t[1..close].chars().collect();
+            if inner.contains(&'$') {
+                let spec = word_string(&inner, Mode::Dq)?;
+                let rebuilt: Vec<char> = format!("[{}]{}", spec, &t[close + 1..]).chars().collect();
+                return arith_text(&rebuilt);
+            }
+        }
+    }
     if let Some(rest) = t.strip_prefix("[#") {
         if let Some(close) = rest.find(']') {
             let spec = &rest[..close];
@@ -3288,7 +3299,7 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
             }
             '+' if starts_param(next) => set_test = true,
             // `^` turns RC_EXPAND_PARAM on for this expansion, `^^` off.
-            '^' if starts_param(next) || matches!(next, Some('^' | ':')) => {
+            '^' if starts_param(next) || matches!(next, Some('^' | ':' | '~' | '=')) => {
                 rc = next != Some('^');
                 if !rc {
                     i += 1;
@@ -3296,7 +3307,7 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
             }
             // `=` splits words, `==` turns SH_WORD_SPLIT off; `~` and
             // `~~` do the same for GLOB_SUBST (see prefix_toggles).
-            '=' if starts_param(next) || matches!(next, Some('=' | ':')) => {
+            '=' if starts_param(next) || matches!(next, Some('=' | ':' | '~' | '^')) => {
                 ifs_split = next != Some('=');
                 if !ifs_split {
                     i += 1;
@@ -3357,7 +3368,9 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
         let Some(end) = scan_brace(body, i + 1, false) else {
             return bad();
         };
-        val = braced(&body[i + 2..end - 1], Mode::Unquoted)?;
+        // A nested expansion is quoted when the outer one is, so a split
+        // in it keeps empty fields.
+        val = braced(&body[i + 2..end - 1], mode)?;
         // In double quotes a nested array joins unless it has its own (@).
         let inner_at = body.get(i + 2) == Some(&'(')
             && body[i + 3..end - 1]

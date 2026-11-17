@@ -821,6 +821,11 @@ pub fn run_fd(fd: i32, prompts: bool) -> i32 {
 pub fn run_interactive() -> i32 {
     // A terminal without cursor control gets plain line reading: the
     // prompt, then the line as the terminal's own line discipline edits it.
+    if unsafe { libc::isatty(0) } == 1
+        && std::env::var_os("MEOWSH_ZLE").is_some_and(|v| !v.is_empty())
+    {
+        return run_zle();
+    }
     let dumb = std::env::var("TERM").map_or(true, |t| t.is_empty() || t == "dumb");
     if unsafe { libc::isatty(0) } != 1 || dumb {
         return run_fd(0, true);
@@ -890,6 +895,133 @@ pub fn run_interactive() -> i32 {
             let _ = rl.add_history_entry(clean.as_str());
             if !history_file.is_empty() {
                 let _ = rl.append_history(&history_file);
+            }
+        },
+    );
+    if !matches!(crate::exec::flow(), crate::types::Flow::Exit(_)) {
+        crate::sys::err_line("exit");
+    }
+    status
+}
+
+// rustyline's history file format: a "#V2" line, then one entry per line
+// with backslashes and newlines escaped.
+fn read_history_file(path: &str) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| *l != "#V2")
+        .map(|l| {
+            let mut out = String::new();
+            let mut it = l.chars();
+            while let Some(c) = it.next() {
+                if c == '\\' {
+                    match it.next() {
+                        Some('n') => out.push('\n'),
+                        Some(o) => out.push(o),
+                        None => out.push('\\'),
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+fn append_history_file(path: &str, line: &str) {
+    use std::io::Write;
+    let new = !std::path::Path::new(path).exists();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let esc = line.replace('\\', "\\\\").replace('\n', "\\n");
+        let _ = if new {
+            writeln!(f, "#V2\n{}", esc)
+        } else {
+            writeln!(f, "{}", esc)
+        };
+    }
+}
+
+/// The interactive loop with meowsh's own line editor (ZLE). With the
+/// zle option off, lines are read as the terminal delivers them, after
+/// a prompt on standard error, as zsh does.
+fn run_zle() -> i32 {
+    // A descriptor of its own, as widgets run with standard input on
+    // /dev/null.
+    let tty = crate::sys::dup_high(0);
+    crate::sys::set_cloexec(tty);
+    crate::zle::refresh::set_tty_fd(tty);
+    let history_file = crate::shell::with_shell(|s| s.history_file.clone());
+    if !history_file.is_empty() {
+        let entries = read_history_file(&history_file);
+        crate::shell::with_shell(|s| {
+            *s.history.lock().unwrap_or_else(|e| e.into_inner()) = entries
+        });
+    }
+    let mut plain = crate::sys::LineReader::new(0);
+    let mut pending = String::new();
+    let status = crate::exec::run_input(
+        |cont| {
+            let prompt = if cont {
+                continuation_prompt()
+            } else {
+                pending.clear();
+                primary_prompt()
+            };
+            if !crate::options::is_set("zle") {
+                let _ = crate::sys::write_fd(2, prompt.as_bytes());
+                wait_input_notify(0);
+                return match plain.read_line() {
+                    Some(l) => {
+                        pending.push_str(&l);
+                        InputLine::Line(l)
+                    }
+                    None => InputLine::Eof,
+                };
+            }
+            let rp_names = if cont {
+                ["RPROMPT2", "RPS2"]
+            } else {
+                ["RPROMPT", "RPS1"]
+            };
+            let rprompt = rp_names
+                .iter()
+                .find_map(|n| crate::shell::var_get_opt(n).filter(|v| !v.is_empty()))
+                .map(|v| crate::shell::render_prompt(&v))
+                .unwrap_or_default();
+            crate::zle::set_prebuffer(&pending);
+            let ctx = if cont {
+                crate::zle::ZLCON_LINE_CONT
+            } else {
+                crate::zle::ZLCON_LINE_START
+            };
+            match crate::zle::zleread(
+                &prompt,
+                &rprompt,
+                crate::zle::ZLRF_HISTORY,
+                ctx,
+                "zle-line-init",
+                "zle-line-finish",
+                None,
+            ) {
+                crate::zle::ReadResult::Line(l) => {
+                    pending.push_str(&l);
+                    InputLine::Line(l)
+                }
+                crate::zle::ReadResult::Interrupted => InputLine::Interrupted,
+                crate::zle::ReadResult::Eof => InputLine::Eof,
+            }
+        },
+        |text| {
+            crate::exec::history_add(text);
+            if !history_file.is_empty() {
+                append_history_file(&history_file, text);
             }
         },
     );

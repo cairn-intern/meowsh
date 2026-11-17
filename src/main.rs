@@ -190,6 +190,9 @@ fn main() {
                 base.trim_start_matches('-').to_string()
             }
         };
+        // As in zsh, an interactive shell on a terminal uses the line
+        // editor unless `+Z` (or `-o nozle`) says otherwise.
+        options::set_in(s, "zle", interactive && tty_in);
         for (opt, on) in &args.options {
             options::set_in(s, opt, *on);
         }

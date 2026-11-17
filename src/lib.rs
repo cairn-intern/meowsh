@@ -20,6 +20,7 @@ pub mod testexpr;
 pub mod trap;
 pub mod types;
 pub mod typeset;
+pub mod zle;
 pub mod zpty;
 
 pub use exec::*;
