@@ -1471,3 +1471,24 @@ fn autoload_in_emulate_c_is_sticky_and_parse_errors_name_the_function() {
     assert_eq!(out, "OK\noff\non\n");
     assert_eq!(err, "emu:3: parse error near `\\n'\n");
 }
+
+#[test]
+fn hist_subst_pattern_uses_patterns_anchors_and_match() {
+    let (_, out, _) = sh("setopt histsubstpattern extendedglob; foo=(one.c two.c three.c); \
+         print ${foo:s/#%(#b)t(*).c/T${match[1]}.X/}; x='a{}b[]c'; print ${x:fs/(\\\\{\\\\}|\\\\[\\\\])//}");
+    assert_eq!(out, "one.c Two.X Three.X\nabc\n");
+}
+
+#[test]
+fn glob_qualifier_substitution_sorts_the_modified_names() {
+    let dir = TempDir::new().unwrap();
+    for f in ["tmpcd", "tmpfile1", "tmpfile2", "homedir"] {
+        std::fs::write(dir.path().join(f), "").unwrap();
+    }
+    let (_, out, _) = sh(&format!(
+        "cd {} && setopt histsubstpattern extendedglob; \
+         print *(#q:s/#(#b)tmp(*e)/'scrunchy${{match[1]}}'/)",
+        dir.path().display()
+    ));
+    assert_eq!(out, "homedir scrunchyfile1 scrunchyfile2 tmpcd\n");
+}

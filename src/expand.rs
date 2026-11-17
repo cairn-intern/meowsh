@@ -2004,6 +2004,19 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
 
 /// Applies `:` modifiers (`mods` starts with `:`) to one word, as glob
 /// qualifiers such as `*(:h)` do.
+// `\\` pairs as single backslashes; other escapes stay.
+fn collapse_backslashes(s: &str) -> String {
+    let mut out = String::new();
+    let mut cs = s.chars().peekable();
+    while let Some(c) = cs.next() {
+        out.push(c);
+        if c == '\\' && cs.peek() == Some(&'\\') {
+            cs.next();
+        }
+    }
+    out
+}
+
 pub fn modify_word(word: &str, mods: &str) -> String {
     let rest: Vec<char> = mods.chars().collect();
     match apply_modifiers(Val::Str(word.to_string()), &rest) {
@@ -2102,7 +2115,7 @@ fn parse_modifiers(rest: &[char], inbrace: bool) -> ExpResult<(Vec<Modifier>, us
                     }
                 }
                 c @ ('s' | 'S') => {
-                    m.pattern = c == 'S';
+                    m.pattern = c == 'S' || crate::options::is_set("histsubstpattern");
                     i += 1;
                     let Some(&del) = rest.get(i) else {
                         return fail("bad substitution");
@@ -2338,15 +2351,44 @@ fn apply_one(m: &Modifier, s: &str, subst: &Option<(String, String)>) -> String 
             .join(" "),
         's' | '&' if m.pattern => match subst {
             Some((l, r)) => {
-                let pat = crate::pattern::Pattern::new(l);
-                let fl = crate::pattern::SubFlags {
-                    substr: true,
+                // As in ${x/pat/repl}: `#` and `%` anchor the pattern, and
+                // the replacement is expanded per match (so $match works);
+                // `&` is the matched text.
+                let mut l = l.as_str();
+                let mut fl = crate::pattern::SubFlags {
                     long: true,
                     global: m.global,
                     ..Default::default()
                 };
-                let rep = r.replace("\\&", "&");
-                pat.getmatch(s, fl, 1, Some(&|| rep.clone()))
+                if let Some(rest) = l.strip_prefix('#') {
+                    fl.start = true;
+                    l = rest;
+                }
+                if let Some(rest) = l.strip_prefix('%') {
+                    fl.end = true;
+                    l = rest;
+                }
+                fl.substr = !(fl.start || fl.end);
+                let pat = crate::pattern::Pattern::new(l);
+                let repl = || {
+                    let text = if r.contains(['$', '`']) {
+                        expand_heredoc(r).unwrap_or_else(|_| r.clone())
+                    } else {
+                        r.clone()
+                    };
+                    let matched = crate::shell::var_get("MATCH");
+                    let mut out = String::new();
+                    let mut cs = text.chars().peekable();
+                    while let Some(c) = cs.next() {
+                        match c {
+                            '\\' if cs.peek() == Some(&'&') => out.push(cs.next().unwrap()),
+                            '&' => out.push_str(&matched),
+                            _ => out.push(c),
+                        }
+                    }
+                    out
+                };
+                pat.getmatch(s, fl, 1, Some(&repl))
             }
             None => s.to_string(),
         },
@@ -2422,7 +2464,14 @@ fn run_modifiers(mut val: Val, mods: &[Modifier]) -> ExpResult<Val> {
                         Ok(t.to_string())
                     }
                 };
-                let pair = (ex(l)?, ex(r)?);
+                // A pattern's replacement is expanded per match, after $match.
+                let l = if m.pattern {
+                    // `\\` is one backslash, which then quotes the next character.
+                    collapse_backslashes(l)
+                } else {
+                    l.clone()
+                };
+                let pair = (ex(&l)?, if m.pattern { r.clone() } else { ex(r)? });
                 if let Ok(mut h) = HIST_SUBST.lock() {
                     *h = Some((pair.0.clone(), pair.1.clone(), m.pattern));
                 }

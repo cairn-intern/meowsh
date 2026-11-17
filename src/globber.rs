@@ -521,8 +521,20 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
     if !q.modifiers.is_empty() {
         out = out
             .iter()
-            .map(|p| crate::expand::modify_word(p, &q.modifiers))
+            .map(|p| crate::expand::modify_word(p, &qualifier_text(&q.modifiers)))
             .collect();
+        // Sorting by name sorts the modified names, as zsh does.
+        // (Names that become the same all stay.)
+        if q.range.is_none() && q.sort.is_none_or(|(k, _)| k == 'n') {
+            if crate::options::is_set("numericglobsort") {
+                out.sort_by(|a, b| crate::expand::numeric_order(a, b));
+            } else {
+                out.sort();
+            }
+            if q.sort.is_some_and(|(_, rev)| rev) {
+                out.reverse();
+            }
+        }
     }
     if !q.prepend.is_empty() {
         out = out
@@ -535,6 +547,21 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
                     .collect::<Vec<_>>()
             })
             .collect();
+    }
+    out
+}
+
+// A qualifier's modifiers as zsh sees them: quoting in the word has made
+// expansion characters literal (`\$`), but a replacement's `${match[1]}`
+// is expanded per match.
+fn qualifier_text(mods: &str) -> String {
+    let mut out = String::new();
+    let mut cs = mods.chars().peekable();
+    while let Some(c) = cs.next() {
+        if c == '\\' && cs.peek().is_some_and(|n| "$`{}[]".contains(*n)) {
+            continue;
+        }
+        out.push(c);
     }
     out
 }
