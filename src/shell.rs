@@ -352,7 +352,9 @@ fn dynamic_var(name: &str) -> Option<String> {
                 t.as_secs().to_string()
             })
         }
-        "EPOCHSECONDS" | "EPOCHREALTIME" => {
+        "EPOCHSECONDS" | "EPOCHREALTIME"
+            if crate::modules::feature_available(&format!("p:{}", name)) =>
+        {
             let d = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
@@ -508,7 +510,11 @@ pub fn var_exists(name: &str) -> bool {
         return var_exists(&split_target(&resolved).0);
     }
     let shadowed = DYNAMIC_NAMES.contains(&name) && with_shell(|s| s.param(name).is_some());
+    // zsh/datetime's parameters go with the module.
+    let unloaded = matches!(name, "EPOCHSECONDS" | "EPOCHREALTIME")
+        && !crate::modules::feature_available(&format!("p:{}", name));
     if !shadowed
+        && !unloaded
         && matches!(
             name,
             "RANDOM"

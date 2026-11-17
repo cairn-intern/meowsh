@@ -1575,3 +1575,29 @@ fn functions_called_from_one_command_functions_count_their_own_lines() {
     let (_, _, err) = sh("f() g\ng() { () : }\nfunctions -t f\nf");
     assert_eq!(err, "+f:4> g\n+g:0> '(anon)'\n+(anon):0> :\n");
 }
+
+#[test]
+fn alias_expanding_to_a_closing_brace_ends_the_group() {
+    let (_, out, _) = sh("alias OPEN='{' CLOSE='};'; eval 'OPEN print hi; CLOSE'");
+    assert_eq!(out, "hi\n");
+}
+
+#[test]
+fn epochseconds_goes_with_its_module() {
+    let (_, out, _) = sh("zmodload zsh/datetime; fn() { local EPOCHSECONDS=s; zmodload -u zsh/datetime; \
+         print $EPOCHSECONDS }; fn; print ${+EPOCHSECONDS}; EPOCHSECONDS=(a b); print -l $EPOCHSECONDS");
+    assert_eq!(out, "s\n0\na\nb\n");
+}
+
+#[test]
+fn computed_specials_report_zsh_types() {
+    let (_, out, _) = sh(
+        "zmodload zsh/datetime; for v in RANDOM EPOCHSECONDS EPOCHREALTIME LINENO USERNAME; \
+         do print ${(tP)v}; done",
+    );
+    assert_eq!(
+        out,
+        "integer-special\ninteger-readonly-hide-hideval-special\n\
+         float-readonly-hide-hideval-special\ninteger-readonly-special\nscalar-special\n"
+    );
+}

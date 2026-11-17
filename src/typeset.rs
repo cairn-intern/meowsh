@@ -126,7 +126,12 @@ fn special_typeset(
             }
             u.contains(name)
         };
-        if global && off & HIDE != 0 {
+        // An unloaded module takes its parameter (and the unhiding) away.
+        if !crate::modules::feature_available(&format!("p:{}", name)) {
+            unhidden(Some(false));
+            return None;
+        }
+        if off & HIDE != 0 {
             unhidden(Some(true));
             return Some(true);
         }
@@ -1614,6 +1619,11 @@ fn list_params(flags: u32, exclude: u32, pf: &PrintFlags, pattern: Option<&str>)
         text.push_str(&print_param(n, p, pf, level));
     }
     out(&text);
+}
+
+/// Whether `typeset +h` has unhidden module special `name`.
+pub fn is_unhidden(name: &str) -> bool {
+    UNHIDDEN.lock().is_ok_and(|u| u.contains(name))
 }
 
 // Module specials made visible to locals with `typeset +h`.

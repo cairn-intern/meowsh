@@ -324,6 +324,9 @@ impl Parser {
     }
 
     fn at_list_end(&mut self) -> PResult<bool> {
+        // An alias here may expand to a reserved word that ends the list
+        // (`alias CLOSE='};'`).
+        while self.try_alias()? {}
         Ok(match self.peek()? {
             Tok::Eof => true,
             Tok::Op(")") | Tok::Op(";;") | Tok::Op(";&") | Tok::Op(";|") => true,

@@ -2914,9 +2914,39 @@ pub fn param_type(name: &str) -> String {
     type_of(name)
 }
 
+// `${(t)...}` of the specials computed on each read (no parameter of
+// their own unless a user's hides them), as zsh reports them.
+fn computed_special_type(name: &str) -> Option<String> {
+    if !crate::shell::DYNAMIC_NAMES.contains(&name) || with_shell(|s| s.param(name).is_some()) {
+        return None;
+    }
+    let module = |f: &str| crate::modules::feature_available(&format!("p:{}", f));
+    let hide = if crate::typeset::is_unhidden(name) {
+        ""
+    } else {
+        "-hide"
+    };
+    Some(match name {
+        "SECONDS" if crate::shell::SECONDS_FLOAT.load(std::sync::atomic::Ordering::Relaxed) => {
+            "float-special".to_string()
+        }
+        "RANDOM" | "SECONDS" | "UID" | "EUID" | "GID" | "EGID" | "COLUMNS" | "LINES" => {
+            "integer-special".to_string()
+        }
+        "ZSH_SUBSHELL" | "LINENO" => "integer-readonly-special".to_string(),
+        "USERNAME" => "scalar-special".to_string(),
+        "EPOCHSECONDS" if module(name) => format!("integer-readonly{}-hideval-special", hide),
+        "EPOCHREALTIME" if module(name) => format!("float-readonly{}-hideval-special", hide),
+        _ => return None,
+    })
+}
+
 // `${(t)name}`, in zsh's format: the type, then -local and attributes.
 fn type_of(name: &str) -> String {
     use crate::params::*;
+    if let Some(t) = computed_special_type(name) {
+        return t;
+    }
     with_shell(|s| {
         let Some(p) = s.param(name) else {
             return String::new();
