@@ -70,6 +70,17 @@ pub fn lookup(name: &str) -> Option<Rc<Widget>> {
     with_table(|t| t.get(name).map(|th| th.widget.clone()))
 }
 
+/// A widget as zsh's $widgets shows it: builtin, user:func or
+/// completion:widget:func.
+pub fn describe(name: &str) -> String {
+    match lookup(name).map(|w| w.kind.clone()) {
+        Some(WidgetKind::Internal(_)) => "builtin".into(),
+        Some(WidgetKind::User(f)) => format!("user:{}", f),
+        Some(WidgetKind::Complete { builtin, func }) => format!("completion:{}:{}", builtin, func),
+        None => String::new(),
+    }
+}
+
 /// Every widget name, sorted, dotted names included.
 pub fn names() -> Vec<String> {
     with_table(|t| t.keys().cloned().collect())

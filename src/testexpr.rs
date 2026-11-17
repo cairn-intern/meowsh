@@ -597,6 +597,42 @@ impl DbParser<'_> {
                 };
             }
         }
+        // The completion conditions from zsh/complete: -prefix, -suffix,
+        // -after and -between take one or two operands.
+        if let Some(name) = t
+            .strip_prefix('-')
+            .filter(|n| matches!(*n, "prefix" | "suffix" | "after" | "between"))
+        {
+            let mut args = Vec::new();
+            let mut k = self.pos + 1;
+            while args.len() < 2 {
+                match self.toks.get(k) {
+                    Some(x) if !matches!(x.as_str(), "&&" | "||" | ")") => {
+                        args.push(x.clone());
+                        k += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let fits = |n: usize| match name {
+                "between" => n == 2,
+                "after" => n == 1,
+                _ => n >= 1,
+            };
+            if fits(args.len()) {
+                if name == "after" {
+                    args.truncate(1);
+                }
+                self.pos += 1 + args.len();
+                if !run {
+                    return Ok(false);
+                }
+                return match crate::zle::comp::complete::comp_cond(name, &args) {
+                    Some(r) => Ok(r),
+                    None => Err(format!("unknown condition: {}", t)),
+                };
+            }
+        }
         // zsh: `-word arg` with an unknown -word is an unknown condition.
         if t.starts_with('-')
             && t.len() > 1

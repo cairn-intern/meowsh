@@ -1,67 +1,67 @@
-//! Completion widgets, after zsh's zle_tricky.c.
+//! Completion widgets: the editor's way into the completion code in
+//! `crate::zle::comp`, after zsh's zle_tricky.c.
 
+use crate::zle::comp::tricky;
 use crate::zle::*;
 
 pub const WIDGETS: &[(&str, WidgetFn)] = &[
-    ("magic-space", magicspace),
+    ("accept-and-menu-complete", tricky::acceptandmenucomplete),
+    ("complete-word", tricky::completeword),
+    ("delete-char-or-list", tricky::deletecharorlist),
+    ("end-of-list", tricky::endoflist),
+    ("expand-cmd-path", tricky::expandcmdpath),
     ("expand-history", expandhistory),
+    ("expand-or-complete", tricky::expandorcomplete),
+    ("expand-or-complete-prefix", tricky::expandorcompleteprefix),
+    ("expand-word", tricky::expandword),
+    ("list-choices", tricky::listchoices),
+    ("list-expand", tricky::listexpand),
+    ("magic-space", magicspace),
+    ("menu-complete", tricky::menucomplete),
+    ("menu-expand-or-complete", tricky::menuexpandorcomplete),
+    ("reverse-menu-complete", tricky::reversemenucomplete),
+    ("run-help", tricky::processcmd),
+    ("spell-word", tricky::spellword),
+    ("which-command", tricky::processcmd),
 ];
 
 /// History expansion of the whole line; true if it changed.
 pub fn doexpandhist(z: &mut Zle) -> bool {
-    let old: String = z.line.iter().collect();
-    let hist =
-        crate::shell::with_shell(|s| s.history.lock().map(|h| h.clone()).unwrap_or_default());
-    let Ok(new) = crate::history::expand(&old, &hist) else {
-        return false;
-    };
-    if new == old {
-        return false;
-    }
-    let tail = z.line.len() - z.cs;
-    z.line = new.chars().collect();
-    z.cs = z.line.len().saturating_sub(tail);
-    let bol = z.findbol();
-    if z.viinsbegin > bol {
-        z.viinsbegin = bol;
-    }
-    true
+    tricky::doexpandhist(z)
 }
 
 pub fn magicspace(z: &mut Zle, args: &[String]) -> i32 {
-    fixmagicspace(z);
-    let bang = '!';
-    let bangq = (0..z.line.len()).find(|&i| {
-        z.line[i] == bang && z.line.get(i + 1) == Some(&'"') && (i == 0 || z.line[i - 1] == '\\')
-    });
-    let ret = super::misc::selfinsert(z, args);
-    if ret == 0 && bangq.is_none_or(|b| b + 2 > z.cs) {
-        doexpandhist(z);
-    }
-    ret
+    tricky::magicspace(z, args)
 }
 
-pub fn expandhistory(z: &mut Zle, _args: &[String]) -> i32 {
-    i32::from(!doexpandhist(z))
+pub fn expandhistory(z: &mut Zle, args: &[String]) -> i32 {
+    tricky::expandhistory(z, args)
 }
 
-pub fn completecall(_z: &mut Zle, _builtin: &str, _func: &str, _args: &[String]) -> i32 {
-    1
+/// Runs a `zle -C` widget: builtin completion widget `builtin` with
+/// completion function `func`.
+pub fn completecall(z: &mut Zle, builtin: &str, func: &str, args: &[String]) -> i32 {
+    tricky::completecall(z, builtin, func, args)
 }
 
-pub fn iremovesuffix(_z: &mut Zle, _c: Option<char>, _keep: bool) {}
+pub fn iremovesuffix(z: &mut Zle, c: Option<char>, keep: bool) {
+    tricky::iremovesuffix(z, c, keep);
+}
 
-pub fn invalidatelist(_z: &mut Zle) {}
+pub fn invalidatelist(z: &mut Zle) {
+    crate::zle::comp::result::invalidate_list(z);
+}
 
-pub fn listlist(_z: &mut Zle, _items: &[String]) {}
+pub fn listlist(z: &mut Zle, items: &[String]) {
+    tricky::listlist(z, items);
+}
 
+/// Whether a completion widget's function is running (zsh's incompfunc).
 pub fn in_completion() -> bool {
-    false
+    with_active(|z| z.comp.incompfunc != 0).unwrap_or(false)
 }
 
 /// Makes a following space count as typed (magic-space after expansion).
 pub fn fixmagicspace(z: &mut Zle) {
-    z.lastchar = b' ' as i32;
-    z.lastchar_wide = Some(' ');
-    z.lastchar_wide_valid = true;
+    tricky::fixmagicspace(z);
 }

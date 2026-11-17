@@ -21,6 +21,7 @@ pub mod trap;
 pub mod types;
 pub mod typeset;
 pub mod zle;
+pub mod zparam;
 pub mod zpty;
 
 pub use exec::*;

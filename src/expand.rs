@@ -58,6 +58,8 @@ struct Ctx {
     unquoted_lit: u8,
     // After `${^arr}`: later text is appended to every field from here.
     rc_from: Option<usize>,
+    // RC_EXPAND_PARAM with an empty array: the whole word goes.
+    rc_dead: bool,
     // Tags for unquoted parameter and command substitution results, from
     // SH_WORD_SPLIT and GLOB_SUBST: zsh splits parameters only with
     // SH_WORD_SPLIT, always splits command substitution, and globs
@@ -78,6 +80,7 @@ impl Ctx {
             at_lists: 0,
             unquoted_lit: 0,
             rc_from: None,
+            rc_dead: false,
             param_tag: 0,
             subst_tag: 0,
             magic_eq: false,
@@ -157,6 +160,7 @@ fn pos_params() -> Vec<String> {
 
 fn lookup(name: &str) -> Val {
     let _swap = crate::shell::RefSwap::enter(name);
+    crate::zparam::ensure(name);
     match name {
         "@" => return Val::List(pos_params(), false),
         "*" => return Val::List(pos_params(), true),
@@ -299,13 +303,13 @@ fn emit_val(ctx: &mut Ctx, val: &Val, quoted: bool) {
             ctx.content += 1;
         }
         Val::Rc(items) => {
-            if quoted || items.is_empty() {
-                emit_str(ctx, &items.join(" "), quoted);
+            if items.is_empty() {
+                ctx.rc_dead = true;
                 return;
             }
             let prefix = ctx.fields.last().cloned().unwrap_or_default();
             let start = ctx.fields.len() - 1;
-            let tag = ctx.param_tag;
+            let tag = if quoted { Q } else { ctx.param_tag };
             for (k, item) in items.iter().enumerate() {
                 if k > 0 {
                     ctx.fields.push(prefix.clone());
@@ -442,6 +446,7 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
             // zsh: `<(...)` and `>(...)` anywhere in a word.
             '<' | '>'
                 if mode == Mode::Unquoted
+                    && IN_BRACES.with(|b| b.get()) == 0
                     && (i > 0 || ctx.unquoted_lit == 0)
                     && chars.get(i + 1) == Some(&'(')
                     // Not the end of a numeric glob such as `<->(.)`.
@@ -546,6 +551,14 @@ fn unescape_bquote(inner: &[char], in_dq: bool) -> String {
 }
 
 fn command_subst(src: &str) -> ExpResult<String> {
+    // The command is new code, outside any enclosing `${...}`.
+    let saved = IN_BRACES.with(|b| b.replace(0));
+    let r = command_subst_braces(src);
+    IN_BRACES.with(|b| b.set(saved));
+    r
+}
+
+fn command_subst_braces(src: &str) -> ExpResult<String> {
     // `$(<file)` reads the file without running a command.
     let trimmed = src.trim();
     if let Some(file) = trimmed
@@ -787,7 +800,7 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
             }
             let name: String = chars[i + 1..j].iter().collect();
             let mut val = ksh_first(&name, lookup(&name));
-            if crate::options::is_set("rcexpandparam") {
+            if !quoted && crate::options::is_set("rcexpandparam") {
                 if let Val::List(items, _) = val {
                     val = Val::Rc(items);
                 }
@@ -1693,6 +1706,7 @@ fn matcher(word: &str, exact: bool) -> ExpResult<impl Fn(&str) -> bool> {
 // Value of `name[sub]` for a named parameter.
 fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     let _swap = crate::shell::RefSwap::enter(name);
+    crate::zparam::ensure(name);
     let Some(sub) = sub else {
         return Ok(lookup(name));
     };
@@ -2658,6 +2672,11 @@ fn shell_words(s: &str, opts: &str) -> Vec<String> {
     out
 }
 
+/// `${(t)name}`: zsh's type string for parameter `name`.
+pub fn param_type(name: &str) -> String {
+    type_of(name)
+}
+
 // `${(t)name}`, in zsh's format: the type, then -local and attributes.
 fn type_of(name: &str) -> String {
     use crate::params::*;
@@ -3241,7 +3260,20 @@ fn nofork(body: &[char], quoted: bool) -> ExpResult<Option<Val>> {
 
 static NOFORK_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+thread_local! {
+    // How many `${...}` are being expanded; `<(` inside one is not
+    // process substitution (zsh's lexer only sees it outside braces).
+    static IN_BRACES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
+    IN_BRACES.with(|b| b.set(b.get() + 1));
+    let r = braced_inner(body, mode);
+    IN_BRACES.with(|b| b.set(b.get() - 1));
+    r
+}
+
+fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
     if let Some(v) = nofork(body, mode != Mode::Unquoted)? {
         return Ok(v);
     }
@@ -3418,6 +3450,7 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
         val = Val::Str(word_string(&body[i + 1..end - 1], Mode::Dq)?);
         i = end;
     } else if let Some((n, s, end)) = parse_param(&body[i..]) {
+        crate::zparam::ensure(&n);
         name = n;
         // In double quotes `\"` in a subscript is a `"`.
         sub = if mode == Mode::Dq {
@@ -3711,7 +3744,13 @@ fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
         return Ok(Val::Str(n.to_string()));
     }
     if rc {
-        val = Val::Rc(val_items(&plain(val)));
+        // In double quotes only an array kept as separate words ("$a[@]",
+        // (@)) is expanded element by element.
+        val = match plain(val) {
+            Val::List(items, false) => Val::Rc(items),
+            other if mode == Mode::Unquoted => Val::Rc(val_items(&other)),
+            other => other,
+        };
     }
     Ok(val)
 }
@@ -4676,7 +4715,7 @@ fn finish_all(ctxs: Vec<Ctx>, do_glob: bool) -> ExpResult<Vec<String>> {
     });
     let mut out = Vec::new();
     let (mut any_match, mut failed) = (false, None::<String>);
-    for ctx in &ctxs {
+    for ctx in ctxs.iter().filter(|c| !c.rc_dead) {
         for field in &ctx.fields {
             for piece in split_field(field, &ifs) {
                 match glob_piece(&piece, do_glob) {

@@ -820,3 +820,30 @@ fn arithmetic_output_base_may_come_from_a_parameter() {
     let (_, out, _) = sh("f='##8'; print $(( [$f] 8#7 + 1 ))");
     assert_eq!(out, "10\n");
 }
+
+#[test]
+fn rc_expand_param_drops_words_with_empty_arrays() {
+    let (_, out, _) = sh("setopt rcexpandparam; a=(); f=( \"$a[@]\" x$a ); b=(1 2); \
+         g=( \"x$b[@]y\" ); print ${#f} $g");
+    assert_eq!(out, "0 x1y x2y\n");
+}
+
+#[test]
+fn process_substitution_is_literal_inside_braces() {
+    let (_, out, err) = sh("setopt extendedglob; s='<LC><DI><RC>'; \
+         print ${(N)s#*(#b)<LC><(??)><RC>} $match[1]; cat <(print ok)");
+    assert_eq!((out.as_str(), err.as_str()), ("12 DI\nok\n", ""));
+}
+
+#[test]
+fn zsh_parameter_module_specials() {
+    let (_, out, _) = sh("x=1; print $+builtins[:] $+builtins[nosuch] ${parameters[x]} \
+         $+commands[sh]");
+    assert_eq!(out, "1 0 scalar 1\n");
+}
+
+#[test]
+fn zmodload_e_reports_missing_modules() {
+    let (_, out, _) = sh("zmodload -e zsh/compctl; a=$?; zmodload -e zsh/zle; print $a $?");
+    assert_eq!(out, "1 0\n");
+}

@@ -5,6 +5,7 @@
 //! back to it through [`with_active`], which only works inside
 //! [`Zle::shell`]; that keeps a single `&mut` path to the state.
 
+pub mod comp;
 pub mod keymap;
 pub mod params;
 pub mod refresh;
@@ -230,6 +231,7 @@ pub struct Zle {
     pub lastabortedsearch: Option<String>,
     pub isearch: (Option<usize>, Option<usize>, bool),
     pub widget_depth: i32,
+    pub comp: comp::CompState,
 }
 
 thread_local! {
@@ -343,6 +345,7 @@ impl Zle {
             lastabortedsearch: None,
             isearch: (None, None, false),
             widget_depth: 0,
+            comp: comp::CompState::default(),
         }
     }
 

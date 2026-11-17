@@ -88,6 +88,9 @@ const REGULAR: &[&str] = &[
     "bashcompinit",
     "complete",
     "compctl",
+    "compadd",
+    "compset",
+    "compcall",
 ];
 
 const KEYWORDS: &[&str] = &[
@@ -125,6 +128,10 @@ const KEYWORDS: &[&str] = &[
     "readonly",
     "typeset",
 ];
+
+pub fn reserved_words() -> Vec<String> {
+    KEYWORDS.iter().map(|s| s.to_string()).collect()
+}
 
 pub fn builtin_names() -> impl Iterator<Item = &'static str> {
     SPECIAL.iter().chain(REGULAR.iter()).copied()
@@ -299,6 +306,9 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "bindkey" => crate::zle::keymap::builtin_bindkey(words),
         "zle" => crate::zle::thingy::builtin_zle(words),
         "compinit" | "compaudit" | "bashcompinit" => run_fpath_function(words),
+        "compadd" => crate::zle::comp::complete::builtin_compadd(words),
+        "compset" => crate::zle::comp::complete::builtin_compset(words),
+        "compcall" => crate::zle::comp::complete::builtin_compcall(words),
         "compdef" | "zcompile" | "zrecompile" | "complete" | "compctl" => 0,
         _ => {
             builtin_err(name, "not a builtin");
@@ -493,8 +503,28 @@ fn builtin_zmodload(words: &[String]) -> i32 {
     {
         out("SRANDOM (zsh/random)\n");
     }
+    // `zmodload -e name...`: whether each is loaded. Modules meowsh does
+    // not provide are not; completion functions test for zsh/compctl.
+    if flags.contains('e') {
+        let names: Vec<&String> = words[1..].iter().filter(|w| !w.starts_with('-')).collect();
+        return i32::from(names.iter().any(|n| MISSING_MODULES.contains(&n.as_str())));
+    }
     0
 }
+
+const MISSING_MODULES: &[&str] = &[
+    "zsh/attr",
+    "zsh/cap",
+    "zsh/clone",
+    "zsh/compctl",
+    "zsh/curses",
+    "zsh/db/gdbm",
+    "zsh/example",
+    "zsh/net/socket",
+    "zsh/net/tcp",
+    "zsh/pcre",
+    "zsh/zftp",
+];
 
 fn builtin_exit(words: &[String]) -> i32 {
     let code = match words.get(1) {
