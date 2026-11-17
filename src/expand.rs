@@ -985,6 +985,7 @@ struct PFlags {
     charcode: bool,
     // (X): report errors in flags such as (#) instead of ignoring them.
     report: bool,
+    extglob: bool,
     at: bool,
     keys: bool,
     values: bool,
@@ -1164,6 +1165,8 @@ fn parse_flags(body: &[char]) -> Option<(PFlags, usize)> {
             'A' => f.assign_array += 1,
             '#' => f.charcode = true,
             'X' => f.report = true,
+            // (*): EXTENDED_GLOB for this expansion's patterns.
+            '*' => f.extglob = true,
             'm' => {}
             _ => {
                 FLAG_ERR_AT.with(|e| e.set(Some(i - 1)));
@@ -3367,9 +3370,18 @@ thread_local! {
     static IN_BRACES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    // Set when a (*) flag turned EXTENDED_GLOB on for its expansion.
+    static STAR_EXTGLOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     IN_BRACES.with(|b| b.set(b.get() + 1));
+    let outer = STAR_EXTGLOB.with(|s| s.replace(false));
     let r = braced_inner(body, mode);
+    if STAR_EXTGLOB.with(|s| s.replace(outer)) {
+        crate::options::set("extendedglob", false);
+    }
     IN_BRACES.with(|b| b.set(b.get() - 1));
     r
 }
@@ -3399,6 +3411,10 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
                 None => fail(&format!("error in flags in '${{{}}}'", text)),
             };
         };
+        if f.extglob && !crate::options::quick("extendedglob") {
+            crate::options::set("extendedglob", true);
+            STAR_EXTGLOB.with(|s| s.set(true));
+        }
         flags = f;
         i = end;
     }

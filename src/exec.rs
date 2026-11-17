@@ -509,7 +509,22 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
             temp_file_with(body.as_bytes()).map_err(|e| Some(format!("here-document: {}", e)))?;
         return Ok(Target::Opened(fd));
     }
-    let target = expand_string(&r.target).map_err(|_| None)?;
+    let mut target = expand_string(&r.target).map_err(|_| None)?;
+    // A pattern target is globbed: one match names the file, none fails
+    // even with (N).
+    if r.op != RedirOp::HereStr
+        && !crate::options::is_set("noglob")
+        && crate::pattern::has_meta(&r.target)
+        && r.target.ends_with(')')
+    {
+        let words =
+            crate::expand::expand_words(std::slice::from_ref(&r.target)).map_err(|_| None)?;
+        match words.as_slice() {
+            [one] => target = one.clone(),
+            [] => return Err(Some(format!("redirection failed (no match): {}", r.target))),
+            _ => {}
+        }
+    }
     if r.op == RedirOp::HereStr {
         let fd = temp_file_with(format!("{}\n", target).as_bytes())
             .map_err(|e| Some(format!("here-string: {}", e)))?;

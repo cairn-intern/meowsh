@@ -176,7 +176,12 @@ fn parse_quals(s: &str) -> Option<Quals> {
                 while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
                     i += 1;
                 }
-                q.limit = Some(chars[start..i].iter().collect::<String>().parse().ok()?);
+                // ^Y turns the limit off again.
+                q.limit = if negate {
+                    None
+                } else {
+                    Some(chars[start..i].iter().collect::<String>().parse().ok()?)
+                };
                 continue;
             }
             '[' => {

@@ -570,6 +570,9 @@ impl DbParser<'_> {
                 return match op.as_str() {
                     "=" | "==" | "!=" => {
                         let pat = expand_pattern(&rhs).map_err(|_| String::new())?;
+                        if crate::pattern::Pattern::new(&pat).is_bad() {
+                            return Err(format!("bad pattern: {}", pat));
+                        }
                         let m = crate::pattern::matches(&pat, &l);
                         Ok(if op == "!=" { !m } else { m })
                     }

@@ -960,6 +960,11 @@ fn assign_warning(name: &str, kind: &str) {
 }
 
 pub fn var_set(name: &str, value: &str, export: bool) -> bool {
+    // zsh reserves the .zsh namespace for its own read-only parameters.
+    if name.starts_with(".zsh.") {
+        shell_err(&format!("{}: can't modify read-only parameter", name));
+        return false;
+    }
     let ok = var_set_inner(name, value, export);
     // AUTO_NAME_DIRS: a global set to a directory's absolute path names it.
     if ok

@@ -510,7 +510,9 @@ fn expand_tabs(s: &str, width: usize, mut pos: usize, all: bool, out: &mut Strin
             _ => {
                 at_start = false;
                 out.push(c);
-                pos += 1;
+                // Columns, as zsh counts them: wide characters take two.
+                let mut b = [0u8; 4];
+                pos += crate::display_width(c.encode_utf8(&mut b));
             }
         }
     }

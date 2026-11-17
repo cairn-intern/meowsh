@@ -1246,3 +1246,57 @@ fn unset_special_tied_pair_stays_tied() {
     );
     assert_eq!(out, "0\na:b\nc d\n");
 }
+
+#[test]
+fn negated_y_qualifier_removes_the_limit() {
+    let dir = TempDir::new().unwrap();
+    for n in ["d1", "d2", "d3"] {
+        std::fs::create_dir(dir.path().join(n)).unwrap();
+    }
+    let (_, out, _) = sh(&format!("cd {} && print d*(Y1^Y)", dir.path().display()));
+    assert_eq!(out, "d1 d2 d3\n");
+}
+
+#[test]
+fn misplaced_count_flag_is_a_bad_pattern() {
+    let (st, _, err) = sh("setopt extendedglob; [[ foo = (#c0)foo ]]");
+    assert_eq!(st, 2);
+    assert!(err.contains("bad pattern: (#c0)foo"), "{}", err);
+}
+
+#[test]
+fn redirect_to_unmatched_pattern_fails_even_with_n() {
+    let dir = TempDir::new().unwrap();
+    let (st, _, err) = sh(&format!("cd {} && echo > none(N)", dir.path().display()));
+    assert_eq!(st, 1);
+    assert!(
+        err.contains("redirection failed (no match): none(N)"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn star_flag_enables_extended_glob_for_one_expansion() {
+    let (_, out, _) = sh("unsetopt extendedglob; \
+         print -r -- ${(*)=${(@s.+.):-A+B}/(#b)(?)/-${(L)match[1]} ${match[1]}}; \
+         [[ -o extendedglob ]] && print on || print off");
+    assert_eq!(out, "-a A -b B\noff\n");
+}
+
+#[test]
+fn zsh_namespace_parameters_are_read_only() {
+    let (st, _, err) = sh(".zsh.cmdsubst=x");
+    assert_eq!(st, 1);
+    assert!(
+        err.contains(".zsh.cmdsubst: can't modify read-only parameter"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn print_tab_expansion_counts_wide_characters_as_two_columns() {
+    let (_, out, _) = sh("print -X8 -r -- $'one\\tＺＳＨ\\tthree'");
+    assert_eq!(out, "one     ＺＳＨ  three\n");
+}

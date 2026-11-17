@@ -52,6 +52,8 @@ enum Node {
 #[derive(Clone)]
 struct Ctx {
     ext: bool,
+    // A malformed pattern, such as (#c...) with nothing before it.
+    bad: bool,
     ksh: bool,
     shglob: bool,
     fold: Fold,
@@ -442,8 +444,9 @@ fn parse_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
                                     (n, Some(n))
                                 }
                             };
-                            if let Some(last) = items.pop() {
-                                items.push(Node::Repeat(Box::new(last), lo, hi));
+                            match items.pop() {
+                                Some(last) => items.push(Node::Repeat(Box::new(last), lo, hi)),
+                                None => cx.bad = true,
                             }
                             break;
                         }
@@ -796,9 +799,15 @@ pub struct Pattern {
     // (#b) capturing groups; (#m) sets MATCH, MBEGIN and MEND.
     groups: usize,
     matchref: bool,
+    bad: bool,
 }
 
 impl Pattern {
+    /// Whether the pattern is malformed (zsh's "bad pattern").
+    pub fn is_bad(&self) -> bool {
+        self.bad
+    }
+
     pub fn new(pattern: &str) -> Self {
         let p: Vec<char> = pattern.chars().collect();
         let mut cx = Ctx {
@@ -810,12 +819,14 @@ impl Pattern {
             backref: false,
             groups: 0,
             matchref: false,
+            bad: false,
         };
         let root = compile(&p, &mut cx);
         Pattern {
             root,
             groups: cx.groups,
             matchref: cx.matchref,
+            bad: cx.bad,
         }
     }
 
