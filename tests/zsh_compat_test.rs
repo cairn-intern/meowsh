@@ -837,8 +837,10 @@ fn process_substitution_is_literal_inside_braces() {
 
 #[test]
 fn zsh_parameter_module_specials() {
-    let (_, out, _) = sh("x=1; print $+builtins[:] $+builtins[nosuch] ${parameters[x]} \
-         $+commands[sh]");
+    let (_, out, _) = sh(
+        "x=1; print $+builtins[:] $+builtins[nosuch] ${parameters[x]} \
+         $+commands[sh]",
+    );
     assert_eq!(out, "1 0 scalar 1\n");
 }
 
