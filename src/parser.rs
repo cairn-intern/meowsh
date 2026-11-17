@@ -867,6 +867,22 @@ impl Parser {
                     }
                 }
             }
+            // zsh: after a command word, `(...)` that is not `()` starts a
+            // word with a glob group: `print (a|b)*`.
+            if !cmd.words.is_empty()
+                && self.peek_is_op("(")?
+                && !self.peeked_queued
+                && !self.lex.next_after_blanks_is(")")
+            {
+                self.peeked = None;
+                match self.lex.glob_word_after_paren() {
+                    Some(w) => {
+                        cmd.words.push(w);
+                        continue;
+                    }
+                    None => return Err(ParseError::Syntax("parse error near `('".into())),
+                }
+            }
             let word = match self.peek()? {
                 Tok::Word(w) => w.clone(),
                 _ => break,
@@ -928,6 +944,7 @@ impl Parser {
                 && cmd.words.iter().all(|w| is_func_name(w))
                 && is_func_name(&word)
                 && self.peek_is_op("(")?
+                && (self.peeked_queued || self.lex.next_after_blanks_is(")"))
             {
                 self.next()?;
                 self.expect_op(")")?;
@@ -954,6 +971,7 @@ impl Parser {
                 && cmd.assigns.is_empty()
                 && cmd.redirs.is_empty()
                 && self.peek_is_op("(")?
+                && (self.peeked_queued || self.lex.next_after_blanks_is(")"))
             {
                 self.next()?;
                 self.expect_op(")")?;

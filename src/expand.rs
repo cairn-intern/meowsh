@@ -737,6 +737,13 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
             expand_braced(&chars[i + 2..ie], mode, ctx)?;
             Ok(end)
         }
+        // zsh's old `$[expr]`, the same as `$((expr))`.
+        '[' if crate::lexer::scan_dollar_bracket(chars, i + 1).is_some() => {
+            let end = crate::lexer::scan_dollar_bracket(chars, i + 1).unwrap();
+            let v = arith_text(&chars[i + 2..end - 1])?;
+            emit_str(ctx, &v, quoted);
+            Ok(end)
+        }
         '(' => {
             let arith_end = scan_arith(chars, i + 1);
             let Some(end) = arith_end.or_else(|| scan_paren(chars, i + 1)) else {
@@ -885,7 +892,9 @@ fn name_with_subscript(chars: &[char], i: usize) -> usize {
                 Some(p) => k += p + 1,
                 None => return j,
             },
-            ' ' | '\t' | '\n' => return j,
+            // Blanks may appear inside, as in "$x[p + 1, -1]"; words the
+            // lexer split never reach here with them.
+            '\n' => return j,
             _ => {}
         }
         k += 1;
@@ -1739,11 +1748,7 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     // zsh/system's $sysparams.
     if name == "sysparams" && !with_shell(|s| s.assoc("sysparams").is_some()) {
         let key = expand_string(sub)?;
-        return Ok(match key.as_str() {
-            "pid" => Val::Str(std::process::id().to_string()),
-            "ppid" => Val::Str(unsafe { libc::getppid() }.to_string()),
-            _ => Val::Unset,
-        });
+        return Ok(crate::zsystem::sysparam(&key).map_or(Val::Unset, Val::Str));
     }
     // zsh/parameter's $functions: a function's body as text.
     if name == "functions" && !with_shell(|s| s.assoc("functions").is_some()) {

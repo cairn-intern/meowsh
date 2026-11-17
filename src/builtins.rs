@@ -92,6 +92,14 @@ const REGULAR: &[&str] = &[
     "compset",
     "compcall",
     "zformat",
+    "zregexparse",
+    "strftime",
+    "sysread",
+    "syswrite",
+    "sysopen",
+    "sysseek",
+    "syserror",
+    "zsystem",
     "compdescribe",
     "comparguments",
     "compvalues",
@@ -319,6 +327,14 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "compset" => crate::zle::comp::complete::builtin_compset(words),
         "compcall" => crate::zle::comp::complete::builtin_compcall(words),
         "zformat" => crate::zutil::builtin_zformat(words),
+        "zregexparse" => crate::zregexparse::builtin_zregexparse(words),
+        "strftime" => crate::zdatetime::builtin_strftime(words),
+        "sysread" => crate::zsystem::builtin_sysread(words),
+        "syswrite" => crate::zsystem::builtin_syswrite(words),
+        "sysopen" => crate::zsystem::builtin_sysopen(words),
+        "sysseek" => crate::zsystem::builtin_sysseek(words),
+        "syserror" => crate::zsystem::builtin_syserror(words),
+        "zsystem" => crate::zsystem::builtin_zsystem(words),
         "compdescribe" => crate::zle::comp::computil_args::builtin_compdescribe(words),
         "comparguments" => crate::zle::comp::computil_args::builtin_comparguments(words),
         "compvalues" => crate::zle::comp::computil_rest::builtin_compvalues(words),
@@ -520,6 +536,18 @@ fn builtin_zmodload(words: &[String]) -> i32 {
         && with_shell(|s| s.param("SRANDOM").is_none())
     {
         out("SRANDOM (zsh/random)\n");
+    }
+    // Loading a module meowsh does not provide fails, as in a zsh built
+    // without it (zsh's tests then skip what needs it).
+    if !flags.chars().any(|c| "euLldAR".contains(c)) {
+        let names: Vec<&String> = words[1..]
+            .iter()
+            .filter(|w| !w.starts_with(['-', '+']))
+            .collect();
+        if let Some(m) = names.iter().find(|n| MISSING_MODULES.contains(&n.as_str())) {
+            shell_err(&format!("failed to load module `{}': no such module", m));
+            return 1;
+        }
     }
     // Loading zsh/complist switches the completion listing to its
     // colored version and adds menu selection.

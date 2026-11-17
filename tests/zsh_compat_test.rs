@@ -912,3 +912,33 @@ fn braces_expand_as_the_first_array_element() {
     let (_, out, _) = sh("a=({a,b} x); local -a c; c=( {1..2} ); print -r -- $a $c");
     assert_eq!(out, "a b x 1 2\n");
 }
+
+#[test]
+fn dollar_bracket_arithmetic() {
+    let (_, out, _) = sh("a=3; e=$[ $a - 1 ]; print -r -- $e $[2*3] \"$[4]\"");
+    assert_eq!(out, "2 6 4\n");
+}
+
+#[test]
+fn quoted_subscripts_may_contain_blanks() {
+    let (_, out, _) = sh("p=1; x=abcd; print -r -- \"[$x[p + 1, -2]]\"");
+    assert_eq!(out, "[bc]\n");
+}
+
+#[test]
+fn glob_group_words_after_a_command_word() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("foo"), "").unwrap();
+    let (_, out, _) = sh(&format!(
+        "cd {}; print (foo|bar) x; x=(''); setopt nomatch; print -r -- $^x(N) end",
+        dir.path().display()
+    ));
+    assert_eq!(out, "foo x\nend\n");
+}
+
+#[test]
+fn loading_an_unavailable_module_fails() {
+    let (st, _, err) = sh("zmodload zsh/pcre");
+    assert_eq!(st, 1);
+    assert!(err.contains("failed to load module `zsh/pcre'"), "{}", err);
+}

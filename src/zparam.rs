@@ -19,6 +19,8 @@ const NAMES: &[&str] = &[
     "historywords",
     "widgets",
     "keymaps",
+    "errnos",
+    "epochtime",
 ];
 
 /// Brings special parameter `name` up to date, if it is one.
@@ -96,6 +98,10 @@ pub fn ensure(name: &str) {
                     .flat_map(|l| crate::expand::split_shell_words(l).into_iter().rev())
                     .collect(),
             )
+        }
+        "errnos" => Value::Array(crate::zsystem::errnos()),
+        "epochtime" => {
+            crate::zdatetime::epoch_param("epochtime").unwrap_or(Value::Array(Vec::new()))
         }
         "widgets" => assoc(crate::zle::thingy::names().into_iter().map(|n| {
             let kind = crate::zle::thingy::describe(&n);

@@ -549,6 +549,15 @@ fn call(name: &str, args: &[Num]) -> R {
     if let Some(m) = math_func(name) {
         return call_user(&m, args.iter().map(|a| a.to_string()).collect());
     }
+    if let Some(r) = crate::zmathfunc::call(name, args) {
+        return r;
+    }
+    if name == "systell" {
+        return match args {
+            [fd] => crate::zsystem::systell(fd.as_int()).map(Num::I),
+            _ => Err(format!("{}: wrong number of arguments", name)),
+        };
+    }
     let one = |f: fn(f64) -> f64| -> R {
         match args {
             [x] => Ok(Num::F(f(x.as_float()))),
@@ -789,7 +798,8 @@ impl P {
                 self.pos += 1;
                 // `functions -Ms`: the text between the parentheses is
                 // the one argument.
-                if self.peek_op("(") && math_func(&name).is_some_and(|m| m.string) {
+                let user_string = math_func(&name).is_some_and(|m| m.string);
+                if self.peek_op("(") && (user_string || crate::zmathfunc::is_string_func(&name)) {
                     let start = self.starts[self.pos] + 1;
                     let mut depth = 0;
                     let mut end = start;
@@ -811,6 +821,10 @@ impl P {
                     }
                     if skip {
                         return Ok(Num::I(0));
+                    }
+                    if !user_string {
+                        return crate::zmathfunc::call_string(&name, &arg)
+                            .unwrap_or_else(|| Err(format!("{}: unknown function", name)));
                     }
                     let m = math_func(&name).unwrap();
                     return call_user(&m, vec![arg]);

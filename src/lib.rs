@@ -20,9 +20,13 @@ pub mod testexpr;
 pub mod trap;
 pub mod types;
 pub mod typeset;
+pub mod zdatetime;
 pub mod zle;
+pub mod zmathfunc;
 pub mod zparam;
 pub mod zpty;
+pub mod zregexparse;
+pub mod zsystem;
 pub mod zutil;
 
 pub use exec::*;

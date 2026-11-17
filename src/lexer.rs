@@ -350,6 +350,28 @@ fn command_position(before: &[char]) -> bool {
 /// None if the parentheses do not close that way (then it is a command
 /// substitution starting with a subshell). Unlike `scan_paren`, `#` is
 /// not a comment here: `$(( #c ))` is a character code.
+/// zsh's old `$[expr]` arithmetic: `i` indexes the `[`. Returns the
+/// index after the matching `]`.
+pub fn scan_dollar_bracket(chars: &[char], i: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut j = i;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' => j += 1,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
 pub fn scan_arith(chars: &[char], i: usize) -> Option<usize> {
     if chars.get(i + 1) != Some(&'(') {
         return None;
@@ -977,6 +999,7 @@ impl Lexer {
                 '$' if self.pos + 1 < self.chars.len() => {
                     let next = self.chars[self.pos + 1];
                     let end = match next {
+                        '[' => scan_dollar_bracket(&self.chars, self.pos + 1),
                         '(' => Some(
                             match scan_arith(&self.chars, self.pos + 1) {
                                 Some(e) => Some(e),

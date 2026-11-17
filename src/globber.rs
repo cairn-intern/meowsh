@@ -72,7 +72,9 @@ pub fn split_qualifiers(pattern: &str) -> (&str, Option<Quals>) {
             _ => {}
         }
     }
-    let Some(open) = open.filter(|&o| o > 0) else {
+    // A word that is all `(...)` is qualifiers on an empty pattern, as
+    // in zsh (`$^x(N)` with x=('')).
+    let Some(open) = open else {
         return (pattern, None);
     };
     let inner: String = chars[open + 1..chars.len() - 1].iter().collect();
@@ -544,7 +546,9 @@ mod tests {
         assert!(split_qualifiers("*(N)").1.is_some_and(|q| q.null));
         assert!(split_qualifiers("*.(rs|toml)").1.is_none());
         assert_eq!(split_qualifiers("*(Nm-1)").0, "*");
-        assert!(split_qualifiers("(N)").1.is_none());
+        // As in zsh, a word that is all qualifiers has an empty pattern.
+        let (base, q) = split_qualifiers("(N)");
+        assert!(base.is_empty() && q.is_some_and(|q| q.null));
     }
 
     #[test]
