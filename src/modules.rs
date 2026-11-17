@@ -732,7 +732,14 @@ impl State {
         let shell = crate::shell::with_shell(|s| s.param(name).map(|p| (p.level, p.attrs)));
         match shell {
             Some((level, _)) if level > 0 => return ParamState::Local,
-            Some((_, attrs)) if attrs & (SPECIAL | UNSET) == 0 => return ParamState::Global,
+            // meowsh keeps $aliases, $galiases and $options as parameters of
+            // its own: they are zsh/parameter's, not the user's.
+            Some((_, attrs))
+                if attrs & (SPECIAL | UNSET) == 0
+                    && !matches!(name, "aliases" | "galiases" | "options") =>
+            {
+                return ParamState::Global
+            }
             _ => {}
         }
         if self.feature_on(&format!("p:{}", name)) {

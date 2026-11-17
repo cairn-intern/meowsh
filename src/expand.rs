@@ -954,6 +954,18 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
                 }
             }
             let name: String = chars[i + 1..end].iter().collect();
+            // zsh: `$@[2,-1]` and `$*[1]` subscript as `${@[2,-1]}` does.
+            if chars.get(end) == Some(&'[')
+                && matches!(c, '@' | '*')
+                && !crate::exec::sh_emulation_pub()
+                && !ksh_arrays()
+            {
+                let close = scan_bracket_end(chars, end);
+                if close < n {
+                    expand_braced(&chars[i + 1..=close], mode, ctx)?;
+                    return Ok(close + 1);
+                }
+            }
             let val = lookup(&name);
             check_set(&name, &val)?;
             // Modifiers apply here too: `$@:a`, `$0:t`.

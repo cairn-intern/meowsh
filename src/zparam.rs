@@ -36,6 +36,13 @@ pub fn ensure(name: &str) {
     if shadowed {
         return;
     }
+    // A module feature turned off (zmodload -F mod -p:name) takes it away.
+    if !crate::modules::feature_available(&format!("p:{}", name)) {
+        with_shell(|s| {
+            s.remove_param(name);
+        });
+        return;
+    }
     let value = match name {
         "builtins" => assoc(
             crate::builtins::builtin_names()

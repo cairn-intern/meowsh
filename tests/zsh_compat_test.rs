@@ -1536,3 +1536,24 @@ fn failed_module_autoloads_stop_the_command_line() {
         assert!(err.contains("autoload cancelled"), "{}", err);
     }
 }
+
+#[test]
+fn positional_arrays_take_a_subscript_without_braces() {
+    let (_, out, _) = sh("set a b c; print $@[2,-1] / $*[2] / \"$@[1,2]\"");
+    assert_eq!(out, "b c / b / a b\n");
+}
+
+#[test]
+fn disabling_a_parameter_feature_removes_it() {
+    let (_, out, _) = sh(
+        "zmodload zsh/system; print ${+errnos}; zmodload -F zsh/system -p:errnos; \
+         print ${+errnos}; zmodload -F zsh/system +p:errnos; print ${+errnos}",
+    );
+    assert_eq!(out, "1\n0\n1\n");
+}
+
+#[test]
+fn zsh_parameter_reloads_over_alias_and_option_tables() {
+    let (st, _, err) = sh("alias x=y; zmodload -u zsh/parameter; zmodload zsh/parameter");
+    assert_eq!(st, 0, "{}", err);
+}
