@@ -1601,3 +1601,14 @@ fn computed_specials_report_zsh_types() {
          float-readonly-hide-hideval-special\ninteger-readonly-special\nscalar-special\n"
     );
 }
+
+#[test]
+fn nofork_parse_errors_stop_the_command() {
+    let (st, out, err) = sh("print ${| REPLY=x}}");
+    assert_eq!((st, out.as_str()), (1, ""));
+    assert!(err.contains("parse error near `}'"), "{}", err);
+    let (_, out, _) = sh("setopt ignorebraces; print ${| REPLY=x}}");
+    assert_eq!(out, "x}\n");
+    let (st, out, _) = sh("setopt ignorebraces; print ${ { echo nested } } DONE");
+    assert_eq!((st, out.as_str()), (1, ""));
+}

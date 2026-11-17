@@ -828,6 +828,16 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
             if ie == n {
                 return fail("bad substitution");
             }
+            // A nofork substitution is parsed as a command list: a `}`
+            // straight after it has nothing to close.
+            let nofork = matches!(chars.get(i + 2), Some('|' | ' ' | '\t' | '\n'));
+            if nofork
+                && chars.get(end) == Some(&'}')
+                && mode == Mode::Unquoted
+                && !crate::options::is_set("ignorebraces")
+            {
+                return fail("parse error near `}'");
+            }
             expand_braced(&chars[i + 2..ie], mode, ctx)?;
             Ok(end)
         }
@@ -3451,6 +3461,16 @@ fn nofork(body: &[char], quoted: bool) -> ExpResult<Option<Val>> {
         _ => return Ok(None),
     };
     let code: String = code.iter().collect();
+    // A syntax error in the body is an error of the command using it.
+    let mut parser = crate::parser::Parser::new(&code, true);
+    loop {
+        match parser.parse_complete_command() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(crate::parser::ParseError::Syntax(m)) => return fail(&m),
+            Err(crate::parser::ParseError::Incomplete) => return fail("closing brace expected"),
+        }
+    }
     let capture = match kind {
         Kind::Stdout => {
             let dir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
