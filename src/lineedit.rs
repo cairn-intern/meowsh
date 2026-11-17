@@ -195,14 +195,16 @@ impl MeowshHelper {
     fn get_completions(&self, line: &str) -> Vec<rustyline::completion::Pair> {
         let mut completions = Vec::new();
 
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        let chars: Vec<char> = line.chars().collect();
+        let (words, open) = split_words(&chars, char::is_whitespace);
+        let parts: Vec<&str> = words.iter().map(|(_, w)| w.as_str()).collect();
         // Command position: empty line, single word without '/', or after a pipe/operator
-        let trailing_space = line.ends_with(' ') || line.ends_with('\t');
+        let trailing_space = !open && !parts.is_empty();
         let is_cmd_position =
             parts.is_empty() || (parts.len() == 1 && !trailing_space && !parts[0].contains('/'));
 
         if is_cmd_position {
-            let current = parts.last().unwrap_or(&"");
+            let current = parts.last().copied().unwrap_or("");
             // Held only here: path completion reads variables, which lock
             // the shell themselves.
             let shell = crate::shell::SHELL.shell.lock().unwrap();
@@ -262,7 +264,7 @@ impl MeowshHelper {
             let current = if trailing_space {
                 ""
             } else {
-                parts.last().unwrap_or(&"")
+                parts.last().copied().unwrap_or("")
             };
             let cmd = parts.first().unwrap_or(&"");
             let dirs_only = matches!(*cmd, "cd" | "pushd" | "rmdir");
@@ -381,7 +383,7 @@ impl MeowshHelper {
 
             completions.push(rustyline::completion::Pair {
                 display,
-                replacement,
+                replacement: escape_word(&replacement),
             });
         }
 
@@ -485,14 +487,72 @@ pub(crate) fn candidates(line: &str, pos: usize) -> (usize, Vec<rustyline::compl
         .position(|&raw| raw >= pos)
         .unwrap_or(chars.len())
         .min(chars.len());
-    let word_start = chars[..clean_pos]
-        .iter()
-        .rposition(|c| c.is_whitespace() || ";|&".contains(*c))
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let (words, open) = split_words(&chars[..clean_pos], |c| {
+        c.is_whitespace() || ";|&".contains(c)
+    });
+    let word_start = match words.last() {
+        Some(&(i, _)) if open => i,
+        _ => clean_pos,
+    };
     let start = mappings.get(word_start).copied().unwrap_or(pos);
     let prefix: String = chars[..clean_pos].iter().collect();
     (start, MeowshHelper.get_completions(&prefix))
+}
+
+// Splits `chars` into words at unquoted separators, as the parser would
+// read them: each word's start index and its text with quotes and
+// backslashes removed. The flag is whether the last word runs to the end,
+// that is, is still being typed.
+fn split_words(chars: &[char], sep: impl Fn(char) -> bool) -> (Vec<(usize, String)>, bool) {
+    let mut words: Vec<(usize, String)> = Vec::new();
+    let mut cur: Option<(usize, String)> = None;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if quote.is_none() && sep(c) {
+            words.extend(cur.take());
+            i += 1;
+            continue;
+        }
+        let word = &mut cur.get_or_insert_with(|| (i, String::new())).1;
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (None, '\'') | (None, '"') => quote = Some(c),
+            (Some('"'), '\\') if matches!(chars.get(i + 1), Some('"' | '\\' | '$' | '`')) => {
+                i += 1;
+                word.push(chars[i]);
+            }
+            (None, '\\') => {
+                i += 1;
+                if let Some(&n) = chars.get(i) {
+                    word.push(n);
+                }
+            }
+            _ => word.push(c),
+        }
+        i += 1;
+    }
+    let open = cur.is_some();
+    words.extend(cur);
+    (words, open)
+}
+
+// Backslash-escapes what the parser would otherwise read as syntax, so a
+// completed name like `foo (1).deb` stays one literal word. A leading `~`
+// is the user's tilde and is left for expansion.
+fn escape_word(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    for (i, c) in word.chars().enumerate() {
+        let special = c.is_whitespace()
+            || "\\'\"`$&|;<>()[]{}*?!^".contains(c)
+            || (i == 0 && "#=".contains(c));
+        if special {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 // zsh's RPROMPT for the line being read: its rendered text and width,
@@ -1203,6 +1263,27 @@ mod tests {
             MeowshHelper.complete_paths(&partial, &mut completions, dirs_only);
             let got: Vec<&str> = completions.iter().map(|c| c.replacement.as_str()).collect();
             assert_eq!(got, [format!("{}/rust-remake/", tmp.path().display())]);
+        }
+    }
+
+    #[test]
+    fn names_with_syntax_complete_escaped_and_read_back() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("chrome (1).deb"), "").unwrap();
+        let dir = tmp.path().display();
+        let want = format!("{dir}/chrome\\ \\(1\\).deb");
+        // Typed plain, with the space escaped, and inside quotes: each is
+        // one word and completes to the one name, escaped.
+        for (cmd, word) in [
+            ("sudo apt install ", format!("{dir}/chr")),
+            ("mv ", format!("{dir}/chrome\\ (1")),
+            ("mv ", format!("'{dir}/chrome (1")),
+        ] {
+            let line = format!("{cmd}{word}");
+            let (start, got) = candidates(&line, line.len());
+            let got: Vec<&str> = got.iter().map(|c| c.replacement.as_str()).collect();
+            assert_eq!((start, got), (cmd.len(), vec![want.as_str()]), "{line}");
         }
     }
 
