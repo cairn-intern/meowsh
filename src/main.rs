@@ -130,7 +130,12 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 
 fn main() {
     shell_init();
-    let argv: Vec<String> = env::args().collect();
+    let argv: Vec<String> = {
+        use std::os::unix::ffi::OsStrExt;
+        env::args_os()
+            .map(|a| meowsh::shell::bytes_to_zstr(a.as_bytes()))
+            .collect()
+    };
     // As zsh does: emulate the shell named by argv[0] (sh, ksh, ...) or
     // by `--emulate mode`; otherwise zsh.
     let emu = match (argv.get(1).map(|a| a.as_str()), argv.get(2)) {
@@ -186,8 +191,12 @@ fn main() {
             // `-c` and standard input: errors name the shell, as zsh's do.
             None => {
                 let a0 = argv.first().map(|a| a.as_str()).unwrap_or("meowsh");
-                let base = a0.rsplit('/').next().unwrap_or(a0);
-                base.trim_start_matches('-').to_string()
+                let base = a0.rsplit('/').next().unwrap_or(a0).trim_start_matches('-');
+                if args.command.is_some() && !base.contains("meowsh") {
+                    "zsh".to_string()
+                } else {
+                    base.to_string()
+                }
             }
         };
         // As in zsh, an interactive shell on a terminal uses the line

@@ -71,6 +71,7 @@ const REGULAR: &[&str] = &[
     "limit",
     "unlimit",
     "zselect",
+    "zstat",
     "zpty",
     "zle",
     "zcompile",
@@ -161,6 +162,9 @@ pub fn is_special_builtin(name: &str) -> bool {
 }
 
 pub fn is_builtin(name: &str) -> bool {
+    if matches!(name, "stat" | "zstat") {
+        return !builtin_disabled(name) && crate::modules::feature_enabled(&format!("b:{}", name));
+    }
     (SPECIAL.contains(&name) || REGULAR.contains(&name))
         && !builtin_disabled(name)
         && crate::modules::feature_available(&format!("b:{}", name))
@@ -354,6 +358,7 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "limit" => builtin_limit(words),
         "unlimit" => builtin_unlimit(words),
         "zselect" => builtin_zselect(words),
+        "zstat" | "stat" => crate::zstat::builtin_zstat(words),
         "zpty" => crate::zpty::builtin_zpty(words),
         "printf" => crate::print::builtin_printf(words),
         // Accepted for zsh startup-file compatibility; no effect. There is
@@ -694,7 +699,7 @@ fn find_sourced(file: &str) -> Option<String> {
 /// Runs a file in the current shell, as `.` does.
 pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
     let content = match std::fs::read(path) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Ok(b) => crate::shell::bytes_to_zstr(&b),
         Err(e) => {
             err_line(&format!(
                 "meowsh: {}: {}",
@@ -1000,7 +1005,11 @@ fn builtin_unset(words: &[String]) -> i32 {
         if a == "CURSOR_FORM" {
             crate::zle::termctl::cursor_form_param_changed();
         }
+        if matches!(a.as_str(), "LC_ALL" | "LC_CTYPE" | "LANG") {
+            crate::shell::sync_lc_ctype();
+        }
     }
+    crate::shell::sync_lc_ctype();
     status
 }
 
@@ -1557,7 +1566,11 @@ fn builtin_read(words: &[String]) -> i32 {
                 'd' => {
                     delim = take_arg()
                         .and_then(|d| d.chars().next())
-                        .map(|c| c.to_string().into_bytes())
+                        .map(|c| {
+                            crate::shell::decode_raw_byte(c)
+                                .map(|b| vec![b])
+                                .unwrap_or_else(|| c.to_string().into_bytes())
+                        })
                         .unwrap_or_else(|| vec![0]);
                 }
                 // -z: from the buffer stack that `print -z` pushes to.
@@ -1723,20 +1736,36 @@ fn builtin_read(words: &[String]) -> i32 {
         }
     }
 
-    let chars: Vec<(char, bool)> = match std::str::from_utf8(&bytes) {
-        Ok(s) => {
-            let mut out = Vec::new();
-            let mut idx = 0;
-            for c in s.chars() {
-                out.push((c, escaped[idx]));
-                idx += c.len_utf8();
+    let chars: Vec<(char, bool)> = {
+        let mut out = Vec::new();
+        let mut idx = 0;
+        while idx < bytes.len() {
+            match std::str::from_utf8(&bytes[idx..]) {
+                Ok(s) => {
+                    for c in s.chars() {
+                        out.push((c, escaped[idx]));
+                        idx += c.len_utf8();
+                    }
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        let s = unsafe { std::str::from_utf8_unchecked(&bytes[idx..idx + valid]) };
+                        for c in s.chars() {
+                            out.push((c, escaped[idx]));
+                            idx += c.len_utf8();
+                        }
+                    }
+                    let bad = e.error_len().unwrap_or(bytes.len() - idx);
+                    for _ in 0..bad {
+                        out.push((crate::shell::raw_byte_char(bytes[idx]), escaped[idx]));
+                        idx += 1;
+                    }
+                }
             }
-            out
         }
-        Err(_) => String::from_utf8_lossy(&bytes)
-            .chars()
-            .map(|c| (c, false))
-            .collect(),
+        out
     };
     let ifs = var_get_opt("IFS").unwrap_or_else(|| " \t\n".to_string());
     if echo {
@@ -1795,7 +1824,7 @@ fn read_chars(fd: i32, n: usize) -> Option<String> {
                 bytes.push(b);
                 // Count a character once its UTF-8 sequence is complete.
                 if std::str::from_utf8(&bytes).is_ok() {
-                    count = String::from_utf8_lossy(&bytes).chars().count();
+                    count = crate::shell::bytes_to_zstr(&bytes).chars().count();
                 }
             }
             _ => break,
@@ -1807,7 +1836,7 @@ fn read_chars(fd: i32, n: usize) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(crate::shell::bytes_to_zstr(&bytes))
 }
 
 // ---- getopts --------------------------------------------------------------

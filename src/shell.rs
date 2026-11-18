@@ -45,14 +45,17 @@ pub fn shell_init() {
     *shell.next_job_id.lock().unwrap() = 1;
 
     // Every environment variable becomes an exported shell variable.
-    for (key, value) in env::vars_os() {
-        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
-            continue;
-        };
-        if crate::lexer::is_valid_name(key) {
-            let mut p = Param::scalar(value);
-            p.attrs = EXPORT;
-            shell.params.insert(key.to_string(), p);
+    {
+        use std::os::unix::ffi::OsStrExt;
+        for (key, value) in env::vars_os() {
+            let Some(key) = key.to_str() else {
+                continue;
+            };
+            if crate::lexer::is_valid_name(key) {
+                let mut p = Param::scalar(bytes_to_zstr(value.as_bytes()));
+                p.attrs = EXPORT;
+                shell.params.insert(key.to_string(), p);
+            }
         }
     }
 
@@ -162,6 +165,8 @@ pub fn shell_init() {
             }
         }
     }
+    drop(shell);
+    sync_lc_ctype();
 }
 
 // Keeps an inherited $PWD only if it is absolute and names the current
@@ -1236,6 +1241,9 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
     if name == "CURSOR_FORM" {
         crate::zle::termctl::cursor_form_param_changed();
     }
+    if matches!(name, "LC_ALL" | "LC_CTYPE" | "LANG") {
+        sync_lc_ctype();
+    }
     true
 }
 
@@ -1758,6 +1766,7 @@ pub fn pop_scope() {
     if changed {
         crate::zle::termctl::cursor_form_param_changed();
     }
+    sync_lc_ctype();
     if let Some(target) = loop_errs.first() {
         shell_err(&format!("{}: invalid self reference", target));
         crate::exec::abort_command(1);
@@ -2659,6 +2668,180 @@ pub fn shell_err(msg: &str) {
 /// Prints an error from builtin `name` in zsh's format.
 pub fn builtin_err(name: &str, msg: &str) {
     crate::sys::err_line(&format!("{}{}", err_prefix(Some(name)), msg));
+}
+
+const RAW_BYTE_BASE: u32 = 0x10_FF00;
+
+/// Encodes a byte as a char, mapping raw high bytes (`0x80..=0xFF`) into
+/// `U+10FF80..=U+10FFFF` so they never collide with `U+0080..=U+00FF`.
+#[inline]
+pub fn raw_byte_char(b: u8) -> char {
+    if b < 0x80 {
+        b as char
+    } else {
+        char::from_u32(RAW_BYTE_BASE + b as u32).unwrap()
+    }
+}
+
+/// Extracts the raw byte if `c` is an escaped raw high byte (`U+10FF80..=U+10FFFF`).
+#[inline]
+pub fn decode_raw_byte(c: char) -> Option<u8> {
+    let u = c as u32;
+    (RAW_BYTE_BASE + 0x80..=RAW_BYTE_BASE + 0xFF)
+        .contains(&u)
+        .then(|| (u - RAW_BYTE_BASE) as u8)
+}
+
+/// Losslessly decodes bytes into a zstr, keeping valid UTF-8 intact and escaping
+/// invalid bytes (`0x80..=0xFF`) into `U+10FF80..=U+10FFFF`.
+pub fn bytes_to_zstr(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    out.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[i..i + valid]) });
+                    i += valid;
+                }
+                let bad = e.error_len().unwrap_or(bytes.len() - i);
+                for &b in &bytes[i..i + bad] {
+                    out.push(raw_byte_char(b));
+                }
+                i += bad;
+            }
+        }
+    }
+    out
+}
+
+/// Encodes a zstr back to raw bytes.
+pub fn zstr_to_bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        if let Some(b) = decode_raw_byte(c) {
+            out.push(b);
+        } else {
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// Re-parses a zstr as UTF-8 bytes + remaining raw bytes when in a UTF-8 multibyte locale.
+pub fn normalize_zstr(s: &str) -> String {
+    if is_c_locale() {
+        s.to_string()
+    } else {
+        bytes_to_zstr(&zstr_to_bytes(s))
+    }
+}
+
+/// Renders a single byte using zsh's `nicechar` (`\M-`, `^X`, `^?`).
+pub fn nice_byte_char(mut b: u8) -> String {
+    let mut out = String::new();
+    if b & 0x80 != 0 && !crate::options::is_set("printeightbit") {
+        out.push_str("\\M-");
+        b &= 0x7f;
+    }
+    if b == 0x7f {
+        out.push_str("^?");
+    } else if b == b'\n' {
+        out.push_str("\\n");
+    } else if b == b'\t' {
+        out.push_str("\\t");
+    } else if b < 0x20 {
+        out.push('^');
+        out.push((b + 0x40) as char);
+    } else {
+        out.push(b as char);
+    }
+    out
+}
+
+/// Renders raw/control bytes via `nice_byte_char`, keeping valid UTF-8 printable chars intact.
+pub fn nice_str(s: &str) -> String {
+    nice_str_inner(s, false)
+}
+
+/// Renders every raw/non-ASCII/control byte via `nice_byte_char`.
+pub fn nice_bytes_str(s: &str) -> String {
+    nice_str_inner(s, true)
+}
+
+fn nice_str_inner(s: &str, all_non_ascii: bool) -> String {
+    let mut out = String::new();
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        if let Some(b) = decode_raw_byte(c) {
+            out.push_str(&nice_byte_char(b));
+        } else if (c as u32) < 0x20 || c == '\x7f' {
+            out.push_str(&nice_byte_char(c as u8));
+        } else if all_non_ascii && !c.is_ascii() {
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&nice_byte_char(b));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+static LAST_LC_CTYPE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn effective_lc_ctype() -> String {
+    with_shell(|s| {
+        for k in ["LC_ALL", "LC_CTYPE", "LANG"] {
+            if let Some(p) = s.param(k) {
+                let v = p.text();
+                if p.attrs & crate::params::UNSET == 0 && !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+        String::new()
+    })
+}
+
+/// Synchronizes libc `LC_CTYPE` with the shell's `LC_ALL` / `LC_CTYPE` / `LANG`.
+pub fn sync_lc_ctype() {
+    let want = effective_lc_ctype();
+    let target = if want.is_empty() { "C" } else { &want };
+    let mut last = LAST_LC_CTYPE.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_deref() == Some(target) {
+        return;
+    }
+    if let Ok(c) = std::ffi::CString::new(zstr_to_bytes(target)) {
+        let res = unsafe { libc::setlocale(libc::LC_CTYPE, c.as_ptr()) };
+        if res.is_null() && target.to_ascii_lowercase().contains("utf") {
+            let _ = unsafe { libc::setlocale(libc::LC_CTYPE, c"C.UTF-8".as_ptr()) };
+        }
+    }
+    *last = Some(target.to_string());
+}
+
+/// True when the active `LC_CTYPE` is single-byte / non-UTF-8 or `NO_MULTIBYTE` is set.
+pub fn is_c_locale() -> bool {
+    sync_lc_ctype();
+    if !crate::options::is_set("multibyte") {
+        return true;
+    }
+    let cs = unsafe {
+        let p = libc::nl_langinfo(libc::CODESET);
+        if p.is_null() {
+            ""
+        } else {
+            std::ffi::CStr::from_ptr(p).to_str().unwrap_or("")
+        }
+    };
+    !cs.eq_ignore_ascii_case("UTF-8") && !cs.eq_ignore_ascii_case("UTF8")
 }
 
 #[cfg(test)]

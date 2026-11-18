@@ -146,6 +146,8 @@ const QUICK_NAMES: &[&str] = &[
     "kshzerosubscript",
     "posixidentifiers",
     "shglob",
+    "interactive",
+    "banghist",
 ];
 
 /// For code that may run with the shell lock held: whether one of a few
@@ -400,7 +402,7 @@ pub const OPTIONS: &[(&str, u8, bool, bool)] = &[
     ("markdirs", 0, false, false),
     ("menucomplete", 0, false, false),
     ("monitor", 0, false, true),
-    ("multibyte", 0, false, false),
+    ("multibyte", 15, false, false),
     ("multifuncdef", 8, true, false),
     ("multios", 8, true, false),
     ("nomatch", 9, true, false),

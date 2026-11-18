@@ -712,7 +712,7 @@ fn command_subst_braces(src: &str) -> ExpResult<String> {
     {
         let path = expand_string(file.trim())?;
         let (mut out, status) = match std::fs::read(&path) {
-            Ok(b) => (String::from_utf8_lossy(&b).into_owned(), 0),
+            Ok(b) => (crate::shell::bytes_to_zstr(&b), 0),
             Err(e) => {
                 eprintln!("meowsh: {}: {}", path, e);
                 (String::new(), 1)
@@ -929,7 +929,7 @@ fn expand_dollar(chars: &[char], i: usize, mode: Mode, ctx: &mut Ctx) -> ExpResu
         }
         '\'' if mode == Mode::Unquoted => {
             let (ie, end) = bounds(scan_dollar_squote(chars, i + 1), n);
-            let s = dollar_squote_text(&chars[i + 2..ie.max(i + 2)]);
+            let s = dollar_squote_text(&chars[i + 2..ie.max(i + 2)])?;
             for c in s.chars() {
                 ctx.push(c, Q);
             }
@@ -2830,13 +2830,17 @@ fn realpath_p(s: &str) -> String {
 fn visible(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
-        match c {
-            '\x7f' => out.push_str("^?"),
-            c if (c as u32) < 32 => {
-                out.push('^');
-                out.push(char::from(b'@' + c as u8));
+        if let Some(b) = crate::shell::decode_raw_byte(c) {
+            out.push_str(&crate::shell::nice_byte_char(b));
+        } else {
+            match c {
+                '\x7f' => out.push_str("^?"),
+                c if (c as u32) < 32 => {
+                    out.push('^');
+                    out.push(char::from(b'@' + c as u8));
+                }
+                c => out.push(c),
             }
-            c => out.push(c),
         }
     }
     out
@@ -2847,6 +2851,10 @@ fn visible(s: &str) -> String {
 fn dollar_quote(s: &str) -> String {
     let mut out = String::from("$'");
     for c in s.chars() {
+        if let Some(b) = crate::shell::decode_raw_byte(c) {
+            out.push_str(&format!("\\{:03o}", b));
+            continue;
+        }
         match c {
             '\\' => out.push_str("\\\\"),
             '\'' => out.push_str("\\'"),
@@ -2869,9 +2877,16 @@ fn quote_minimal(s: &str, plus: bool) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    if plus && s.chars().any(|c| (c as u32) < 32 || c == '\x7f') {
+    if plus
+        && s.chars()
+            .any(|c| (c as u32) < 32 || c == '\x7f' || crate::shell::decode_raw_byte(c).is_some())
+    {
         let mut out = String::from("$'");
         for c in s.chars() {
+            if let Some(b) = crate::shell::decode_raw_byte(c) {
+                out.push_str(&format!("\\{:03o}", b));
+                continue;
+            }
             match c {
                 '\\' => out.push_str("\\\\"),
                 '\'' => out.push_str("\\'"),
@@ -2966,7 +2981,7 @@ fn quote_minimal(s: &str, plus: bool) -> String {
 }
 
 // (g:opts:): echo/print-style escapes; `o` bare octal, `e` \E/\M-/\C-, `c` ^X.
-fn g_escapes(s: &str, opts: &str) -> String {
+fn g_escapes(s: &str, opts: &str) -> ExpResult<String> {
     let chars: Vec<char> = s.chars().collect();
     let emacs = opts.contains('e');
     ansi_c_opts(
@@ -2976,18 +2991,58 @@ fn g_escapes(s: &str, opts: &str) -> String {
         emacs,
         opts.contains('c'),
     )
+    .or_else(|msg| fail(&msg))
 }
 
 pub(crate) fn backslash_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
+    let is_unprint =
+        |c: char| (c as u32) < 32 || c == '\x7f' || crate::shell::decode_raw_byte(c).is_some();
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::new();
-    for (k, c) in s.chars().enumerate() {
-        if " \t\n\\'\"`$&|;<>()[]{}*?#^".contains(c) || (matches!(c, '~' | '=') && k == 0) {
+    let mut in_dollar = false;
+    for (k, &c) in chars.iter().enumerate() {
+        if is_unprint(c) {
+            if !in_dollar {
+                out.push_str("$'");
+                in_dollar = true;
+            }
+            if let Some(b) = crate::shell::decode_raw_byte(c) {
+                out.push_str(&format!("\\{:03o}", b));
+            } else {
+                match c {
+                    '\0' => {
+                        if chars.get(k + 1).is_some_and(|n| ('0'..='7').contains(n)) {
+                            out.push_str("\\000");
+                        } else {
+                            out.push_str("\\0");
+                        }
+                    }
+                    '\x07' => out.push_str("\\a"),
+                    '\x08' => out.push_str("\\b"),
+                    '\x0c' => out.push_str("\\f"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\x0b' => out.push_str("\\v"),
+                    other => out.push_str(&format!("\\{:03o}", other as u32)),
+                }
+            }
+            continue;
+        }
+        if in_dollar {
+            out.push('\'');
+            in_dollar = false;
+        }
+        if " '\\\"`$&|;<>()[]{}*?#^".contains(c) || (matches!(c, '~' | '=') && k == 0) {
             out.push('\\');
         }
         out.push(c);
+    }
+    if in_dollar {
+        out.push('\'');
     }
     out
 }
@@ -3023,10 +3078,10 @@ fn unquote_checked(s: &str, report: bool) -> ExpResult<String> {
                     if report {
                         return fail("unmatched '");
                     }
-                    out.push_str(&dollar_squote_text(&chars[i + 2..]));
+                    out.push_str(&dollar_squote_text(&chars[i + 2..])?);
                     break;
                 };
-                out.push_str(&dollar_squote_text(&chars[i + 2..end - 1]));
+                out.push_str(&dollar_squote_text(&chars[i + 2..end - 1])?);
                 i = end;
             }
             '"' => {
@@ -3537,11 +3592,21 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
         let mut out = Vec::new();
         for w in val_items(&val) {
             match crate::arith::eval(&w) {
-                Ok(n) => match u32::try_from(n).ok().and_then(char::from_u32) {
-                    Some(c) => out.push(c.to_string()),
-                    None if f.report => return fail("character not in range"),
-                    None => {}
-                },
+                Ok(n) => {
+                    let c_loc = crate::shell::is_c_locale();
+                    let valid = u32::try_from(n)
+                        .ok()
+                        .filter(|&v| !c_loc || v <= 0x7f)
+                        .and_then(char::from_u32);
+                    match valid {
+                        Some(c) => out.push(c.to_string()),
+                        None if f.report => return fail("character not in range"),
+                        None if n >= 0 => {
+                            out.push(crate::shell::raw_byte_char((n & 0xff) as u8).to_string());
+                        }
+                        None => {}
+                    }
+                }
                 Err(e) if f.report => return fail(&e),
                 Err(_) => {}
             }
@@ -3650,7 +3715,7 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             *s = crate::shell::render_prompt(s);
         }
         if let Some(g) = &f.gflags {
-            *s = g_escapes(s, g);
+            *s = g_escapes(s, g)?;
         }
         if f.unquote {
             *s = unquote_checked(s, f.report)?;
@@ -5143,7 +5208,7 @@ fn pattern_text(ctx: &Ctx) -> String {
 }
 
 // `keep_unknown`: an unknown escape keeps its backslash (echo); `$'...'` drops it, as zsh does.
-fn ansi_c(chars: &[char], keep_unknown: bool) -> String {
+fn ansi_c(chars: &[char], keep_unknown: bool) -> Result<String, String> {
     ansi_c_opts(chars, keep_unknown, true, true, false)
 }
 
@@ -5153,7 +5218,7 @@ fn ansi_c_opts(
     octal_no_zero: bool,
     emacs: bool,
     caret: bool,
-) -> String {
+) -> Result<String, String> {
     let mut out = String::new();
     let mut i = 0;
     let n = chars.len();
@@ -5174,7 +5239,10 @@ fn ansi_c_opts(
     let mut mark = 0;
     let modify = |out: &mut String, meta: &mut bool, ctrl: &mut bool, mark: usize| {
         if (*meta || *ctrl) && out.chars().count() > mark {
-            let mut v = out.pop().unwrap_or_default() as u32;
+            let ch = out.pop().unwrap_or_default();
+            let mut v = crate::shell::decode_raw_byte(ch)
+                .map(u32::from)
+                .unwrap_or(ch as u32);
             if *ctrl {
                 v = if v == u32::from(b'?') {
                     0x7f
@@ -5185,7 +5253,7 @@ fn ansi_c_opts(
             if *meta {
                 v |= 0x80;
             }
-            out.push(char::from_u32(v).unwrap_or('?'));
+            out.push(crate::shell::raw_byte_char((v & 0xff) as u8));
             *meta = false;
             *ctrl = false;
         }
@@ -5233,16 +5301,21 @@ fn ansi_c_opts(
                     i -= 1;
                 }
                 let v = take_digits(&mut i, 8, 3).unwrap_or(0);
-                out.push(char::from_u32(v & 0xff).unwrap_or('?'));
+                out.push(crate::shell::raw_byte_char((v & 0xff) as u8));
             }
             'x' => match take_digits(&mut i, 16, 2) {
-                Some(v) => out.push(char::from_u32(v).unwrap_or('?')),
+                Some(v) => out.push(crate::shell::raw_byte_char((v & 0xff) as u8)),
                 None => out.push_str("\\x"),
             },
             'u' | 'U' => {
                 let max = if c == 'u' { 4 } else { 8 };
                 match take_digits(&mut i, 16, max) {
-                    Some(v) => out.push(char::from_u32(v).unwrap_or('\u{fffd}')),
+                    Some(v) => {
+                        if v > 0x7f && crate::shell::is_c_locale() {
+                            return Err("character not in range".to_string());
+                        }
+                        out.push(char::from_u32(v).unwrap_or('\u{fffd}'));
+                    }
                     None => {
                         out.push('\\');
                         out.push(c);
@@ -5262,24 +5335,30 @@ fn ansi_c_opts(
         }
     }
     modify(&mut out, &mut meta, &mut ctrl, mark);
-    out
+    Ok(crate::shell::normalize_zstr(&out))
 }
 
 // `$'...'`: with POSIX_STRINGS a null character ends the string.
-fn dollar_squote_text(chars: &[char]) -> String {
-    let mut s = ansi_c(chars, false);
+fn dollar_squote_text(chars: &[char]) -> ExpResult<String> {
+    let mut s = ansi_c(chars, false).or_else(|msg| fail(&msg))?;
     if crate::options::is_set("posixstrings") {
         if let Some(k) = s.find('\0') {
             s.truncate(k);
         }
     }
-    s
+    Ok(s)
 }
 
 /// Decodes backslash escapes the way `$'...'` does (used by `echo -e`).
 pub fn decode_escapes(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
-    ansi_c(&chars, true)
+    match ansi_c(&chars, true) {
+        Ok(v) => v,
+        Err(msg) => {
+            crate::shell::shell_err(&msg);
+            String::new()
+        }
+    }
 }
 
 // ---- brace expansion ------------------------------------------------------
@@ -5385,7 +5464,12 @@ fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
         let (ca, cb): (Vec<char>, Vec<char>) =
             (parts[0].chars().collect(), parts[1].chars().collect());
         if ca.len() == 1 && cb.len() == 1 && !(ca[0].is_ascii_digit() && cb[0].is_ascii_digit()) {
-            let (mut a, mut b) = (ca[0] as u32, cb[0] as u32);
+            let to_ord = |c: char| -> u32 {
+                crate::shell::decode_raw_byte(c)
+                    .map(u32::from)
+                    .unwrap_or(c as u32)
+            };
+            let (mut a, mut b) = (to_ord(ca[0]), to_ord(cb[0]));
             let rev = b < a;
             if rev {
                 std::mem::swap(&mut a, &mut b);
@@ -5394,8 +5478,10 @@ fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
             let mut out: Vec<String> = (a..=b)
                 .filter_map(char::from_u32)
                 .map(|c| {
-                    if !mb && (c as u32) <= 0xff {
-                        nice_byte_char(c as u8)
+                    if (!mb && (c as u32) <= 0xff) || (c as u32) < 32 || c == '\x7f' {
+                        crate::shell::nice_byte_char(c as u8)
+                    } else if (0x80..=0xff).contains(&(c as u32)) {
+                        crate::shell::raw_byte_char(c as u8).to_string()
                     } else {
                         c.to_string()
                     }
@@ -5461,28 +5547,6 @@ fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
         out.reverse();
     }
     Some((out, false))
-}
-
-// zsh `nicechar`: renders a single byte under `no_multibyte` for `{a..b}` ranges.
-fn nice_byte_char(mut b: u8) -> String {
-    let mut out = String::new();
-    if b & 0x80 != 0 && !crate::options::is_set("printeightbit") {
-        out.push_str("\\M-");
-        b &= 0x7f;
-    }
-    if b == 0x7f {
-        out.push_str("^?");
-    } else if b == b'\n' {
-        out.push_str("\\n");
-    } else if b == b'\t' {
-        out.push_str("\\t");
-    } else if b < 0x20 {
-        out.push('^');
-        out.push((b + 0x40) as char);
-    } else {
-        out.push(b as char);
-    }
-    out
 }
 
 // ---- field splitting and pathname expansion -------------------------------

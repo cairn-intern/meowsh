@@ -1801,3 +1801,35 @@ fn private_and_nameref_scope_compat() {
         "self=enclosing\nst=1 p= v=inner\nunder=-n\ntypeset -n x=!\nns=0:foo.4ar\nerrs=1:1\nln1=1\nln2=1\n"
     );
 }
+
+#[test]
+fn raw_bytes_multibyte_zstat_and_zformat_compat() {
+    let dir = std::env::temp_dir().join(format!("meowsh_zstat_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_str().unwrap().to_string();
+
+    let (st, out, err) = sh(&format!(
+        "export LC_ALL=en_US.UTF-8; \
+         setopt multibyte; \
+         read -ed $'\\xc2' <<<$'one\\xc2\\xa3two'; \
+         foo=$'X\\xc0Y\\x07Z\\x7fT'; print -r -- \"q=${{(q)foo}}\"; \
+         printf 'px=%x\\n' $(printf '\"\\xf0'); \
+         [[ $'\\xcc' != $'\\ucc' && $'\\xcc' = [$'\\xcc'] && $'\\xcc' != [$'\\ucc'] ]] && print raw_cmp; \
+         [[ $'\\xe3' == [[:INCOMPLETE:]] && $'\\xe3\\x83' == [[:INCOMPLETE:]][[:INVALID:]] && $'\\xe3\\x83\\x9b' = ? ]] && print utf_class; \
+         [[ $'\\ua0' =~ '^.$' ]] && print regex_mb; \
+         (LC_ALL=C; print $'\\u00e9') 2>&1 | grep -q 'character not in range' && print c_range; \
+         (LC_ALL=C; [[ ${{(#):-0x80}} = $'\\x80' ]] && print c_hash); \
+         zmodload zsh/stat zsh/zutil; \
+         x=$'\\xff'; zformat -F REPLY \"<%$x>\" \"$x:$x\" && print -r -- \"zf=${{(V)REPLY}}\"; \
+         zformat -F REPLY '' 'é:' 2>&1 | sed 's/.*: //'; \
+         cd '{d}' && : > 'f-é' && typeset -A sizes && zstat +size -A sizes -nor -- 'f-é' && \
+         [[ -N 'f-é' ]] && print \"zstat=${{sizes[f-é]}}\"",
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(
+        out,
+        "one\nq=X$'\\300'Y$'\\a'Z$'\\177'T\npx=f0\nraw_cmp\nutf_class\nregex_mb\nc_range\nc_hash\nzf=<\\M-^?>\n\\M-C\\M-):\nzstat=0\n"
+    );
+}

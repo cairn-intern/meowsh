@@ -1430,9 +1430,15 @@ pub fn quote_value(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    if s.chars().any(|c| c.is_control()) {
+    if s.chars()
+        .any(|c| c.is_control() || crate::shell::decode_raw_byte(c).is_some())
+    {
         let mut out = String::from("$'");
         for c in s.chars() {
+            if let Some(b) = crate::shell::decode_raw_byte(c) {
+                out.push_str(&format!("\\{:03o}", b));
+                continue;
+            }
             match c {
                 '\n' => out.push_str("\\n"),
                 '\t' => out.push_str("\\t"),

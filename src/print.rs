@@ -160,15 +160,15 @@ fn getkeystring(s: &str, how: Keys) -> (String, bool) {
             'c' => return (out, true),
             '0' if how == Keys::PrintfArg => {
                 let v = digits(&mut i, 8, 3).unwrap_or(0);
-                out.push(char::from_u32(v & 0xff).unwrap_or('?'));
+                out.push(crate::shell::raw_byte_char((v & 0xff) as u8));
             }
             '0'..='7' if how != Keys::PrintfArg => {
                 i -= 1;
                 let v = digits(&mut i, 8, 3).unwrap_or(0);
-                push_esc(&mut out, char::from_u32(v & 0xff).unwrap_or('?'), how);
+                push_esc(&mut out, crate::shell::raw_byte_char((v & 0xff) as u8), how);
             }
             'x' => match digits(&mut i, 16, 2) {
-                Some(v) => push_esc(&mut out, char::from_u32(v).unwrap_or('?'), how),
+                Some(v) => push_esc(&mut out, crate::shell::raw_byte_char((v & 0xff) as u8), how),
                 None => out.push_str("\\x"),
             },
             'u' | 'U' => match digits(&mut i, 16, if c == 'u' { 4 } else { 8 }) {
@@ -384,7 +384,7 @@ fn print_main(name: &str, ops: &Ops, mut args: Vec<String>, printf: bool) -> i32
             let r = format_all(name, f, *trunc, &args, o('r'));
             out = r.out;
             if r.abort {
-                let _ = crate::sys::write_fd(fd, out.as_bytes());
+                let _ = crate::sys::write_fd(fd, &crate::shell::zstr_to_bytes(&out));
                 return 1;
             }
             ret = r.ret;
@@ -408,7 +408,7 @@ fn print_main(name: &str, ops: &Ops, mut args: Vec<String>, printf: bool) -> i32
         };
         return if ok { ret } else { 1 };
     }
-    match crate::sys::write_fd(fd, out.as_bytes()) {
+    match crate::sys::write_fd(fd, &crate::shell::zstr_to_bytes(&out)) {
         Ok(()) => ret,
         Err(e) if fd == 1 && e.raw_os_error() == Some(libc::EBADF) => {
             // Closed for this command alone (`print foo >&-`) it is not
@@ -804,8 +804,13 @@ fn format_all(name: &str, fmt: &str, mut fmttrunc: bool, args: &[String], once: 
             if kind > 0 {
                 let conv = conv.unwrap();
                 let quoted = curarg.and_then(|a| {
-                    a.strip_prefix(['\'', '"'])
-                        .map(|r| r.chars().next().map_or(0, |ch| ch as u32))
+                    a.strip_prefix(['\'', '"']).map(|r| {
+                        r.chars().next().map_or(0, |ch| {
+                            crate::shell::decode_raw_byte(ch)
+                                .map(u32::from)
+                                .unwrap_or(ch as u32)
+                        })
+                    })
                 });
                 let text = match (quoted, kind) {
                     (Some(cc), 2) => c_format(&flags, width, prec, conv, CArg::Float(cc as f64)),

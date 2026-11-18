@@ -268,12 +268,19 @@ pub fn builtin_zformat(words: &[String]) -> i32 {
         }
         let bad = match arg.first() {
             None => true,
-            Some(c) => {
-                matches!(c, '-' | '.' | '%' | ')') || c.is_ascii_digit() || arg.get(1) != Some(&':')
+            Some(&c) => {
+                let single_byte = c.len_utf8() == 1 || crate::shell::decode_raw_byte(c).is_some();
+                !single_byte
+                    || matches!(c, '-' | '.' | '%' | ')')
+                    || c.is_ascii_digit()
+                    || arg.get(1) != Some(&':')
             }
         };
         if bad {
-            builtin_err(name, &format!("invalid spec: {}", a));
+            builtin_err(
+                name,
+                &format!("invalid spec: {}", crate::shell::nice_bytes_str(a)),
+            );
             return 1;
         }
         let key = arg[0];

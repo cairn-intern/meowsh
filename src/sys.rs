@@ -33,15 +33,14 @@ pub fn write_fd(fd: i32, bytes: &[u8]) -> io::Result<()> {
 /// Writes to standard output. Returns false on a write error, which
 /// builtins report as a nonzero status.
 pub fn out(s: &str) -> bool {
-    write_fd(1, s.as_bytes()).is_ok()
+    write_fd(1, &crate::shell::zstr_to_bytes(s)).is_ok()
 }
 
 /// Writes a line to standard error.
 pub fn err_line(s: &str) {
-    let mut line = String::with_capacity(s.len() + 1);
-    line.push_str(s);
-    line.push('\n');
-    let _ = write_fd(2, line.as_bytes());
+    let mut bytes = crate::shell::zstr_to_bytes(s);
+    bytes.push(b'\n');
+    let _ = write_fd(2, &bytes);
 }
 
 /// Duplicates `fd` to the lowest free descriptor >= 10, close-on-exec.
@@ -168,7 +167,7 @@ impl LineReader {
         if bytes.is_empty() {
             None
         } else {
-            Some(String::from_utf8_lossy(&bytes).into_owned())
+            Some(crate::shell::bytes_to_zstr(&bytes))
         }
     }
 }

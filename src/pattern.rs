@@ -186,7 +186,28 @@ fn parse_class(p: &[char], start: usize) -> Option<(bool, Vec<ClassItem>, usize)
     None
 }
 
-fn class_matches(set: &[ClassItem], c: char) -> bool {
+fn raw_byte_state(s: &[char], pos: usize) -> Option<bool> {
+    if crate::shell::is_c_locale() {
+        return None;
+    }
+    crate::shell::decode_raw_byte(s[pos])?;
+    let mut run = Vec::new();
+    for &c in &s[pos..] {
+        if let Some(b) = crate::shell::decode_raw_byte(c) {
+            run.push(b);
+        } else {
+            let mut buf = [0u8; 4];
+            run.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            break;
+        }
+    }
+    match std::str::from_utf8(&run) {
+        Err(e) => Some(e.error_len().is_none()),
+        Ok(_) => None,
+    }
+}
+
+fn class_matches(set: &[ClassItem], c: char, raw_state: Option<bool>) -> bool {
     set.iter().any(|item| match item {
         ClassItem::Char(x) => *x == c,
         ClassItem::Range(lo, hi) => *lo <= c && c <= *hi,
@@ -199,8 +220,8 @@ fn class_matches(set: &[ClassItem], c: char) -> bool {
             "space" => c.is_whitespace(),
             "blank" => c == ' ' || c == '\t',
             "punct" => c.is_ascii_punctuation(),
-            "print" => !c.is_control(),
-            "graph" => !c.is_control() && !c.is_whitespace(),
+            "print" => !c.is_control() && raw_state.is_none(),
+            "graph" => !c.is_control() && !c.is_whitespace() && raw_state.is_none(),
             "cntrl" => c.is_control(),
             "xdigit" => c.is_ascii_hexdigit(),
             // zsh's own classes.
@@ -220,7 +241,8 @@ fn class_matches(set: &[ClassItem], c: char) -> bool {
                         .unwrap_or_default()
                         .contains(c)
             }
-            "INCOMPLETE" | "INVALID" => false,
+            "INCOMPLETE" => raw_state == Some(true),
+            "INVALID" => raw_state == Some(false),
             _ => false,
         },
     })
@@ -244,16 +266,16 @@ fn lower(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
-fn class_fold(set: &[ClassItem], c: char, fold: Fold) -> bool {
-    if class_matches(set, c) {
+fn class_fold(set: &[ClassItem], c: char, fold: Fold, raw_state: Option<bool>) -> bool {
+    if class_matches(set, c, raw_state) {
         return true;
     }
-    if fold == Fold::Exact {
+    if fold == Fold::Exact || raw_state.is_some() {
         return false;
     }
     let l = lower(c);
     let u = c.to_uppercase().next().unwrap_or(c);
-    class_matches(set, l) || class_matches(set, u)
+    class_matches(set, l, None) || class_matches(set, u, None)
 }
 
 // ---- compiling ------------------------------------------------------------
@@ -528,13 +550,14 @@ struct Matcher<'a> {
 }
 
 impl Matcher<'_> {
-    fn one_char(&self, node: &Node, c: char) -> Option<bool> {
+    fn one_char(&self, node: &Node, p: usize) -> Option<bool> {
+        let c = self.s[p];
         match node {
             Node::Lit(x, f, _) => Some(fold_eq(*x, c, *f)),
             Node::Any(_) => Some(true),
             Node::Class {
                 negated, set, fold, ..
-            } => Some(class_fold(set, c, *fold) != *negated),
+            } => Some(class_fold(set, c, *fold, raw_byte_state(self.s, p)) != *negated),
             _ => None,
         }
     }
@@ -554,7 +577,7 @@ impl Matcher<'_> {
         match node {
             Node::Lit(..) | Node::Any(_) | Node::Class { .. } => {
                 for (&p, &e) in from {
-                    if p < len && self.one_char(node, s[p]) == Some(true) {
+                    if p < len && self.one_char(node, p) == Some(true) {
                         add(&mut out, p + 1, e);
                     }
                 }
@@ -678,8 +701,8 @@ impl Matcher<'_> {
                         for (&p, &e) in &cur {
                             if e < budget
                                 && p + 1 < len
-                                && self.one_char(after, s[p]) == Some(true)
-                                && self.one_char(item, s[p + 1]) == Some(true)
+                                && self.one_char(after, p) == Some(true)
+                                && self.one_char(item, p + 1) == Some(true)
                             {
                                 add(&mut t, p + 2, e + 1);
                             }
@@ -858,7 +881,8 @@ impl Pattern {
     }
 
     pub fn new(pattern: &str) -> Self {
-        let p: Vec<char> = pattern.chars().collect();
+        let norm = crate::shell::normalize_zstr(pattern);
+        let p: Vec<char> = norm.chars().collect();
         let mut cx = Ctx {
             ext: crate::options::quick("extendedglob"),
             ksh: crate::options::quick("kshglob"),
@@ -926,14 +950,16 @@ impl Pattern {
     }
 
     pub fn matches(&self, s: &str) -> bool {
-        let chars: Vec<char> = s.chars().collect();
+        let norm = crate::shell::normalize_zstr(s);
+        let chars: Vec<char> = norm.chars().collect();
         self.matches_chars(&chars)
     }
 }
 
 pub fn matches(pattern: &str, s: &str) -> bool {
     let p = Pattern::new(pattern);
-    let chars: Vec<char> = s.chars().collect();
+    let norm = crate::shell::normalize_zstr(s);
+    let chars: Vec<char> = norm.chars().collect();
     let hit = p.matches_chars(&chars);
     if hit && p.records() {
         p.record(&chars, 0, chars.len());

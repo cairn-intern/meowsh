@@ -364,7 +364,10 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
             let _ = std::io::stdout().flush();
             unsafe { libc::_exit(st) }
         }
-        shell_err(&format!("command not found: {}", name));
+        shell_err(&format!(
+            "command not found: {}",
+            crate::shell::nice_str(name)
+        ));
         unsafe { libc::_exit(127) }
     };
     let env_argv0 = argv0
@@ -376,7 +379,7 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
         })
         .flatten();
     let eff_argv0 = argv0.or(env_argv0);
-    let to_c = |s: &str| CString::new(s.as_bytes()).ok();
+    let to_c = |s: &str| CString::new(crate::shell::zstr_to_bytes(s)).ok();
     let (Some(c_path), Some(argv)) = (
         to_c(&path),
         words
@@ -391,7 +394,9 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
     let envp: Vec<CString> = env
         .iter()
         .filter(|(k, _)| !(env_argv0.is_some() && k == "ARGV0"))
-        .filter_map(|(k, v)| CString::new(format!("{}={}", k, v)).ok())
+        .filter_map(|(k, v)| {
+            CString::new(crate::shell::zstr_to_bytes(&format!("{}={}", k, v))).ok()
+        })
         .collect();
     let mut argv_p: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
     argv_p.push(std::ptr::null());
@@ -505,7 +510,8 @@ pub fn file_error(path: &str, errno: i32) -> String {
 }
 
 fn open_file(path: &str, flags: i32) -> Result<i32, String> {
-    let c = CString::new(path).map_err(|_| format!("invalid file name: {}", path))?;
+    let c = CString::new(crate::shell::zstr_to_bytes(path))
+        .map_err(|_| format!("invalid file name: {}", path))?;
     let fd = unsafe { libc::open(c.as_ptr(), flags | libc::O_CLOEXEC, 0o666 as libc::c_uint) };
     if fd < 0 {
         return Err(file_error(path, last_errno()));
@@ -521,8 +527,8 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
             Some(h) => h.body.clone(),
             None => String::new(),
         };
-        let fd =
-            temp_file_with(body.as_bytes()).map_err(|e| Some(format!("here-document: {}", e)))?;
+        let fd = temp_file_with(&crate::shell::zstr_to_bytes(&body))
+            .map_err(|e| Some(format!("here-document: {}", e)))?;
         return Ok(Target::Opened(fd));
     }
     let mut target = expand_string(&r.target).map_err(|_| None)?;
@@ -545,7 +551,7 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
         }
     }
     if r.op == RedirOp::HereStr {
-        let fd = temp_file_with(format!("{}\n", target).as_bytes())
+        let fd = temp_file_with(&crate::shell::zstr_to_bytes(&format!("{}\n", target)))
             .map_err(|e| Some(format!("here-string: {}", e)))?;
         return Ok(Target::Opened(fd));
     }
@@ -4010,7 +4016,7 @@ fn command_subst_in(src: &str) -> (String, i32) {
         }
         break 127;
     };
-    (String::from_utf8_lossy(&bytes).into_owned(), status)
+    (crate::shell::bytes_to_zstr(&bytes), status)
 }
 
 // Descriptors handed out by process substitution, closed once the
@@ -4112,9 +4118,8 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                         with_shell(|s| s.history.lock().map(|h| h.clone()).unwrap_or_default());
                     match crate::history::expand(&l, &hist) {
                         Ok(new) => {
-                            // The expanded line is shown at a terminal.
                             if new != l && unsafe { libc::isatty(0) } == 1 {
-                                let _ = crate::sys::write_fd(2, new.as_bytes());
+                                let _ = crate::sys::write_fd(2, &crate::shell::zstr_to_bytes(&new));
                             }
                             l = new;
                         }

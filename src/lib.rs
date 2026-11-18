@@ -27,6 +27,7 @@ pub mod zmathfunc;
 pub mod zparam;
 pub mod zpty;
 pub mod zregexparse;
+pub mod zstat;
 pub mod zstyle;
 pub mod zsystem;
 pub mod zutil;

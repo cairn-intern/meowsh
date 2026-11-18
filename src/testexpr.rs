@@ -62,7 +62,7 @@ fn is_binary(op: &str) -> bool {
 }
 
 fn access(path: &str, mode: i32) -> bool {
-    match CString::new(path) {
+    match CString::new(crate::shell::zstr_to_bytes(path)) {
         Ok(c) => unsafe { libc::access(c.as_ptr(), mode) == 0 },
         Err(_) => false,
     }
@@ -106,7 +106,9 @@ fn unary(op: &str, arg: &str) -> TResult {
         "-G" => meta()
             .map(|m| m.gid() == unsafe { libc::getegid() })
             .unwrap_or(false),
-        "-N" => meta().map(|m| m.mtime() > m.atime()).unwrap_or(false),
+        "-N" => meta()
+            .map(|m| (m.mtime(), m.mtime_nsec()) >= (m.atime(), m.atime_nsec()))
+            .unwrap_or(false),
         "-t" => {
             let fd: i32 = arg
                 .trim()
@@ -182,7 +184,10 @@ fn int(s: &str) -> Result<i64, String> {
 }
 
 fn regex_match(s: &str, re: &str) -> TResult {
-    let (Ok(cs), Ok(cre)) = (CString::new(s), CString::new(re)) else {
+    let (Ok(cs), Ok(cre)) = (
+        CString::new(crate::shell::zstr_to_bytes(s)),
+        CString::new(crate::shell::zstr_to_bytes(re)),
+    ) else {
         return Ok(false);
     };
     unsafe {
@@ -230,7 +235,11 @@ fn regex_groups(re: &str) -> usize {
 // `[[ s =~ re ]]`: on a match, zsh sets $MATCH, $MBEGIN, $MEND and
 // $match, $mbegin, $mend for the groups (1-based character offsets).
 fn regex_match_set(s: &str, re: &str) -> TResult {
-    let (Ok(cs), Ok(cre)) = (CString::new(s), CString::new(re)) else {
+    let sb = crate::shell::zstr_to_bytes(s);
+    let (Ok(cs), Ok(cre)) = (
+        CString::new(sb.as_slice()),
+        CString::new(crate::shell::zstr_to_bytes(re)),
+    ) else {
         return Ok(false);
     };
     unsafe {
@@ -251,9 +260,8 @@ fn regex_match_set(s: &str, re: &str) -> TResult {
         if r != 0 {
             return Ok(false);
         }
-        let bytes = s.as_bytes();
-        let chars_to = |b: usize| String::from_utf8_lossy(&bytes[..b]).chars().count();
-        let part = |b: usize, e: usize| String::from_utf8_lossy(&bytes[b..e]).into_owned();
+        let chars_to = |b: usize| crate::shell::bytes_to_zstr(&sb[..b]).chars().count();
+        let part = |b: usize, e: usize| crate::shell::bytes_to_zstr(&sb[b..e]);
         let (b0, e0) = (m[0].rm_so as usize, m[0].rm_eo as usize);
         crate::shell::var_set("MATCH", &part(b0, e0), false);
         crate::shell::var_set("MBEGIN", &(chars_to(b0) + 1).to_string(), false);

@@ -184,6 +184,10 @@ const DESCS: &[ModDesc] = &[
         features: Some(&["b:limit", "b:ulimit", "b:unlimit"]),
     },
     ModDesc {
+        name: "zsh/stat",
+        features: Some(&["b:stat", "b:zstat"]),
+    },
+    ModDesc {
         name: "zsh/system",
         features: Some(&[
             "b:syserror",

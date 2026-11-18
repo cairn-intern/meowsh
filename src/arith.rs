@@ -225,7 +225,13 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
         // `##c` (or `#\c`): the character code of c; `#name`: of the
         // first character of $name.
         if ch == '#' {
-            let code = |x: Option<&char>| x.map(|&x| x as i64);
+            let code = |x: Option<&char>| {
+                x.map(|&x| {
+                    crate::shell::decode_raw_byte(x)
+                        .map(i64::from)
+                        .unwrap_or(x as i64)
+                })
+            };
             if matches!(c.get(i + 1), Some('#' | '\\')) {
                 let mut k = i + 2;
                 // `##\C-a` (control) and `##\M-a` (meta), as bindkey reads them.
@@ -268,10 +274,11 @@ fn tokenize(s: &str) -> Result<(Vec<T>, Vec<usize>), String> {
                     i += 1;
                 }
                 let name: String = c[start..i].iter().collect();
-                let v = crate::shell::var_get(&name)
-                    .chars()
-                    .next()
-                    .map_or(0, |x| x as i64);
+                let v = crate::shell::var_get(&name).chars().next().map_or(0, |x| {
+                    crate::shell::decode_raw_byte(x)
+                        .map(i64::from)
+                        .unwrap_or(x as i64)
+                });
                 out.push(T::Num(Num::I(v)));
                 continue;
             }

@@ -145,7 +145,7 @@ and builtins include:
   (`sysread`, `sysopen`, `zsystem flock`, ...), zsh/mathfunc,
   zsh/parameter (assigning to `$functions` defines functions;
   `$funcsourcetrace`, `$functions_source`), zsh/param/private (`private`,
-  `local -P`), zsh/random and the completion modules. `zmodload`
+  `local -P`), zsh/stat (`zstat`, `stat`), zsh/random and the completion modules. `zmodload`
   tracks them as zsh does (features, `-F`, autoloads, `-u`); a module's
   builtins work without loading it until `zmodload` is given that
   module. Loading one meowsh does not have (zsh/pcre, zsh/db/gdbm,
