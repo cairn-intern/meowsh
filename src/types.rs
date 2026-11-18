@@ -146,6 +146,8 @@ pub struct Shell {
     // startup).
     pub source_file: Option<String>,
     pub script_name: String,
+    // Command hash table for $PATH lookups (zsh `hash` / `rehash` / `$commands`).
+    pub cmd_hash: HashMap<String, String>,
 }
 
 impl Shell {
@@ -203,6 +205,7 @@ impl Shell {
             coproc: None,
             source_file: None,
             script_name: "zsh".to_string(),
+            cmd_hash: HashMap::new(),
         }
     }
 

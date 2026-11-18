@@ -49,11 +49,20 @@ pub fn ensure(name: &str) {
                 .filter(|b| crate::builtins::is_builtin(b))
                 .map(|b| (b.to_string(), "defined".to_string())),
         ),
-        "commands" => assoc(
-            crate::shell::all_commands()
-                .into_iter()
-                .filter_map(|c| crate::shell::find_command(&c).map(|p| (c, p))),
-        ),
+        "commands" => {
+            if crate::options::is_set("hashlistall") {
+                for c in crate::shell::all_commands() {
+                    crate::shell::lookup_command(&c);
+                }
+            }
+            let map = with_shell(|s| {
+                s.cmd_hash
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            });
+            Value::Assoc(map)
+        }
         "parameters" => {
             let names: Vec<String> = with_shell(|s| s.params.keys().cloned().collect());
             assoc(

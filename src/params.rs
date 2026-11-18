@@ -240,6 +240,9 @@ impl Shell {
 
     pub fn remove_param(&mut self, name: &str) -> Option<Param> {
         let p = self.params.remove(name)?;
+        if matches!(name, "PATH" | "path") {
+            self.cmd_hash.clear();
+        }
         // Unsetting one side of a tie unsets the other (zsh unties them).
         if let Some((other, _)) = &p.tie {
             if let Some(o) = self.params.get_mut(other) {
@@ -251,6 +254,9 @@ impl Shell {
 
     /// Re-derives the tied partner of `name` from its value.
     pub fn sync_tie(&mut self, name: &str) {
+        if matches!(name, "PATH" | "path") {
+            self.cmd_hash.clear();
+        }
         if crate::zle::params::is_linked(name) {
             crate::zle::params::reconcile(self, name);
             return;
@@ -481,11 +487,18 @@ impl Shell {
         }
     }
 
-    pub fn pop_scope(&mut self) {
+    pub fn pop_scope(&mut self) -> bool {
         let Some(scope) = self.local_scopes.pop() else {
-            return;
+            return false;
         };
+        let mut cursor_form_changed = false;
         for (name, prev) in scope {
+            if name == "CURSOR_FORM" {
+                cursor_form_changed = true;
+            }
+            if matches!(name.as_str(), "PATH" | "path") {
+                self.cmd_hash.clear();
+            }
             match prev {
                 Some(p) => {
                     self.params.insert(name, p);
@@ -503,6 +516,9 @@ impl Shell {
         // over whatever the inner code left in their place.
         while self.private_stash.last().is_some_and(|e| e.0 == depth) {
             let (_, name, p) = self.private_stash.pop().unwrap();
+            if name == "CURSOR_FORM" {
+                cursor_form_changed = true;
+            }
             let under = self
                 .params
                 .remove(&name)
@@ -512,6 +528,7 @@ impl Shell {
             }
             self.params.insert(name, p);
         }
+        cursor_form_changed
     }
 }
 

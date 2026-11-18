@@ -176,6 +176,7 @@ fn lookup(name: &str) -> Val {
             }
             return Val::Unset;
         }
+        crate::zparam::ensure(name);
     }
     match name {
         "@" => return Val::List(pos_params(), false),
@@ -580,7 +581,17 @@ pub fn dynamic_dir(kind: char, arg: &str) -> Option<Vec<String>> {
         with_shell(|s| {
             s.remove_param("reply");
         });
+        let saved_icf = crate::zle::with_active(|z| {
+            let icf = z.comp.incompfunc;
+            z.comp.incompfunc = 0;
+            icf
+        });
         let st = crate::exec::call_function(&body, &[f, kind.to_string(), arg.to_string()], line);
+        if let Some(icf) = saved_icf {
+            crate::zle::with_active(|z| {
+                z.comp.incompfunc = icf;
+            });
+        }
         let reply = with_shell(|s| {
             let r = s
                 .array("reply")
@@ -1578,6 +1589,10 @@ impl SubSearch {
     }
 }
 
+pub fn has_subscript_flag(sub: &str) -> bool {
+    parse_sub_flags(sub).is_some()
+}
+
 fn parse_sub_flags(sub: &str) -> Option<(SubSearch, &str)> {
     let rest = sub.strip_prefix('(')?;
     let chars: Vec<char> = rest.chars().collect();
@@ -1976,8 +1991,35 @@ fn keys_subscript_value(name: &str, sub: &str) -> ExpResult<Val> {
     if resolved.contains('[') {
         return param_value(name, Some(sub));
     }
+    if resolved == "functions" && !with_shell(|s| s.assoc("functions").is_some()) {
+        let k = assoc_key(sub)?;
+        return Ok(if with_shell(|s| s.functions.contains_key(&k)) {
+            Val::Str(k)
+        } else {
+            Val::Unset
+        });
+    }
+    if resolved == "commands"
+        && crate::modules::feature_available("p:commands")
+        && with_shell(|s| {
+            s.param("commands")
+                .is_none_or(|p| p.attrs & crate::params::SPECIAL != 0 && p.level == 0)
+        })
+    {
+        let k = assoc_key(sub)?;
+        return Ok(if crate::shell::lookup_command(&k).is_some() {
+            Val::Str(k)
+        } else {
+            Val::Unset
+        });
+    }
     if assoc_keys(&resolved).is_some() {
-        return Ok(Val::Str(assoc_key(sub)?));
+        let k = assoc_key(sub)?;
+        return Ok(if assoc_get(&resolved, &k).is_some() {
+            Val::Str(k)
+        } else {
+            Val::Unset
+        });
     }
     if let Some(items) = with_shell(|s| s.array(&resolved).cloned()) {
         let subc: Vec<char> = sub.chars().collect();
@@ -2056,9 +2098,15 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
             },
         );
     }
-    if name == "commands" && !with_shell(|s| s.assoc("commands").is_some()) {
+    if name == "commands"
+        && crate::modules::feature_available("p:commands")
+        && with_shell(|s| {
+            s.param("commands")
+                .is_none_or(|p| p.attrs & crate::params::SPECIAL != 0 && p.level == 0)
+        })
+    {
         let key = assoc_key(sub)?;
-        return Ok(match crate::shell::find_command(&key) {
+        return Ok(match crate::shell::lookup_command(&key) {
             Some(p) => Val::Str(p),
             None => Val::Unset,
         });
@@ -2817,8 +2865,8 @@ fn quote_minimal(s: &str, plus: bool) -> String {
     let special = |k: usize, c: char| {
         c == '\''
             || c.is_whitespace()
-            || "|&;<>()$`\\\"*?[]#%^!".contains(c)
-            || (matches!(c, '~' | '=') && k == 0)
+            || "|&;<>()$`\\\"*?[]#^!=".contains(c)
+            || (c == '~' && k == 0)
     };
     if !s.chars().enumerate().any(|(k, c)| special(k, c)) {
         return s.to_string();

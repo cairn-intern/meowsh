@@ -370,7 +370,10 @@ fn resolve(ident: &str) -> Result<String, String> {
     };
     let sub = sub.strip_suffix(']').unwrap_or(sub);
     let target = crate::shell::split_target_pub(&crate::shell::resolve_ref(name));
-    if crate::shell::with_shell(|s| s.assoc(&target).is_some()) || matches!(sub, "@" | "*") {
+    if crate::shell::with_shell(|s| s.assoc(&target).is_some())
+        || matches!(sub, "@" | "*")
+        || crate::expand::has_subscript_flag(sub)
+    {
         return Ok(ident.to_string());
     }
     let n = eval_num(sub)?.as_int();

@@ -1104,6 +1104,9 @@ fn typeset_single(
             p.attrs |= on & READONLY;
         }
     });
+    if base_name == "CURSOR_FORM" && !has_value(&asg) {
+        crate::zle::termctl::cursor_form_param_changed();
+    }
     true
 }
 
@@ -1424,11 +1427,31 @@ pub fn quote_value(s: &str) -> String {
         out.push('\'');
         return out;
     }
-    let special = |c: char| "#$^*()=|{}[]`<>?~;&\n\t \\'\"!%".contains(c);
+    let special = |c: char| "#$^*()=|{}[]`<>?~;&\n\t \\'\"!".contains(c);
     if !s.chars().any(special) {
         return s.to_string();
     }
-    format!("'{}'", s.replace('\'', "'\\''"))
+    let mut out = String::new();
+    let mut inquote = false;
+    for c in s.chars() {
+        if c == '\'' {
+            if inquote {
+                out.push('\'');
+                inquote = false;
+            }
+            out.push_str("\\'");
+        } else {
+            if !inquote {
+                out.push('\'');
+                inquote = true;
+            }
+            out.push(c);
+        }
+    }
+    if inquote {
+        out.push('\'');
+    }
+    out
 }
 
 /// The value of a scalar as `$name` shows it: numbers formatted, case

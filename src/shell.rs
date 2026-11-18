@@ -1133,6 +1133,10 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
     }
     p.value = Value::Scalar(value);
     shell.sync_tie(name);
+    drop(shell);
+    if name == "CURSOR_FORM" {
+        crate::zle::termctl::cursor_form_param_changed();
+    }
     true
 }
 
@@ -1614,7 +1618,10 @@ pub fn push_scope() {
 }
 
 pub fn pop_scope() {
-    SHELL.shell.lock().unwrap().pop_scope();
+    let changed = SHELL.shell.lock().unwrap().pop_scope();
+    if changed {
+        crate::zle::termctl::cursor_form_param_changed();
+    }
 }
 
 /// Enters a function call's scope (which hides private parameters).
@@ -2361,6 +2368,24 @@ pub fn find_command(name: &str) -> Option<String> {
     }
 
     find_command_in(name, &var_get("PATH"))
+}
+
+/// Looks up `name` in the command hash table, searching `$PATH` and
+/// caching when `HASH_CMDS` is set.
+pub fn lookup_command(name: &str) -> Option<String> {
+    if name.contains('/') {
+        return find_command(name);
+    }
+    if let Some(p) = with_shell(|s| s.cmd_hash.get(name).cloned()) {
+        return Some(p);
+    }
+    let found = find_command(name)?;
+    if crate::options::is_set("hashcmds") {
+        with_shell(|s| {
+            s.cmd_hash.insert(name.to_string(), found.clone());
+        });
+    }
+    Some(found)
 }
 
 /// `find_command` searching the directories of `path`.

@@ -562,12 +562,24 @@ impl Lexer {
             return None;
         }
         let mut depth = 0;
+        let mut quote: Option<char> = None;
         let mut i = start;
         while i < self.chars.len() {
             let c = self.chars[i];
+            if let Some(q) = quote {
+                if c == q {
+                    quote = None;
+                } else if q == '"' && c == '\\' {
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
             match c {
                 '\\' => i += 1,
+                '\'' | '"' => quote = Some(c),
                 '(' => depth += 1,
+                ')' if depth == 0 => break,
                 ')' => depth -= 1,
                 ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' if depth == 0 => break,
                 '\n' => return None,
@@ -575,7 +587,7 @@ impl Lexer {
             }
             i += 1;
         }
-        if depth != 0 {
+        if depth != 0 || quote.is_some() {
             return None;
         }
         let word: String = self.chars[start..i.min(self.chars.len())].iter().collect();
@@ -883,7 +895,10 @@ impl Lexer {
             }
         }
 
-        if c == '(' && self.chars.get(self.pos + 1) == Some(&'(') {
+        if c == '('
+            && self.chars.get(self.pos + 1) == Some(&'(')
+            && self.pos.checked_sub(1).and_then(|p| self.chars.get(p)) != Some(&'=')
+        {
             if let Some(t) = self.try_arith()? {
                 return Ok(t);
             }

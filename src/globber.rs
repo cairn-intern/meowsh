@@ -93,14 +93,23 @@ fn byte_offset_for_items(s: &str, item_idx: usize) -> usize {
 /// Splits trailing qualifiers off expanded `(char, quoted)` pieces, preserving
 /// quoted vs unquoted delimiter semantics for `(e...)` and `(#q...)`.
 pub fn split_qualifiers_items(items: &[(char, bool)]) -> Result<(usize, Option<Quals>), String> {
-    if items.last() != Some(&(')', false)) {
+    if items.last() != Some(&(')', false)) || crate::builtins::is_disabled('p', "(") {
         return Ok((items.len(), None));
     }
-    let mut depth = 0;
+    let extglob = crate::options::is_set("extendedglob");
+    let mut bare_disallowed = !crate::options::is_set("bareglobqual");
+    let bar_enabled = !crate::builtins::is_disabled('p', "|");
+    let tilde_enabled = extglob && !crate::builtins::is_disabled('p', "~");
+    let mut depth = 1usize;
     let mut open = None;
-    for k in (0..items.len()).rev() {
+    for k in (0..items.len() - 1).rev() {
         match items[k] {
-            (')', false) => depth += 1,
+            (')', false) => {
+                depth += 1;
+                bare_disallowed = true;
+            }
+            ('|', false) if bar_enabled => bare_disallowed = true,
+            ('~', false) if tilde_enabled => bare_disallowed = true,
             ('(', false) => {
                 depth -= 1;
                 if depth == 0 {
@@ -115,22 +124,21 @@ pub fn split_qualifiers_items(items: &[(char, bool)]) -> Result<(usize, Option<Q
         return Ok((items.len(), None));
     };
     let inner = &items[open + 1..items.len() - 1];
-    let explicit_q = matches!(inner.get(..2), Some([('#', false), ('q', false)]));
-    let body = if explicit_q {
-        &inner[2..]
-    } else if !crate::options::is_set("bareglobqual")
-        || inner.iter().any(|&(c, q)| c == '|' && !q)
-        || matches!(inner.first(), Some(&('#', _)))
+    let body = if extglob
+        && !crate::builtins::is_disabled('p', "#")
+        && matches!(inner.first(), Some(&('#', false)))
     {
+        if inner.get(1) == Some(&('q', false)) {
+            &inner[2..]
+        } else {
+            return Ok((items.len(), None));
+        }
+    } else if bare_disallowed {
         return Ok((items.len(), None));
     } else {
         inner
     };
-    match parse_quals_items(body) {
-        Ok(q) => Ok((open, Some(q))),
-        Err(msg) if explicit_q => Err(msg),
-        Err(_) => Ok((items.len(), None)),
-    }
+    Ok((open, Some(parse_quals_items(body)?)))
 }
 
 // A qualifier argument: text between a delimiter and its partner

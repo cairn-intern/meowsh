@@ -129,10 +129,10 @@ pub fn abort_command(status: i32) -> i32 {
 fn expansion_failed(e: ExpError) -> i32 {
     with_shell(|s| {
         if s.flow == Flow::None {
+            s.error_exit = true;
             s.flow = if s.interactive {
                 Flow::Interrupt
             } else {
-                s.error_exit = true;
                 Flow::Exit(e.status)
             };
         }
@@ -1759,7 +1759,8 @@ fn exec_node_inner(node: &Node) -> i32 {
             set_flow(Flow::None);
             // TRY_BLOCK_ERROR: 1 in the cleanup after an error; setting it
             // to 0 there cancels the error.
-            let is_error = matches!(pending, Flow::Exit(_)) && with_shell(|s| s.error_exit);
+            let is_error =
+                matches!(pending, Flow::Exit(_) | Flow::Interrupt) && with_shell(|s| s.error_exit);
             let saved = crate::shell::var_get_opt("TRY_BLOCK_ERROR");
             crate::shell::without_assign_warnings(|| {
                 crate::shell::var_set("TRY_BLOCK_ERROR", if is_error { "1" } else { "0" }, false)
@@ -4167,7 +4168,10 @@ pub fn run_input(mut next: impl FnMut(bool) -> InputLine, mut on_command: impl F
                         Flow::Exit(n) => return n,
                         Flow::None => {}
                         Flow::Interrupt => {
-                            set_flow(Flow::None);
+                            with_shell(|s| {
+                                s.flow = Flow::None;
+                                s.error_exit = false;
+                            });
                             buf.clear();
                             break;
                         }

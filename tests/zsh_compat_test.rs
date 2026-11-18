@@ -1735,3 +1735,37 @@ fn prompt_xtrace_brace_and_func_quoting() {
     assert_eq!(st2, 1);
     assert!(err2.contains("unmatched \""), "err2={:?}", err2);
 }
+
+#[test]
+fn modules_commands_quote_subscript_and_eval_error_compat() {
+    // V01zmodload: autoloaded readonly module params report read-only on unset.
+    let (st, out, err) = sh("unset builtins 2>&1; print \"st=$?\"; \
+         zmodload -F zsh/parameter -p:builtins; unset builtins; print \"u=$?\"");
+    assert_eq!(st, 0, "err={:?}", err);
+    assert!(
+        out.contains("read-only") && out.ends_with("st=1\nu=0\n"),
+        "out={:?} err={:?}",
+        out,
+        err
+    );
+
+    // V06parameter: $commands respects hashcmds and rehash.
+    let (_, out, _) = sh(
+        "print ${+commands[sh]}; unsetopt hashcmds; PATH=/nonexistent; \
+         rehash; print \"${+commands[sh]} ${#commands}\"",
+    );
+    assert_eq!(out, "1\n0 0\n");
+
+    // V12zparseopts & Y01completion: (q+) quotes `=` anywhere, not `%`, and `quote_value` wraps `'`.
+    let (_, out, _) = sh(
+        "a=('--foo=' '%pct' \"a'b\"); print -rl -- ${(q+)a}; \
+         b=(\"a'b\"); typeset -p b; \
+         f() { :; }; print \"<${(k)functions[f]}>|<${(k)functions[missing]}>\"; \
+         argv=(a - b); (( minus = argv[(ib:2:)-] )); print \"m=$minus\"; \
+         setopt bareglobqual nullglob; g() { eval local \"x;x=(( a b ))\"; print \"after=$? +x=$+x t=${(t)x}\"; }; g",
+    );
+    assert_eq!(
+        out,
+        "'--foo='\n%pct\n'a'\\''b'\ntypeset -a b=( 'a'\\''b' )\n<f>|<>\nm=2\nafter=1 +x=1 t=scalar-local\n"
+    );
+}

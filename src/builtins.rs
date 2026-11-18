@@ -556,9 +556,16 @@ fn builtin_eval(words: &[String]) -> i32 {
     with_shell(|s| {
         if s.error_exit {
             s.error_exit = false;
-            if let Flow::Exit(code) = s.flow {
-                s.flow = Flow::None;
-                return code;
+            match s.flow {
+                Flow::Exit(code) => {
+                    s.flow = Flow::None;
+                    return code;
+                }
+                Flow::Interrupt => {
+                    s.flow = Flow::None;
+                    return if st == 0 { 1 } else { st };
+                }
+                _ => {}
             }
         }
         st
@@ -900,6 +907,7 @@ fn builtin_unset(words: &[String]) -> i32 {
         {
             continue;
         }
+        crate::zparam::ensure(a.as_str());
         let readonly = with_shell(|s| {
             s.param(a.as_str())
                 .is_some_and(|p| p.attrs & VAR_READONLY != 0)
@@ -964,6 +972,9 @@ fn builtin_unset(words: &[String]) -> i32 {
                 }
             }
         });
+        if a == "CURSOR_FORM" {
+            crate::zle::termctl::cursor_form_param_changed();
+        }
     }
     status
 }
@@ -2985,10 +2996,21 @@ fn builtin_hash(words: &[String]) -> i32 {
     let has = |c| flags.contains(c);
     let args = &words[i..];
     if !has('d') {
+        if has('r') || has('f') {
+            if has('r') {
+                with_shell(|s| s.cmd_hash.clear());
+            }
+            if args.is_empty() {
+                return 0;
+            }
+        }
         let mut status = 0;
         for name in args {
-            let name = name.split_once('=').map_or(name.as_str(), |(n, _)| n);
-            if find_command(name).is_none() && !is_builtin(name) {
+            if let Some((k, v)) = name.split_once('=') {
+                with_shell(|s| {
+                    s.cmd_hash.insert(k.to_string(), v.to_string());
+                });
+            } else if crate::shell::lookup_command(name).is_none() && !is_builtin(name) {
                 builtin_err("hash", &format!("{}: not found", name));
                 status = 1;
             }

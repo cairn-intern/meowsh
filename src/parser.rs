@@ -856,16 +856,7 @@ impl Parser {
                             self.next()?;
                             if self.peek_is_op("(")? {
                                 self.next()?;
-                                let mut items = Vec::new();
-                                loop {
-                                    match self.next()? {
-                                        Tok::Op(")") => break,
-                                        Tok::Newline => continue,
-                                        Tok::Word(x) => items.push(x),
-                                        Tok::Eof => return Err(self.eof_error("`)'")),
-                                        t => return Err(self.unexpected(&t)),
-                                    }
-                                }
+                                let items = self.parse_array_items()?;
                                 cmd.decl_arrays.push((cmd.words.len(), items));
                             }
                             cmd.words.push(w);
@@ -920,16 +911,7 @@ impl Parser {
                     // `name=(...)` array literal.
                     if value.is_empty() && self.peek_is_op("(")? {
                         self.next()?;
-                        let mut items = Vec::new();
-                        loop {
-                            match self.next()? {
-                                Tok::Op(")") => break,
-                                Tok::Newline => continue,
-                                Tok::Word(w) => items.push(w),
-                                Tok::Eof => return Err(self.eof_error("`)'")),
-                                t => return Err(self.unexpected(&t)),
-                            }
-                        }
+                        let items = self.parse_array_items()?;
                         cmd.assigns.push(Assign {
                             name,
                             subscript,
@@ -1011,6 +993,31 @@ impl Parser {
             return Err(self.unexpected(&t));
         }
         Ok(Node::Simple(cmd))
+    }
+
+    /// Reads elements of an `(...)` array literal after the opening `(`.
+    fn parse_array_items(&mut self) -> PResult<Vec<String>> {
+        let mut items = Vec::new();
+        loop {
+            if self.peek_is_op("(")? && !self.peeked_queued && !self.lex.next_after_blanks_is(")") {
+                self.peeked = None;
+                match self.lex.glob_word_after_paren() {
+                    Some(w) => {
+                        items.push(w);
+                        continue;
+                    }
+                    None => return Err(ParseError::Syntax("parse error near `('".into())),
+                }
+            }
+            match self.next()? {
+                Tok::Op(")") => break,
+                Tok::Newline => continue,
+                Tok::Word(w) => items.push(w),
+                Tok::Eof => return Err(self.eof_error("`)'")),
+                t => return Err(self.unexpected(&t)),
+            }
+        }
+        Ok(items)
     }
 
     // function name [()] compound-command
