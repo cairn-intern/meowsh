@@ -1888,3 +1888,13 @@ fn zwc_compile_and_invalid_description_compat() {
     assert_eq!(out2, "from_src:fallback\n", "err={:?}", err2);
     assert!(err2.contains("invalid description:"), "err={:?}", err2);
 }
+
+#[test]
+fn nofork_stdout_parse_wrapper_lineno_and_comment_compat() {
+    let (st, out, err) = sh(
+        "setopt ignorebraces interactivecomments\neval 'echo ${ echo hi # comment\n}'\neval 'echo ${ { echo nested } } DONE'\n",
+    );
+    assert_eq!(st, 1, "out={:?} err={:?}", out, err);
+    assert_eq!(out, "hi\n");
+    assert_eq!(err, "(eval):3: parse error near `}'\n");
+}

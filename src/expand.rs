@@ -3855,14 +3855,33 @@ fn nofork(body: &[char], quoted: bool) -> ExpResult<Option<Val>> {
         _ => return Ok(None),
     };
     let code: String = code.iter().collect();
-    // A syntax error in the body is an error of the command using it.
-    let mut parser = crate::parser::Parser::new(&code, true);
+    // Wrap `${ ... }` as zsh does (`{| ...\n}` / `{\n...\n;}`) so trailing
+    // comments and closing-brace line numbers match `parse_string(..., 0)`.
+    let parse_src = if matches!(kind, Kind::Stdout) {
+        format!("{{\n{}\n;}}", code)
+    } else {
+        code.clone()
+    };
+    let mut parser = crate::parser::Parser::new(&parse_src, true);
     loop {
         match parser.parse_complete_command() {
             Ok(Some(_)) => {}
             Ok(None) => break,
-            Err(crate::parser::ParseError::Syntax(m)) => return fail(&m),
-            Err(crate::parser::ParseError::Incomplete) => return fail("closing brace expected"),
+            Err(e) => {
+                let msg = match e {
+                    crate::parser::ParseError::Syntax(m) => m,
+                    crate::parser::ParseError::Incomplete => "closing brace expected".to_string(),
+                };
+                let delta = parser.line().saturating_sub(1);
+                let saved = crate::shell::with_err_ctx(|ctx| {
+                    let prev = ctx.lineno;
+                    ctx.lineno = prev.saturating_add(delta);
+                    prev
+                });
+                let res = fail(&msg);
+                crate::shell::with_err_ctx(|ctx| ctx.lineno = saved);
+                return res;
+            }
         }
     }
     let capture = match kind {

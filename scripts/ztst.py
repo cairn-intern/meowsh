@@ -223,8 +223,10 @@ def split_exclusion(p):
 def matches(expected, actual, pattern):
     if not pattern:
         return expected == actual
-    el = expected.split("\n")
-    al = actual.split("\n")
+    # Test/ztst.zsh reads files via `"${(f@)$(<file)}"`, which strips
+    # trailing newlines before splitting into lines (`""` -> `[""]`).
+    el = expected.rstrip("\n").split("\n")
+    al = actual.rstrip("\n").split("\n")
     if len(el) != len(al):
         return False
     for e, a in zip(el, al):
