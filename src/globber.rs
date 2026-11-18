@@ -50,20 +50,58 @@ enum Test {
 /// Splits a trailing qualifier group `(...)` off `pattern`. A final group
 /// counts as qualifiers when it has no `|`, as with zsh's BARE_GLOB_QUAL.
 pub fn split_qualifiers(pattern: &str) -> (&str, Option<Quals>) {
-    let chars: Vec<char> = pattern.chars().collect();
-    if chars.last() != Some(&')') {
-        return (pattern, None);
+    let items = unescaped_items(pattern);
+    match split_qualifiers_items(&items) {
+        Ok((split, Some(q))) => {
+            let byte_open = byte_offset_for_items(pattern, split);
+            (&pattern[..byte_open], Some(q))
+        }
+        _ => (pattern, None),
     }
-    // The `(` matching the final `)`.
+}
+
+fn unescaped_items(s: &str) -> Vec<(char, bool)> {
+    let mut out = Vec::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push((n, true));
+                continue;
+            }
+        }
+        out.push((c, false));
+    }
+    out
+}
+
+fn byte_offset_for_items(s: &str, item_idx: usize) -> usize {
+    let mut chars = s.char_indices();
+    let mut count = 0;
+    while count < item_idx {
+        let Some((_, c)) = chars.next() else {
+            return s.len();
+        };
+        if c == '\\' {
+            let _ = chars.next();
+        }
+        count += 1;
+    }
+    chars.next().map(|(idx, _)| idx).unwrap_or(s.len())
+}
+
+/// Splits trailing qualifiers off expanded `(char, quoted)` pieces, preserving
+/// quoted vs unquoted delimiter semantics for `(e...)` and `(#q...)`.
+pub fn split_qualifiers_items(items: &[(char, bool)]) -> Result<(usize, Option<Quals>), String> {
+    if items.last() != Some(&(')', false)) {
+        return Ok((items.len(), None));
+    }
     let mut depth = 0;
     let mut open = None;
-    let mut k = chars.len();
-    while k > 0 {
-        k -= 1;
-        let escaped = k > 0 && chars[k - 1] == '\\';
-        match chars[k] {
-            ')' if !escaped => depth += 1,
-            '(' if !escaped => {
+    for k in (0..items.len()).rev() {
+        match items[k] {
+            (')', false) => depth += 1,
+            ('(', false) => {
                 depth -= 1;
                 if depth == 0 {
                     open = Some(k);
@@ -73,30 +111,37 @@ pub fn split_qualifiers(pattern: &str) -> (&str, Option<Quals>) {
             _ => {}
         }
     }
-    // A word that is all `(...)` is qualifiers on an empty pattern, as
-    // in zsh (`$^x(N)` with x=('')).
     let Some(open) = open else {
-        return (pattern, None);
+        return Ok((items.len(), None));
     };
-    let inner: String = chars[open + 1..chars.len() - 1].iter().collect();
-    // Without BARE_GLOB_QUAL only `(#q...)` holds qualifiers.
-    let inner = match inner.strip_prefix("#q") {
-        Some(rest) => rest.to_string(),
-        None if !crate::options::is_set("bareglobqual") => return (pattern, None),
-        None if inner.contains('|') || inner.starts_with('#') => return (pattern, None),
-        None => inner,
+    let inner = &items[open + 1..items.len() - 1];
+    let explicit_q = matches!(inner.get(..2), Some([('#', false), ('q', false)]));
+    let body = if explicit_q {
+        &inner[2..]
+    } else if !crate::options::is_set("bareglobqual")
+        || inner.iter().any(|&(c, q)| c == '|' && !q)
+        || matches!(inner.first(), Some(&('#', _)))
+    {
+        return Ok((items.len(), None));
+    } else {
+        inner
     };
-    let byte_open: usize = chars[..open].iter().map(|c| c.len_utf8()).sum();
-    match parse_quals(&inner) {
-        Some(q) => (&pattern[..byte_open], Some(q)),
-        None => (pattern, None),
+    match parse_quals_items(body) {
+        Ok(q) => Ok((open, Some(q))),
+        Err(msg) if explicit_q => Err(msg),
+        Err(_) => Ok((items.len(), None)),
     }
 }
 
 // A qualifier argument: text between a delimiter and its partner
 // (`(`, `[`, `{`, `<` pair up; anything else closes itself).
-fn delimited(chars: &[char], i: &mut usize) -> Option<String> {
-    let open = *chars.get(*i)?;
+// Unquoted delimiters only close on unquoted matching delimiters (matching
+// zsh's tokenized `ctok` in `get_strarg`); quoted delimiters close on the
+// matching character regardless of quoting.
+fn delimited_items(chars: &[(char, bool)], i: &mut usize) -> Result<String, String> {
+    let &(open, open_quoted) = chars
+        .get(*i)
+        .ok_or_else(|| "missing delimiter".to_string())?;
     let close = match open {
         '(' => ')',
         '[' => ']',
@@ -104,36 +149,26 @@ fn delimited(chars: &[char], i: &mut usize) -> Option<String> {
         '<' => '>',
         c => c,
     };
-    // Quoted characters arrive backslash-escaped: skip them, and drop
-    // the escapes from the text.
     let mut out = String::new();
     let mut k = *i + 1;
     while k < chars.len() {
-        match chars[k] {
-            '\\' if k + 1 < chars.len() => {
-                out.push(chars[k + 1]);
-                k += 2;
-            }
-            c if c == close => {
-                *i = k + 1;
-                return Some(out);
-            }
-            c => {
-                out.push(c);
-                k += 1;
-            }
+        let (c, quoted) = chars[k];
+        if c == close && (open_quoted || !quoted) {
+            *i = k + 1;
+            return Ok(out);
         }
+        out.push(c);
+        k += 1;
     }
-    None
+    Err("missing end of string".to_string())
 }
 
-fn parse_quals(s: &str) -> Option<Quals> {
+fn parse_quals_items(chars: &[(char, bool)]) -> Result<Quals, String> {
     let mut q = Quals::default();
-    let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     let mut negate = false;
     while i < chars.len() {
-        let c = chars[i];
+        let (c, _) = chars[i];
         i += 1;
         let test = match c {
             'N' => {
@@ -142,7 +177,7 @@ fn parse_quals(s: &str) -> Option<Quals> {
             }
             // Modifiers end the qualifiers.
             ':' => {
-                q.modifiers = chars[i - 1..].iter().collect();
+                q.modifiers = chars[i - 1..].iter().map(|&(ch, _)| ch).collect();
                 break;
             }
             'D' => {
@@ -154,45 +189,56 @@ fn parse_quals(s: &str) -> Option<Quals> {
                 continue;
             }
             'e' => {
-                q.code.push(delimited(&chars, &mut i)?);
+                q.code.push(delimited_items(chars, &mut i)?);
                 continue;
             }
             '+' => {
                 let start = i;
                 while chars
                     .get(i)
-                    .is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .is_some_and(|&(c, _)| c.is_alphanumeric() || c == '_' || c == '-')
                 {
                     i += 1;
                 }
-                q.code.push(chars[start..i].iter().collect());
+                q.code
+                    .push(chars[start..i].iter().map(|&(c, _)| c).collect());
                 continue;
             }
             'P' => {
-                q.prepend.push(delimited(&chars, &mut i)?);
+                q.prepend.push(delimited_items(chars, &mut i)?);
                 continue;
             }
             'Y' => {
                 let start = i;
-                while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                while chars.get(i).is_some_and(|&(c, _)| c.is_ascii_digit()) {
                     i += 1;
                 }
                 // ^Y turns the limit off again.
                 q.limit = if negate {
                     None
                 } else {
-                    Some(chars[start..i].iter().collect::<String>().parse().ok()?)
+                    Some(
+                        chars[start..i]
+                            .iter()
+                            .map(|&(c, _)| c)
+                            .collect::<String>()
+                            .parse()
+                            .map_err(|_| "invalid count".to_string())?,
+                    )
                 };
                 continue;
             }
             '[' => {
                 i -= 1;
-                let spec = delimited(&chars, &mut i)?;
+                let spec = delimited_items(chars, &mut i)?;
                 let eval = |t: &str| crate::arith::eval(t.trim()).ok();
                 q.range = Some(match spec.split_once(',') {
-                    Some((a, b)) => (eval(a)?, eval(b)?),
+                    Some((a, b)) => (
+                        eval(a).ok_or_else(|| "invalid subscript".to_string())?,
+                        eval(b).ok_or_else(|| "invalid subscript".to_string())?,
+                    ),
                     None => {
-                        let n = eval(&spec)?;
+                        let n = eval(&spec).ok_or_else(|| "invalid subscript".to_string())?;
                         (n, n)
                     }
                 });
@@ -213,24 +259,29 @@ fn parse_quals(s: &str) -> Option<Quals> {
             'X' => Test::Perm(0o001),
             'm' => {
                 let unit = match chars.get(i) {
-                    Some(&u @ ('M' | 'w' | 'h' | 'm' | 's')) => {
+                    Some(&(u @ ('M' | 'w' | 'h' | 'm' | 's'), _)) => {
                         i += 1;
                         u
                     }
                     _ => 'd',
                 };
                 let sign = match chars.get(i) {
-                    Some(&s @ ('+' | '-')) => {
+                    Some(&(s @ ('+' | '-'), _)) => {
                         i += 1;
                         s
                     }
                     _ => '=',
                 };
                 let start = i;
-                while chars.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                while chars.get(i).is_some_and(|&(c, _)| c.is_ascii_digit()) {
                     i += 1;
                 }
-                let n: i64 = chars[start..i].iter().collect::<String>().parse().ok()?;
+                let n: i64 = chars[start..i]
+                    .iter()
+                    .map(|&(c, _)| c)
+                    .collect::<String>()
+                    .parse()
+                    .map_err(|_| "invalid time".to_string())?;
                 let secs = match unit {
                     'M' => 30 * 86400,
                     'w' => 7 * 86400,
@@ -242,25 +293,28 @@ fn parse_quals(s: &str) -> Option<Quals> {
                 Test::Mtime(sign, n, secs)
             }
             'o' | 'O' => {
-                let key = *chars.get(i)?;
+                let &(key, _) = chars
+                    .get(i)
+                    .ok_or_else(|| "unknown sort specifier".to_string())?;
                 i += 1;
                 let rev = (c == 'O') != negate;
                 match key {
                     'e' => {
-                        q.sort_code = Some((delimited(&chars, &mut i)?, rev));
+                        q.sort_code = Some((delimited_items(chars, &mut i)?, rev));
                     }
                     '+' => {
                         let start = i;
                         while chars
                             .get(i)
-                            .is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                            .is_some_and(|&(c, _)| c.is_alphanumeric() || c == '_' || c == '-')
                         {
                             i += 1;
                         }
                         if start == i {
-                            return None;
+                            return Err("missing identifier after `+'".to_string());
                         }
-                        q.sort_code = Some((chars[start..i].iter().collect(), rev));
+                        q.sort_code =
+                            Some((chars[start..i].iter().map(|&(c, _)| c).collect(), rev));
                     }
                     _ => q.sort = Some((key, rev)),
                 }
@@ -269,7 +323,7 @@ fn parse_quals(s: &str) -> Option<Quals> {
             // Accepted without effect.
             '-' | ',' | 'L' | 'U' | 'G' | 's' | 'S' | 't' | 'T' => continue,
             '0'..='9' | ']' => continue,
-            _ => return None,
+            other => return Err(format!("unknown file attribute: {}", other)),
         };
         let test = if negate {
             Test::Negate(Box::new(test))
@@ -278,7 +332,12 @@ fn parse_quals(s: &str) -> Option<Quals> {
         };
         q.tests.push(test);
     }
-    Some(q)
+    Ok(q)
+}
+
+#[cfg(test)]
+fn parse_quals(s: &str) -> Option<Quals> {
+    parse_quals_items(&unescaped_items(s)).ok()
 }
 
 // `(e:code:)`: runs code with $REPLY set to the match; a zero status
@@ -458,12 +517,14 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
     }
     let dots = quals.is_some_and(|q| q.dots);
     let comps = components(pattern);
-    let mut current = vec![String::new()];
+    let trailing_slash =
+        pattern != "/" && comps.len() > 1 && comps.last().is_some_and(String::is_empty);
+    let mut current = vec![(String::new(), false)];
     let absolute = pattern.starts_with('/');
     let last = comps.len() - 1;
     for (k, comp) in comps.iter().enumerate() {
         if k == 0 && absolute {
-            current = vec!["/".to_string()];
+            current = vec![("/".to_string(), false)];
             continue;
         }
         if comp.is_empty() {
@@ -471,23 +532,25 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
         }
         let mut next = Vec::new();
         if (comp == "**" || comp == "***") && k < last {
-            for dir in &current {
-                walk_dirs(dir, dots, &mut next);
+            for (dir, _) in &current {
+                let mut found = Vec::new();
+                walk_dirs(dir, dots, &mut found);
+                next.extend(found.into_iter().map(|p| (p, true)));
             }
             current = next;
             continue;
         }
         if !crate::pattern::has_meta(comp) {
             let lit = crate::pattern::unescape(comp);
-            for dir in &current {
-                next.push(join(dir, &lit));
+            for (dir, _) in &current {
+                next.push((join(dir, &lit), false));
             }
             current = next;
             continue;
         }
         let pat = Pattern::new(comp);
         let explicit_dot = comp.starts_with('.') || comp.starts_with("\\.");
-        for dir in &current {
+        for (dir, _) in &current {
             for name in list_dir(dir) {
                 if name.starts_with('.') && !(dots || explicit_dot) {
                     continue;
@@ -498,7 +561,7 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
                 if pat.matches(&name) {
                     let p = join(dir, &name);
                     if k == last || fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
-                        next.push(p);
+                        next.push((p, true));
                     }
                 }
             }
@@ -507,13 +570,29 @@ pub fn glob(pattern: &str, quals: Option<&Quals>) -> Vec<String> {
     }
     let mut out: Vec<String> = current
         .into_iter()
-        .filter(|p| !p.is_empty() && fs::symlink_metadata(p).is_ok())
+        .filter(|(p, from_readdir)| {
+            !p.is_empty()
+                && (*from_readdir || fs::symlink_metadata(p).is_ok())
+                && (!trailing_slash || fs::metadata(p).is_ok_and(|m| m.is_dir()))
+        })
+        .map(|(p, _)| p)
         .collect();
+    let append_slash = |items: &mut Vec<String>| {
+        if trailing_slash {
+            for p in items {
+                if !p.ends_with('/') {
+                    p.push('/');
+                }
+            }
+        }
+    };
     let Some(q) = quals else {
+        append_slash(&mut out);
         sort_names(&mut out);
         return out;
     };
     out.retain(|p| q.tests.iter().all(|t| passes(Path::new(p), t)));
+    append_slash(&mut out);
     sort_matches(&mut out, q);
     if !q.code.is_empty() {
         let saved = (

@@ -1680,3 +1680,58 @@ fn aliases_short_loops_and_ignoreclosebraces() {
     assert_eq!((st, out.as_str()), (1, ""));
     assert!(err.contains("unterminated `=(...)'"), "{}", err);
 }
+
+#[test]
+fn glob_approx_pattern_disables_realpath_and_qualifiers() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let d = tmp.path().to_str().unwrap();
+    std::fs::create_dir_all(format!("{}/dir3/subdir", d)).unwrap();
+    std::fs::create_dir_all(format!("{}/hello/world", d)).unwrap();
+    std::os::unix::fs::symlink("dir3/subdir", format!("{}/link", d)).unwrap();
+    std::fs::write(format!("{}/a", d), "").unwrap();
+    let (_, out, _) = sh(&format!(
+        "setopt extendedglob; \
+         [[ dcba = (#a3)abcd && aabaXaaabY = (#a1)(a#b)(a#b)Y ]] && echo ok; \
+         f() {{ emulate -L zsh; disable -p '*'; [[ 'f*g' = $~1 ]] && echo off; disable -p; }}; \
+         f 'f*g'; disable -p; \
+         p='{}/link/../../hello/world'; print -r -- ${{p:P}}; \
+         for 1 2 in a b c d; do print -r -- \"$1:$2\"; done; \
+         cd {}; print -r -- [a](#qe\"|reply=( \\\\* )|\"[1]); \
+         print -r -- [a](#qe*reply=( \\\\\\* )*)",
+        d, d
+    ));
+    assert_eq!(
+        out,
+        format!("ok\noff\n'*'\n{}/hello/world\na:b\nc:d\n*\n*\n", d)
+    );
+    let (st, _, err) = sh(&format!(
+        "setopt extendedglob; cd {}; print -r -- [a](#qe\"*reply=( \\* )*\")",
+        d
+    ));
+    assert_eq!(st, 1);
+    assert!(err.contains("unknown file attribute:"), "err={:?}", err);
+}
+
+#[test]
+fn prompt_xtrace_brace_and_func_quoting() {
+    let (_, out, err) = sh("A1=${(%):-%s}; A2=${(%):-%u}; A3=${(%):-%s%u%s}; \
+         [[ $A3 = $A1$A2 ]] && echo optok; \
+         () { setopt no_multibyte; echo -E {$'\\x80'..$'\\x81'}; }; \
+         setopt extendedglob xtrace; \
+         f() { local d='~[x:l]'; [[ abc = (#b)(*)/z ]] || true; }; f; unsetopt xtrace; \
+         eval \"$'ba\\0z'() { echo inner; }\"; LC_ALL=C which $'ba\\0z'");
+    assert!(out.contains("optok\n\\M-^@ \\M-^A\n"), "out={:?}", out);
+    assert!(
+        out.contains("$'ba\\C-@z' () {\n\techo inner\n}\n"),
+        "out={:?}",
+        out
+    );
+    assert!(err.contains("local d='~[x:l]'"), "err={:?}", err);
+    assert!(err.contains("= (#b)(*)/z ]]"), "err={:?}", err);
+    let (st, _, err) = sh("print ${:-\"${| REPLY=${REPLY:-x}\"}");
+    assert_eq!(st, 1);
+    assert!(err.contains("unmatched \""), "err={:?}", err);
+    let (st2, _, err2) = sh("print ${:-\"${| REPLY=${REPLY:-x}\"}\"}");
+    assert_eq!(st2, 1);
+    assert!(err2.contains("unmatched \""), "err2={:?}", err2);
+}

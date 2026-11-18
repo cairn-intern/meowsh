@@ -1712,6 +1712,8 @@ pub fn expand_prompt(s: &str) -> String {
         f: s.chars().collect(),
         pos: 0,
         trunc: false,
+        active_attrs: 0,
+        unknown_attrs: 0b1_1111,
     };
     let mut out = String::new();
     while p.pos < p.f.len() {
@@ -1730,6 +1732,10 @@ struct Prompt {
     pos: usize,
     // Inside a truncation region: the next one ends it.
     trunc: bool,
+    // Tracked text attribute bits (1=bold, 2=underline, 4=standout, 8=fg, 16=bg)
+    // and which bits are still unknown since the start of prompt expansion.
+    active_attrs: u8,
+    unknown_attrs: u8,
 }
 
 // The longest named directory (HOME as ``) that starts `p`, for `~`.
@@ -2142,12 +2148,12 @@ impl Prompt {
                         out.push_str(&time_fmt("%y-%m-%d"));
                     }
                 }
-                'B' => out.push_str("\x1b[1m"),
-                'b' => out.push_str("\x1b[22m"),
-                'U' => out.push_str("\x1b[4m"),
-                'u' => out.push_str("\x1b[24m"),
-                'S' => out.push_str("\x1b[7m"),
-                's' => out.push_str("\x1b[27m"),
+                'B' => self.set_attr(out, 1, true, "\x1b[1m"),
+                'b' => self.set_attr(out, 1, false, "\x1b[22m"),
+                'U' => self.set_attr(out, 2, true, "\x1b[4m"),
+                'u' => self.set_attr(out, 2, false, "\x1b[24m"),
+                'S' => self.set_attr(out, 4, true, "\x1b[7m"),
+                's' => self.set_attr(out, 4, false, "\x1b[27m"),
                 'E' => out.push_str("\x1b[K"),
                 'F' | 'K' => {
                     let spec = if self.at(self.pos) == Some('{') {
@@ -2159,14 +2165,22 @@ impl Prompt {
                         None
                     };
                     match (spec, e) {
-                        (Some(n), 'F') => out.push_str(&color_fg(&n)),
-                        (Some(n), _) => out.push_str(&color_bg(&n)),
-                        (None, 'F') => out.push_str("\x1b[39m"),
-                        (None, _) => out.push_str("\x1b[49m"),
+                        (Some(n), 'F') => {
+                            self.active_attrs |= 8;
+                            self.unknown_attrs &= !8;
+                            out.push_str(&color_fg(&n));
+                        }
+                        (Some(n), _) => {
+                            self.active_attrs |= 16;
+                            self.unknown_attrs &= !16;
+                            out.push_str(&color_bg(&n));
+                        }
+                        (None, 'F') => self.set_attr(out, 8, false, "\x1b[39m"),
+                        (None, _) => self.set_attr(out, 16, false, "\x1b[49m"),
                     }
                 }
-                'f' => out.push_str("\x1b[39m"),
-                'k' => out.push_str("\x1b[49m"),
+                'f' => self.set_attr(out, 8, false, "\x1b[39m"),
+                'k' => self.set_attr(out, 16, false, "\x1b[49m"),
                 'H' => {
                     if self.at(self.pos) == Some('{') {
                         self.pos += 1;
@@ -2208,6 +2222,19 @@ impl Prompt {
             }
         }
         end.is_none()
+    }
+
+    fn set_attr(&mut self, out: &mut String, bit: u8, on: bool, seq: &str) {
+        let was_on = (self.active_attrs & bit) != 0;
+        if (self.unknown_attrs & bit) != 0 || was_on != on {
+            out.push_str(seq);
+        }
+        if on {
+            self.active_attrs |= bit;
+        } else {
+            self.active_attrs &= !bit;
+        }
+        self.unknown_attrs &= !bit;
     }
 }
 

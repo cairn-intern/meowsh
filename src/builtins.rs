@@ -171,6 +171,31 @@ pub fn is_builtin(name: &str) -> bool {
 // can ask without the shell lock.
 static DISABLED: std::sync::RwLock<Vec<(char, String)>> = std::sync::RwLock::new(Vec::new());
 
+pub const PAT_CHARS: &[&str] = &[
+    "|", "~", "(", "?", "*", "[", "<", "^", "#", "?(", "*(", "+(", "!(", "\\!(", "@(",
+];
+
+pub fn disabled_patterns() -> Vec<String> {
+    DISABLED
+        .read()
+        .map(|d| {
+            d.iter()
+                .filter(|(k, _)| *k == 'p')
+                .map(|(_, n)| n.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn set_disabled_patterns(pats: &[String]) {
+    if let Ok(mut d) = DISABLED.write() {
+        d.retain(|(k, _)| *k != 'p');
+        for p in pats {
+            d.push(('p', p.clone()));
+        }
+    }
+}
+
 pub fn is_disabled(kind: char, name: &str) -> bool {
     DISABLED
         .read()
@@ -183,7 +208,7 @@ fn builtin_disabled(name: &str) -> bool {
     !crate::parser::is_decl_word(name) && is_disabled('b', name)
 }
 
-/// `enable` / `disable [-afmr] [name ...]`.
+/// `enable` / `disable [-afmprs] [name ...]`.
 fn builtin_enable(words: &[String]) -> i32 {
     let enable = words[0] == "enable";
     let mut kind = 'b';
@@ -199,9 +224,9 @@ fn builtin_enable(words: &[String]) -> i32 {
         }
         for c in flags.chars() {
             match c {
-                'a' | 'f' | 'r' => kind = c,
+                'a' | 'f' | 'p' | 'r' => kind = c,
                 'm' => pattern = true,
-                'p' | 's' => {}
+                's' => {}
                 _ => return usage(&words[0], &format!("bad option: -{}", c)),
             }
         }
@@ -213,6 +238,7 @@ fn builtin_enable(words: &[String]) -> i32 {
             .chain(REGULAR.iter())
             .map(|s| s.to_string())
             .collect(),
+        'p' => PAT_CHARS.iter().map(|s| s.to_string()).collect(),
         'r' => KEYWORDS.iter().map(|s| s.to_string()).collect(),
         'a' => with_shell(|s| {
             s.assoc(crate::types::ALIASES)
@@ -223,6 +249,17 @@ fn builtin_enable(words: &[String]) -> i32 {
     };
     let names = &words[i..];
     if names.is_empty() {
+        if kind == 'p' {
+            let items: Vec<String> = PAT_CHARS
+                .iter()
+                .filter(|p| is_disabled('p', p) != enable)
+                .map(|p| format!("'{}'", p))
+                .collect();
+            if !items.is_empty() {
+                out(&format!("{}\n", items.join(" ")));
+            }
+            return 0;
+        }
         let mut list: Vec<&String> = known
             .iter()
             .filter(|n| is_disabled(kind, n) != enable)
@@ -243,7 +280,12 @@ fn builtin_enable(words: &[String]) -> i32 {
         } else if known.contains(name) {
             vec![name.clone()]
         } else {
-            builtin_err(&words[0], &format!("no such hash table element: {}", name));
+            let msg = if kind == 'p' {
+                format!("invalid pattern: {}", name)
+            } else {
+                format!("no such hash table element: {}", name)
+            };
+            builtin_err(&words[0], &msg);
             status = 1;
             continue;
         };

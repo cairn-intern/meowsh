@@ -2463,9 +2463,10 @@ fn apply_one(m: &Modifier, s: &str, subst: &Option<(String, String)>) -> String 
         'r' => path_root(s),
         'e' => path_ext(s),
         'a' => absolute_path(s),
-        'A' | 'P' => std::fs::canonicalize(absolute_path(s))
+        'A' => std::fs::canonicalize(absolute_path(s))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| absolute_path(s)),
+        'P' => realpath_p(s),
         'c' => crate::shell::find_command(s).unwrap_or_else(|| s.to_string()),
         'l' => s.to_lowercase(),
         'u' => s.to_uppercase(),
@@ -2694,6 +2695,59 @@ fn absolute_path(s: &str) -> String {
         }
     }
     format!("/{}", parts.join("/"))
+}
+
+// `:P`: resolves symlinks component-by-component before collapsing `..`,
+// tolerating missing suffixes, long segments, and symlink loops.
+fn realpath_p(s: &str) -> String {
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    if !s.starts_with('/') {
+        for p in var_get("PWD").split('/') {
+            if !p.is_empty() {
+                queue.push_back(p.to_string());
+            }
+        }
+    }
+    for p in s.split('/') {
+        if !p.is_empty() {
+            queue.push_back(p.to_string());
+        }
+    }
+    let mut resolved = std::path::PathBuf::from("/");
+    let mut hops = 0usize;
+    while let Some(comp) = queue.pop_front() {
+        match comp.as_str() {
+            "" | "." => {}
+            ".." => {
+                resolved.pop();
+            }
+            _ => {
+                let cand = resolved.join(&comp);
+                if hops < 40
+                    && std::fs::symlink_metadata(&cand).is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    if let Ok(target) = std::fs::read_link(&cand) {
+                        hops += 1;
+                        let target_str = target.to_string_lossy();
+                        if target.is_absolute() {
+                            resolved = std::path::PathBuf::from("/");
+                        }
+                        let tparts: Vec<String> = target_str
+                            .split('/')
+                            .filter(|x| !x.is_empty())
+                            .map(str::to_string)
+                            .collect();
+                        for tp in tparts.into_iter().rev() {
+                            queue.push_front(tp);
+                        }
+                        continue;
+                    }
+                }
+                resolved.push(comp);
+            }
+        }
+    }
+    resolved.to_string_lossy().into_owned()
 }
 
 // zsh `:q` / `(q)`: backslash before the characters special to the
@@ -5175,7 +5229,11 @@ fn brace_expand(field: &[(char, u8)]) -> Vec<Vec<(char, u8)>> {
                 last = c + 1;
             }
         } else {
-            let inner: Vec<char> = field[i + 1..close].iter().map(|&(c, _)| c).collect();
+            let inner: Vec<char> = field[i + 1..close]
+                .iter()
+                .filter(|&&(_, t)| t & MARK == 0)
+                .map(|&(c, _)| c)
+                .collect();
             if let Some((seq, chars)) = sequence(&inner) {
                 let tag = if chars { Q } else { field[i].1 };
                 alts = seq
@@ -5258,9 +5316,16 @@ fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
             if rev {
                 std::mem::swap(&mut a, &mut b);
             }
+            let mb = crate::options::is_set("multibyte");
             let mut out: Vec<String> = (a..=b)
                 .filter_map(char::from_u32)
-                .map(|c| c.to_string())
+                .map(|c| {
+                    if !mb && (c as u32) <= 0xff {
+                        nice_byte_char(c as u8)
+                    } else {
+                        c.to_string()
+                    }
+                })
                 .collect();
             if rev {
                 out.reverse();
@@ -5324,6 +5389,28 @@ fn sequence(inner: &[char]) -> Option<(Vec<String>, bool)> {
     Some((out, false))
 }
 
+// zsh `nicechar`: renders a single byte under `no_multibyte` for `{a..b}` ranges.
+fn nice_byte_char(mut b: u8) -> String {
+    let mut out = String::new();
+    if b & 0x80 != 0 && !crate::options::is_set("printeightbit") {
+        out.push_str("\\M-");
+        b &= 0x7f;
+    }
+    if b == 0x7f {
+        out.push_str("^?");
+    } else if b == b'\n' {
+        out.push_str("\\n");
+    } else if b == b'\t' {
+        out.push_str("\\t");
+    } else if b < 0x20 {
+        out.push('^');
+        out.push((b + 0x40) as char);
+    } else {
+        out.push(b as char);
+    }
+    out
+}
+
 // ---- field splitting and pathname expansion -------------------------------
 
 fn split_field(field: &[(char, u8)], ifs: &str) -> Vec<Vec<(char, u8)>> {
@@ -5376,6 +5463,8 @@ enum Globbed {
     Word(String),
     // A malformed pattern (BAD_PATTERN).
     Bad(String),
+    // Qualifier parse failure.
+    Err(String),
     Matches(Vec<String>),
     // A pattern that matched nothing, with its literal text.
     NoMatch(String),
@@ -5458,16 +5547,25 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
         return Globbed::Word(literal);
     }
     // Quoted characters are escaped so they match literally.
+    let items: Vec<(char, bool)> = piece
+        .iter()
+        .filter(|&&(_, f)| f & MARK == 0)
+        .map(|&(c, f)| (c, f & (Q | NG) != 0))
+        .collect();
+    let back_slash_raw: Vec<bool> = piece
+        .iter()
+        .filter(|&&(_, f)| f & MARK == 0)
+        .map(|&(c, f)| c == '\\' && f & (Q | NG) == 0 && f & B != 0)
+        .collect();
+    let (split, quals) = match crate::globber::split_qualifiers_items(&items) {
+        Ok(res) => res,
+        Err(msg) => return Globbed::Err(msg),
+    };
     let mut pat = String::new();
-    for &(c, f) in piece {
-        if f & MARK != 0 {
-            continue;
-        }
+    for (idx, &(c, quoted)) in items[..split].iter().enumerate() {
         // A backslash from a GLOB_SUBST value quotes the next character,
         // as in zsh; one in the literal text is itself.
-        if (f & (Q | NG) != 0 && "*?[]()|<>^#~\\!-".contains(c))
-            || (c == '\\' && f & (Q | NG) == 0 && f & B != 0)
-        {
+        if (quoted && "*?[]()|<>^#~\\!-".contains(c)) || back_slash_raw[idx] {
             pat.push('\\');
         }
         pat.push(c);
@@ -5476,8 +5574,7 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
     if crate::options::is_set("badpattern") && unclosed_bracket(&pat) {
         return Globbed::Bad(literal);
     }
-    let (base, quals) = crate::globber::split_qualifiers(&pat);
-    if quals.is_none() && !crate::pattern::has_meta(base) {
+    if quals.is_none() && !crate::pattern::has_meta(&pat) {
         return Globbed::Word(literal);
     }
     let mut quals = quals.unwrap_or_default();
@@ -5485,7 +5582,7 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
     if crate::options::is_set("globdots") {
         quals.dots = true;
     }
-    let mut matches = crate::globber::glob(base, Some(&quals));
+    let mut matches = crate::globber::glob(&pat, Some(&quals));
     if matches.is_empty() {
         return if explicit_null {
             Globbed::Matches(Vec::new())
@@ -5525,6 +5622,7 @@ fn finish_all(ctxs: Vec<Ctx>, do_glob: bool) -> ExpResult<Vec<String>> {
                 match glob_piece(&piece, do_glob) {
                     Globbed::Word(w) => out.push(w),
                     Globbed::Bad(w) => return fail(&format!("bad pattern: {}", w)),
+                    Globbed::Err(msg) => return fail(&msg),
                     Globbed::Matches(m) => {
                         any_match = true;
                         out.extend(m);

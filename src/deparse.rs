@@ -43,7 +43,7 @@ impl Deparser {
 
     /// `name () {\n\tbody\n}` for a function.
     pub fn function(mut self, name: &str, body: &Node) -> String {
-        self.push(name);
+        self.push(&format_func_name(name));
         self.push(" () {");
         self.indent += 1;
         // `f() { ... } >out`: the redirections follow the closing brace.
@@ -423,4 +423,45 @@ pub fn function_text(name: &str, body: &Node, spaces: Option<usize>) -> String {
     }
     s.push('\n');
     s
+}
+
+fn format_func_name(name: &str) -> String {
+    let c_locale = matches!(
+        crate::shell::var_get_opt("LC_ALL")
+            .or_else(|| crate::shell::var_get_opt("LC_CTYPE"))
+            .as_deref(),
+        Some("C" | "POSIX")
+    ) || !crate::options::is_set("multibyte");
+    let needs_dollar = name
+        .bytes()
+        .any(|b| b < 0x20 || b == 0x7f || (c_locale && b >= 0x80));
+    if !needs_dollar {
+        return name.to_string();
+    }
+    let mut out = String::from("$'");
+    for mut b in name.bytes() {
+        if b == b'\'' || b == b'\\' {
+            out.push('\\');
+            out.push(b as char);
+            continue;
+        }
+        if b & 0x80 != 0 {
+            out.push_str("\\M-");
+            b &= 0x7f;
+        }
+        if b == 0x7f {
+            out.push_str("\\C-?");
+        } else if b == b'\n' {
+            out.push_str("\\n");
+        } else if b == b'\t' {
+            out.push_str("\\t");
+        } else if b < 0x20 {
+            out.push_str("\\C-");
+            out.push((b + 0x40) as char);
+        } else {
+            out.push(b as char);
+        }
+    }
+    out.push('\'');
+    out
 }

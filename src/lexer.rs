@@ -193,20 +193,26 @@ pub fn scan_dollar_squote(chars: &[char], i: usize) -> Option<usize> {
 }
 
 pub fn scan_dquote(chars: &[char], i: usize) -> Option<usize> {
+    scan_dquote_res(chars, i).ok()
+}
+
+fn scan_dquote_res(chars: &[char], i: usize) -> Result<usize, &'static str> {
     let mut j = i + 1;
     while j < chars.len() {
         match chars[j] {
             '\\' => j += 2,
-            '"' => return Some(j + 1),
-            '`' => j = scan_bquote(chars, j)?,
-            '$' if j + 1 < chars.len() && chars[j + 1] == '(' => j = scan_paren(chars, j + 1)?,
+            '"' => return Ok(j + 1),
+            '`' => j = scan_bquote(chars, j).ok_or("unmatched \"")?,
+            '$' if j + 1 < chars.len() && chars[j + 1] == '(' => {
+                j = scan_paren(chars, j + 1).ok_or("unmatched \"")?
+            }
             '$' if j + 1 < chars.len() && chars[j + 1] == '{' => {
-                j = scan_brace(chars, j + 1, true)?
+                j = scan_brace_res(chars, j + 1, true)?
             }
             _ => j += 1,
         }
     }
-    None
+    Err("unmatched \"")
 }
 
 pub fn scan_bquote(chars: &[char], i: usize) -> Option<usize> {
@@ -223,17 +229,23 @@ pub fn scan_bquote(chars: &[char], i: usize) -> Option<usize> {
 
 // `${...}`: `i` indexes the `{`.
 pub fn scan_brace(chars: &[char], i: usize, in_dq: bool) -> Option<usize> {
+    scan_brace_res(chars, i, in_dq).ok()
+}
+
+pub fn scan_brace_res(chars: &[char], i: usize, in_dq: bool) -> Result<usize, &'static str> {
     let mut j = i + 1;
     let mut depth = 1;
     while j < chars.len() {
         match chars[j] {
             '\\' => j += 2,
-            '\'' if !in_dq => j = scan_squote(chars, j)?,
-            '"' => j = scan_dquote(chars, j)?,
-            '`' => j = scan_bquote(chars, j)?,
-            '$' if j + 1 < chars.len() && chars[j + 1] == '(' => j = scan_paren(chars, j + 1)?,
+            '\'' if !in_dq => j = scan_squote(chars, j).ok_or("unmatched '")?,
+            '"' => j = scan_dquote_res(chars, j)?,
+            '`' => j = scan_bquote(chars, j).ok_or("closing brace expected")?,
+            '$' if j + 1 < chars.len() && chars[j + 1] == '(' => {
+                j = scan_paren(chars, j + 1).ok_or("closing brace expected")?
+            }
             '$' if j + 1 < chars.len() && chars[j + 1] == '{' => {
-                j = scan_brace(chars, j + 1, in_dq)?
+                j = scan_brace_res(chars, j + 1, in_dq)?
             }
             '{' => {
                 depth += 1;
@@ -243,13 +255,13 @@ pub fn scan_brace(chars: &[char], i: usize, in_dq: bool) -> Option<usize> {
                 depth -= 1;
                 j += 1;
                 if depth == 0 {
-                    return Some(j);
+                    return Ok(j);
                 }
             }
             _ => j += 1,
         }
     }
-    None
+    Err("closing brace expected")
 }
 
 // `$(...)` and `$((...))`: `i` indexes the first `(`. Unbalanced `)` that
@@ -1088,22 +1100,10 @@ impl Lexer {
                                 ))
                             })?,
                         ),
-                        '{' => {
-                            Some(scan_brace(&self.chars, self.pos + 1, false).ok_or_else(|| {
-                                // An unclosed quote inside is reported first.
-                                let rest = &self.chars[self.pos..];
-                                let quotes = rest
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|&(k, &c)| c == '"' && (k == 0 || rest[k - 1] != '\\'))
-                                    .count();
-                                self.incomplete(if quotes % 2 == 1 {
-                                    "unmatched \""
-                                } else {
-                                    "closing brace expected"
-                                })
-                            })?)
-                        }
+                        '{' => Some(
+                            scan_brace_res(&self.chars, self.pos + 1, false)
+                                .map_err(|msg| self.incomplete(msg))?,
+                        ),
                         '\'' => Some(
                             scan_dollar_squote(&self.chars, self.pos + 1)
                                 .ok_or_else(|| self.incomplete("unmatched '"))?,

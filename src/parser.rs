@@ -1333,7 +1333,9 @@ impl Parser {
         }];
         // zsh: several names take that many words per iteration.
         while let Tok::Word(w) = self.peek()? {
-            if w == "in" || w == "do" || !is_valid_name(w) {
+            let is_var =
+                is_valid_name(w) || (!w.is_empty() && w.chars().all(|c| c.is_ascii_digit()));
+            if w == "in" || w == "do" || !is_var {
                 break;
             }
             let w = w.clone();
@@ -1488,9 +1490,7 @@ pub fn is_decl_word(w: &str) -> bool {
 }
 
 fn is_func_name(s: &str) -> bool {
-    !s.is_empty()
-        && !s.contains(['\'', '"', '\\', '$', '`', '=', '/'])
-        && !LIST_TERMINATORS.contains(&s)
+    !s.is_empty() && !s.contains(['=', '/']) && !LIST_TERMINATORS.contains(&s)
 }
 
 fn with_redir(node: Node, r: Redir) -> Node {

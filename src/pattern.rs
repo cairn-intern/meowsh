@@ -73,12 +73,16 @@ enum ClassItem {
 /// With EXTENDED_GLOB, a glob `a~b`: (a, b), b being matched against
 /// whole paths.
 pub fn glob_exclusion(pattern: &str) -> Option<(String, String)> {
-    if !crate::options::quick("extendedglob") {
+    if !crate::options::quick("extendedglob") || !pat_on("~") {
         return None;
     }
     let p: Vec<char> = pattern.chars().collect();
     let k = split_exclusion(&p)?;
     Some((p[..k].iter().collect(), p[k + 1..].iter().collect()))
+}
+
+fn pat_on(op: &str) -> bool {
+    !crate::builtins::is_disabled('p', op)
 }
 
 // Splits an EXTENDED_GLOB `a~b` at the top-level `~` (not a final one).
@@ -274,7 +278,7 @@ fn parse_alts(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
     let saved = (cx.fold, cx.approx);
     let mut alts = vec![parse_branch(p, i, nested, cx)];
     // zsh also alternates at the top level: `[[ x = a|b ]]`.
-    while (nested || !cx.shglob) && *i < p.len() && p[*i] == '|' {
+    while (nested || !cx.shglob) && pat_on("|") && *i < p.len() && p[*i] == '|' {
         *i += 1;
         // Each alternative starts with the group's flags.
         cx.fold = saved.0;
@@ -298,7 +302,7 @@ fn parse_alts(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
 fn parse_branch(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
     let first = parse_neg_seq(p, i, nested, cx);
     let mut excl = Vec::new();
-    while cx.ext && *i < p.len() && p[*i] == '~' {
+    while cx.ext && pat_on("~") && *i < p.len() && p[*i] == '~' {
         *i += 1;
         // Exclusions keep their own approximation.
         let saved = cx.approx;
@@ -315,7 +319,7 @@ fn parse_branch(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
 
 // A sequence, negated by a leading `^`.
 fn parse_neg_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
-    if cx.ext && *i + 1 < p.len() && p[*i] == '^' {
+    if cx.ext && pat_on("^") && *i + 1 < p.len() && p[*i] == '^' {
         *i += 1;
         Node::Not(Box::new(parse_seq(p, i, nested, cx)))
     } else {
@@ -324,24 +328,30 @@ fn parse_neg_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node 
 }
 
 fn at_branch_end(p: &[char], i: usize, nested: bool) -> bool {
-    i >= p.len() || p[i] == '|' || (nested && p[i] == ')')
+    i >= p.len() || (p[i] == '|' && pat_on("|")) || (nested && p[i] == ')')
 }
 
 fn parse_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
     let mut items: Vec<Node> = Vec::new();
     while *i < p.len() {
         let c = p[*i];
-        if (nested && c == ')') || (c == '|' && (nested || !cx.shglob)) {
+        if (nested && c == ')') || (c == '|' && (nested || !cx.shglob) && pat_on("|")) {
             break;
         }
         // `~` before more pattern text is an exclusion; a final one is
         // literal, as is one at the very start.
-        if c == '~' && cx.ext && !items.is_empty() && !at_branch_end(p, *i + 1, nested) {
+        if c == '~'
+            && cx.ext
+            && pat_on("~")
+            && !items.is_empty()
+            && !at_branch_end(p, *i + 1, nested)
+        {
             break;
         }
         let i0 = *i;
         // `@(#I)`: under KSH_GLOB a flag group, the `@` dropped.
         if cx.ksh
+            && pat_on("@(")
             && c == '@'
             && cx.ext
             && p.get(i0 + 1) == Some(&'(')
@@ -351,8 +361,16 @@ fn parse_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
             continue;
         }
         // KSH_GLOB `*(..)`, `+(..)`, `?(..)`, `@(..)`, `!(..)`.
+        let ksh_op = match c {
+            '*' => Some("*("),
+            '+' => Some("+("),
+            '?' => Some("?("),
+            '@' => Some("@("),
+            '!' => Some("!("),
+            _ => None,
+        };
         if cx.ksh
-            && matches!(c, '*' | '+' | '?' | '@' | '!')
+            && ksh_op.is_some_and(pat_on)
             && p.get(i0 + 1) == Some(&'(')
             && group_end(p, i0 + 1).is_some()
         {
@@ -372,17 +390,17 @@ fn parse_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
                 items.push(Node::Lit(p[i0 + 1], cx.fold, cx.approx));
                 *i += 2;
             }
-            '*' => {
+            '*' if pat_on("*") => {
                 *i += 1;
                 if !matches!(items.last(), Some(Node::Star)) {
                     items.push(Node::Star);
                 }
             }
-            '?' => {
+            '?' if pat_on("?") => {
                 *i += 1;
                 items.push(Node::Any(cx.approx));
             }
-            '[' => match parse_class(p, i0) {
+            '[' if pat_on("[") => match parse_class(p, i0) {
                 Some((negated, set, next)) => {
                     *i = next;
                     items.push(Node::Class {
@@ -397,7 +415,7 @@ fn parse_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
                     items.push(Node::Lit('[', cx.fold, cx.approx));
                 }
             },
-            '#' if cx.ext && !items.is_empty() => {
+            '#' if cx.ext && pat_on("#") && !items.is_empty() => {
                 let last = items.pop().unwrap();
                 let min = if p.get(i0 + 1) == Some(&'#') {
                     *i += 1;
@@ -409,7 +427,7 @@ fn parse_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
                 items.push(Node::Repeat(Box::new(last), min, None));
             }
             // (#i), (#b), (#a2), (#s), (#cN,M) and the other flags.
-            '(' if cx.ext && p.get(i0 + 1) == Some(&'#') => {
+            '(' if cx.ext && pat_on("(") && p.get(i0 + 1) == Some(&'#') => {
                 let end = (i0 + 2..p.len()).find(|&k| p[k] == ')').unwrap_or(p.len());
                 let flags: Vec<char> = p[i0 + 2..end].to_vec();
                 *i = (end + 1).min(p.len());
@@ -456,14 +474,17 @@ fn parse_seq(p: &[char], i: &mut usize, nested: bool, cx: &mut Ctx) -> Node {
                 }
             }
             // SH_GLOB: `<n-m>` and `(a|b)` are plain characters.
-            '<' if !cx.shglob && crate::lexer::numeric_range_len(p, i0).is_some() => {
+            '<' if !cx.shglob
+                && pat_on("<")
+                && crate::lexer::numeric_range_len(p, i0).is_some() =>
+            {
                 let len = crate::lexer::numeric_range_len(p, i0).unwrap();
                 let inner: String = p[i0 + 1..i0 + len - 1].iter().collect();
                 let (lo, hi) = inner.split_once('-').unwrap_or(("", ""));
                 items.push(Node::Range(lo.parse().ok(), hi.parse().ok()));
                 *i += len;
             }
-            '(' if !cx.shglob && group_end(p, i0).is_some() => {
+            '(' if !cx.shglob && pat_on("(") && group_end(p, i0).is_some() => {
                 *i += 1;
                 let slot = cx.backref.then(|| {
                     cx.groups += 1;
@@ -651,23 +672,33 @@ impl Matcher<'_> {
                     }
                 }
                 // Swapped with the next single character.
-                if let Some(after) = items.get(k + 1).filter(|n| Self::approx_of(n) > 0) {
-                    let mut t = States::new();
-                    for (&p, &e) in &cur {
-                        if e < budget
-                            && p + 1 < len
-                            && self.one_char(after, s[p]) == Some(true)
-                            && self.one_char(item, s[p + 1]) == Some(true)
-                        {
-                            add(&mut t, p + 2, e + 1);
+                let next_swap =
+                    if let Some(after) = items.get(k + 1).filter(|n| Self::approx_of(n) > 0) {
+                        let mut t = States::new();
+                        for (&p, &e) in &cur {
+                            if e < budget
+                                && p + 1 < len
+                                && self.one_char(after, s[p]) == Some(true)
+                                && self.one_char(item, s[p + 1]) == Some(true)
+                            {
+                                add(&mut t, p + 2, e + 1);
+                            }
                         }
-                    }
-                    if !t.is_empty() {
-                        swapped = Some(t);
-                        cur = next;
-                        continue;
+                        (!t.is_empty()).then_some(t)
+                    } else {
+                        None
+                    };
+                if let Some(t) = swapped.take() {
+                    for (q, e) in t {
+                        add(&mut next, q, e);
                     }
                 }
+                swapped = next_swap;
+                cur = next;
+                if cur.is_empty() && swapped.is_none() {
+                    break;
+                }
+                continue;
             }
             if let Some(t) = swapped.take() {
                 for (q, e) in t {
@@ -695,19 +726,37 @@ impl Matcher<'_> {
         cur
     }
 
+    fn step_rep(&self, inner: &Node, cur: &States) -> States {
+        let mut next = self.step(inner, cur);
+        let budget = Self::approx_of(inner);
+        if budget > 0 {
+            let len = self.s.len();
+            for (&p, &e) in cur {
+                if e < budget {
+                    add(&mut next, p, e + 1);
+                    if p < len && matches!(inner, Node::Lit(..)) {
+                        add(&mut next, p + 1, e + 1);
+                    }
+                }
+            }
+        }
+        next
+    }
+
     fn repeat(&self, inner: &Node, min: usize, max: Option<usize>, from: &States) -> States {
         let mut out = States::new();
+        let mut seen = States::new();
         if min == 0 {
             out = from.clone();
+            seen = from.clone();
         }
         let mut cur = from.clone();
-        let mut seen = States::new();
         let limit = self.s.len() + min + 1;
         for n in 1..=limit {
             if max.is_some_and(|m| n > m) {
                 break;
             }
-            let mut next = self.step(inner, &cur);
+            let mut next = self.step_rep(inner, &cur);
             if n > min {
                 // Past the minimum, only new progress matters.
                 next.retain(|q, e| seen.get(q).is_none_or(|g| *g > *e));
@@ -896,23 +945,39 @@ pub fn matches(pattern: &str, s: &str) -> bool {
 /// `?`, `[`, a `(...)` group, or a `<n-m>` range.
 pub fn has_meta(pattern: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
+    let ksh = crate::options::quick("kshglob");
+    let shglob = crate::options::quick("shglob");
+    let ext = crate::options::quick("extendedglob");
     let mut i = 0;
     while i < p.len() {
+        let ksh_op = match p[i] {
+            '*' => Some("*("),
+            '+' => Some("+("),
+            '?' => Some("?("),
+            '@' => Some("@("),
+            '!' => Some("!("),
+            _ => None,
+        };
+        if ksh
+            && ksh_op.is_some_and(pat_on)
+            && p.get(i + 1) == Some(&'(')
+            && group_end(&p, i + 1).is_some()
+        {
+            return true;
+        }
         match p[i] {
             '\\' => i += 1,
-            '*' | '?' => return true,
-            '[' if parse_class(&p, i).is_some() => return true,
-            '(' if !crate::options::quick("shglob") && group_end(&p, i).is_some() => return true,
-            '<' if !crate::options::quick("shglob")
-                && crate::lexer::numeric_range_len(&p, i).is_some() =>
-            {
+            '*' if pat_on("*") => return true,
+            '?' if pat_on("?") => return true,
+            '[' if pat_on("[") && parse_class(&p, i).is_some() => return true,
+            '(' if !shglob && pat_on("(") && group_end(&p, i).is_some() => return true,
+            '<' if !shglob && pat_on("<") && crate::lexer::numeric_range_len(&p, i).is_some() => {
                 return true
             }
-            '#' | '^' if crate::options::quick("extendedglob") => return true,
+            '#' if ext && pat_on("#") => return true,
+            '^' if ext && pat_on("^") => return true,
             // An exclusion needs text on both sides: a final `~` is literal.
-            '~' if crate::options::quick("extendedglob") && i > 0 && i + 1 < p.len() => {
-                return true
-            }
+            '~' if ext && pat_on("~") && i > 0 && i + 1 < p.len() => return true,
             _ => {}
         }
         i += 1;

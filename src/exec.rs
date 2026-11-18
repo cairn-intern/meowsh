@@ -1434,7 +1434,7 @@ impl TempVars {
 
 // XTRACE: the command as zsh shows it, assignments first (each followed
 // by a space) then the words, quoted where needed.
-fn xtrace_cmd(assigns: &[Expanded], words: &[String]) {
+fn xtrace_cmd(assigns: &[Expanded], words: &[String], decl: Option<&[DeclArg]>) {
     if !opt_set(OPT_XTRACE) || (assigns.is_empty() && words.is_empty()) {
         return;
     }
@@ -1442,13 +1442,42 @@ fn xtrace_cmd(assigns: &[Expanded], words: &[String]) {
         .iter()
         .map(|a| format!("{} ", assign_text(a)))
         .collect();
-    line.push_str(
-        &words
+    let formatted: Vec<String> = match decl {
+        Some(args) => args
+            .iter()
+            .map(|a| match a {
+                DeclArg::Word(w) => crate::builtins::shell_quote(w),
+                DeclArg::Assign {
+                    name,
+                    append,
+                    value,
+                } => match value {
+                    Some(v) => format!(
+                        "{}{}{}",
+                        name,
+                        if *append { "+=" } else { "=" },
+                        crate::builtins::shell_quote(v)
+                    ),
+                    None => crate::builtins::shell_quote(name),
+                },
+                DeclArg::Array {
+                    name,
+                    append,
+                    items,
+                } => format!(
+                    "{}{}=({})",
+                    name,
+                    if *append { "+=" } else { "" },
+                    crate::shell::plain_items(items).join(" ")
+                ),
+            })
+            .collect(),
+        None => words
             .iter()
             .map(|w| crate::builtins::shell_quote(w))
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+            .collect(),
+    };
+    line.push_str(&formatted.join(" "));
     xtrace_line(&line);
 }
 
@@ -1456,11 +1485,46 @@ fn xtrace_cmd(assigns: &[Expanded], words: &[String]) {
 // patterns with their quoted characters backslashed, no parentheses.
 fn dbracket_trace(words: &[String]) -> String {
     let mut out = vec!["[[".to_string()];
+    let mut i = 0;
     let mut prev = "";
-    for w in words {
+    while i < words.len() {
+        let w = &words[i];
+        if matches!(prev, "==" | "=" | "!=") && !matches!(w.as_str(), "(" | ")") {
+            let pat = crate::expand::pattern_for_trace(w).unwrap_or_else(|_| w.clone());
+            out.push(pat);
+            prev = "";
+            i += 1;
+            continue;
+        }
+        if matches!(prev, "==" | "=" | "!=") && w == "(" {
+            let mut rhs = w.clone();
+            let mut depth = 1i32;
+            i += 1;
+            while i < words.len() {
+                if depth == 0 && words[i] != "(" {
+                    break;
+                }
+                depth += (words[i] == "(") as i32 - (words[i] == ")") as i32;
+                rhs.push_str(&words[i]);
+                i += 1;
+                if depth == 0 {
+                    if let Some(t) = words.get(i) {
+                        if !matches!(t.as_str(), "&&" | "||" | "(" | ")" | "]]") {
+                            rhs.push_str(t);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            let pat = crate::expand::pattern_for_trace(&rhs).unwrap_or(rhs);
+            out.push(pat);
+            prev = "";
+            continue;
+        }
         let text = match w.as_str() {
             "(" | ")" => {
                 prev = w;
+                i += 1;
                 continue;
             }
             "&&" | "||" | "!" | "==" | "=" | "!=" | "=~" | "<" | ">" => w.clone(),
@@ -1478,12 +1542,10 @@ fn dbracket_trace(words: &[String]) -> String {
             {
                 w.clone()
             }
-            _ if matches!(prev, "==" | "=" | "!=") => {
-                crate::expand::pattern_for_trace(w).unwrap_or_else(|_| w.clone())
-            }
             _ => crate::builtins::shell_quote(&expand_string(w).unwrap_or_else(|_| w.clone())),
         };
         prev = w;
+        i += 1;
         out.push(text);
     }
     out.push("]]".to_string());
@@ -1732,7 +1794,7 @@ fn exec_node_inner(node: &Node) -> i32 {
             Ok(mut words) => {
                 words.insert(0, "(anon)".to_string());
                 set_lineno(*line);
-                xtrace_cmd(&[], &words);
+                xtrace_cmd(&[], &words, None);
                 let saved = traced.then(|| with_shell(|s| s.opts & OPT_XTRACE != 0));
                 if *traced {
                     with_shell(|s| crate::options::set_in(s, "xtrace", true));
@@ -2131,7 +2193,7 @@ fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
         }
     }
     if words.is_empty() {
-        xtrace_cmd(&assigns, &[]);
+        xtrace_cmd(&assigns, &[], None);
         for a in &assigns {
             if let Err(st) = apply_assign(a, false) {
                 if !interactive() {
@@ -2147,7 +2209,7 @@ fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
         return with_shell(|s| s.last_cmdsub_status).unwrap_or(0);
     }
 
-    xtrace_cmd(&assigns, &words);
+    xtrace_cmd(&assigns, &words, decl.as_deref());
     // $_: the last word of the previous command.
     let last = words.last().cloned();
     let st = run_command(words, decl, &assigns, &cmd.redirs, in_child, dash);
@@ -2521,6 +2583,7 @@ type Frame = (
     std::collections::HashMap<String, bool>,
     crate::options::Emulation,
     TrapFuncs,
+    Vec<String>,
 );
 
 // The TRAPxxx functions defined when a function was entered.
@@ -2543,8 +2606,8 @@ fn trap_funcs() -> TrapFuncs {
 /// trap replaces it (and makes the caller return too, as in zsh).
 fn restore_function_frame(entry: Frame, status: i32, posix_traps: bool) -> i32 {
     let mut status = status;
-    let (traps, opts, named, emulation, funcs) = entry;
-    let (local_traps, local_opts, exit_action) = with_shell(|s| {
+    let (traps, opts, named, emulation, funcs, pat_dis) = entry;
+    let (local_traps, local_opts, local_patterns, exit_action) = with_shell(|s| {
         let on = |k: &str| s.named_opts.get(k).copied().unwrap_or(false);
         let exit = s.traps.get(&0).cloned();
         // A TRAPEXIT defined in the function is a new EXIT trap even
@@ -2564,9 +2627,13 @@ fn restore_function_frame(entry: Frame, status: i32, posix_traps: bool) -> i32 {
         (
             on("localtraps"),
             on("localoptions"),
+            on("localpatterns"),
             exit.filter(|_| changed),
         )
     });
+    if local_patterns {
+        crate::builtins::set_disabled_patterns(&pat_dis);
+    }
     if exit_action.is_some() || local_traps {
         let current = with_shell(|s| s.traps.clone());
         let mut sigs: Vec<i32> = current.keys().chain(traps.keys()).copied().collect();
@@ -2790,6 +2857,7 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
     });
     let local_loops = crate::options::is_set("localloops");
     let tf = trap_funcs();
+    let pat_dis = crate::builtins::disabled_patterns();
     let entry = with_shell(|s| {
         (
             s.traps.clone(),
@@ -2797,6 +2865,7 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
             s.named_opts.clone(),
             s.emulation,
             tf,
+            pat_dis,
         )
     });
     // A function with a different sticky emulation runs in it, and its
@@ -2819,7 +2888,8 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
         Node::Brace(b) => b.as_ref(),
         b => b,
     };
-    let mut st = crate::shell::in_eval_context("shfunc", || exec_with_debug(inner));
+    let mut st =
+        in_cmd_scope(|| crate::shell::in_eval_context("shfunc", || exec_with_debug(inner)));
     with_shell(|s| {
         if let Flow::Return(n) = s.flow {
             st = n;
@@ -3325,6 +3395,18 @@ fn in_cmd<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
     r
 }
 
+fn in_cmd_scope<R>(f: impl FnOnce() -> R) -> R {
+    let saved = CMD_STACK
+        .lock()
+        .map(|mut c| std::mem::take(&mut *c))
+        .unwrap_or_default();
+    let r = f();
+    if let Ok(mut c) = CMD_STACK.lock() {
+        *c = saved;
+    }
+    r
+}
+
 fn exec_if(branches: &[(Node, Node)], else_body: Option<&Node>) -> i32 {
     for (k, (cond, body)) in branches.iter().enumerate() {
         suppress_errexit(1);
@@ -3715,10 +3797,17 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
     // aliases it defines apply only later); sourced files, and sh mode as
     // in bash, go command by command.
     let whole = ctx.is_none_or(|c| c == "(eval)") && !sh_emulation();
-    let st = if whole {
-        run_whole(src)
+    let run = || {
+        if whole {
+            run_whole(src)
+        } else {
+            run_parsed(src)
+        }
+    };
+    let st = if ctx.is_some() {
+        in_cmd_scope(run)
     } else {
-        run_parsed(src)
+        run()
     };
     crate::shell::with_err_ctx(|e| {
         if ctx.is_some() {
