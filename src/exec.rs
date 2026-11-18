@@ -2775,10 +2775,6 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
             }
             f
         });
-    if stray {
-        crate::shell::with_err_ctx(|e| e.lineno = line);
-        shell_err("`break' active at end of function scope");
-    }
     // POSIX_TRAPS (as in force when the function ends): EXIT traps
     // belong to the shell, not the function.
     let posix_traps = crate::options::is_set("posixtraps");
@@ -2827,6 +2823,10 @@ pub fn call_function(body: &Arc<Node>, words: &[String], line: usize) -> i32 {
     });
     if let Ok(mut o) = FUNC_ORIGINS.lock() {
         o.pop();
+    }
+    // zsh reports it from the caller, at the line of the call.
+    if stray {
+        shell_err("`break' active at end of function scope");
     }
     if kind.is_some() || saved_trace.1 {
         with_shell(|s| crate::options::set_in(s, "xtrace", saved_trace.0));
@@ -3144,7 +3144,17 @@ fn exec_time(body: &Node) -> i32 {
 fn exec_subshell(body: &Node) -> i32 {
     let pid = fork_process(ForkKind::Foreground(0));
     if pid == 0 {
-        exec_in_child(body);
+        // The subshell keeps ZERR and ERR_EXIT: a lone failing command
+        // trips them in it, as in zsh.
+        let st = match body {
+            Node::Simple(cmd) => {
+                let st = exec_simple(cmd, true);
+                check_errexit(st);
+                st
+            }
+            _ => exec_node(body),
+        };
+        exit_child(st);
     }
     if pid < 0 {
         return 1;

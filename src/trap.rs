@@ -158,12 +158,35 @@ pub fn set_trap(sig: i32, action: Option<String>) {
 /// Resets dispositions in a freshly forked child. Ignored signals stay
 /// ignored; caught ones return to their defaults.
 pub fn reset_in_child(background_without_job_control: bool) {
-    let ignored: Vec<i32> = with_shell(|s| {
-        s.traps.retain(|_, a| a.is_empty());
-        s.traps.keys().copied().collect()
+    // zsh's entersubsh() unsets every trap except TRAPxxx functions and the
+    // ZERR and DEBUG pseudo-signals, which a subshell keeps.
+    let (ignored, kept): (Vec<i32>, Vec<i32>) = with_shell(|s| {
+        let is_func = |sig: i32, a: &str| {
+            !a.is_empty()
+                && a.split(' ').next().is_some_and(|w| {
+                    w.strip_prefix("TRAP")
+                        .and_then(signal_number)
+                        .is_some_and(|n| n == sig)
+                })
+        };
+        s.traps
+            .retain(|&sig, a| a.is_empty() || sig >= SIG_ZERR || is_func(sig, a));
+        let ignored = s
+            .traps
+            .iter()
+            .filter(|(_, a)| a.is_empty())
+            .map(|(&k, _)| k)
+            .collect();
+        let kept = s
+            .traps
+            .iter()
+            .filter(|(_, a)| !a.is_empty())
+            .map(|(&k, _)| k)
+            .collect();
+        (ignored, kept)
     });
     for &(_, sig) in SIGNALS {
-        if sig == libc::SIGKILL || sig == libc::SIGSTOP {
+        if sig == libc::SIGKILL || sig == libc::SIGSTOP || kept.contains(&sig) {
             continue;
         }
         if ignored.contains(&sig) {

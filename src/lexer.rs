@@ -978,6 +978,29 @@ impl Lexer {
                         self.pos += 2;
                     }
                 }
+                '\'' if crate::options::is_set("cshjunkiequotes") => {
+                    // CSH_JUNKIE_QUOTES: a quote may not span lines, except
+                    // after a backslash, which is then dropped.
+                    out.push('\'');
+                    self.pos += 1;
+                    loop {
+                        match self.chars.get(self.pos) {
+                            None => return Err(self.incomplete("unmatched '")),
+                            Some('\'') => break,
+                            Some('\n') => return Err(LexError::Syntax("unmatched '".into())),
+                            Some('\\') if self.chars.get(self.pos + 1) == Some(&'\n') => {
+                                out.push('\n');
+                                self.pos += 2;
+                            }
+                            Some(&c) => {
+                                out.push(c);
+                                self.pos += 1;
+                            }
+                        }
+                    }
+                    out.push('\'');
+                    self.pos += 1;
+                }
                 '\'' => {
                     let end = scan_squote(&self.chars, self.pos)
                         .ok_or_else(|| self.incomplete("unmatched '"))?;
@@ -987,6 +1010,16 @@ impl Lexer {
                 '"' => {
                     let end = scan_dquote(&self.chars, self.pos)
                         .ok_or_else(|| self.incomplete("unmatched \""))?;
+                    if crate::options::is_set("cshjunkiequotes") {
+                        let body = &self.chars[self.pos..end];
+                        if body
+                            .iter()
+                            .enumerate()
+                            .any(|(k, &c)| c == '\n' && (k == 0 || body[k - 1] != '\\'))
+                        {
+                            return Err(LexError::Syntax("unmatched \"".into()));
+                        }
+                    }
                     out.extend(&self.chars[self.pos..end]);
                     self.pos = end;
                 }

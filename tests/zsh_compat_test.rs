@@ -1612,3 +1612,30 @@ fn nofork_parse_errors_stop_the_command() {
     let (st, out, _) = sh("setopt ignorebraces; print ${ { echo nested } } DONE");
     assert_eq!((st, out.as_str()), (1, ""));
 }
+
+#[test]
+fn csh_junkie_quotes_end_at_a_newline() {
+    let (_, out, err) =
+        sh("setopt cshjunkiequotes; eval \"print 'a\nb'\"; eval \"print 'c\\\\\nd'\"");
+    assert_eq!(out, "c\nd\n");
+    assert_eq!(err.matches("unmatched '").count(), 1, "{}", err);
+}
+
+#[test]
+fn subshell_keeps_zerr_trap_functions() {
+    let (_, out, _) = sh("TRAPZERR() { print trapped; }; (false; true); (false)");
+    assert_eq!(out, "trapped\ntrapped\ntrapped\n");
+    let (_, out, _) = sh("trap 'print no' USR1; (trap)");
+    assert_eq!(out, "");
+}
+
+#[test]
+fn local_loops_warning_comes_from_the_caller() {
+    let (_, _, err) =
+        sh("g() {\n setopt localloops\n for i in 1; do\n  () {\n   break\n  }\n done\n}\ng");
+    assert!(
+        err.contains("g:3: `break' active at end of function scope"),
+        "{}",
+        err
+    );
+}
