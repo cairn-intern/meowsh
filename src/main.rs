@@ -232,6 +232,7 @@ fn main() {
     }
 
     let status = if let Some(cmd) = &args.command {
+        meowsh::exec::EXITING_SHELL.store(true, std::sync::atomic::Ordering::Relaxed);
         run_string(cmd)
     } else if let Some(path) = &args.script {
         // PATH_SCRIPT: a script name without a slash not found here is

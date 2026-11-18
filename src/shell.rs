@@ -99,8 +99,9 @@ pub fn shell_init() {
         0,
     );
     set(&mut shell, "HOST", hostname_full(), 0);
-    // POSIX: IFS is reset at startup rather than inherited.
-    set(&mut shell, "IFS", " \t\n".to_string(), 0);
+    // POSIX: IFS is reset at startup rather than inherited (zsh's default
+    // includes a trailing NUL).
+    set(&mut shell, "IFS", " \t\n\0".to_string(), 0);
     let ppid = unsafe { libc::getppid() };
     set(&mut shell, "PPID", ppid.to_string(), 0);
     let shlvl = shell
@@ -130,6 +131,9 @@ pub fn shell_init() {
     }
 
     START.get_or_init(std::time::Instant::now);
+    if let Ok(mut s) = SECONDS_START.lock() {
+        *s = Some((std::time::Instant::now(), 0.0));
+    }
     crate::options::init(&mut shell, crate::options::Emulation::Zsh);
     // zsh/langinfo: the character set of the locale.
     let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
@@ -254,6 +258,8 @@ pub fn build_env(overrides: &[(String, String)]) -> Vec<(String, String)> {
 }
 
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static SECONDS_START: std::sync::Mutex<Option<(std::time::Instant, f64)>> =
+    std::sync::Mutex::new(None);
 static RANDOM_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn terminal_size() -> Option<(u16, u16)> {
@@ -345,11 +351,21 @@ fn dynamic_var(name: &str) -> Option<String> {
             Some(((x >> 33) % 32768).to_string())
         }
         "SECONDS" => {
-            let t = START.get_or_init(std::time::Instant::now).elapsed();
+            let secs = SECONDS_START
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map(|(t, base)| base + t.elapsed().as_secs_f64())
+                .unwrap_or_else(|| {
+                    START
+                        .get_or_init(std::time::Instant::now)
+                        .elapsed()
+                        .as_secs_f64()
+                });
             Some(if SECONDS_FLOAT.load(Ordering::Relaxed) {
-                format!("{:.10}", t.as_secs_f64())
+                format!("{:.10}", secs)
             } else {
-                t.as_secs().to_string()
+                (secs as i64).to_string()
             })
         }
         "EPOCHSECONDS" | "EPOCHREALTIME"
@@ -544,7 +560,12 @@ pub fn var_exists(name: &str) -> bool {
             return idx == 0 || idx <= shell.pos_params.len();
         }
     }
-    shell.param(name).is_some_and(|p| p.is_set())
+    shell.param(name).is_some_and(|p| {
+        p.is_set()
+            && !(p.attrs & crate::params::NAMEREF != 0
+                && p.attrs & crate::params::DECLARED != 0
+                && p.text().is_empty())
+    })
 }
 
 pub fn var_get_if_exists(name: &str) -> Option<i64> {
@@ -761,7 +782,7 @@ pub fn set_ref_target(name: &str, target: &str) -> bool {
         .or(Some(if upper { lvl.saturating_sub(1) } else { lvl }));
         if let Some(p) = s.param_mut(name) {
             p.value = Value::Scalar(target.to_string());
-            p.attrs &= !UNSET;
+            p.attrs &= !(UNSET | crate::params::DECLARED);
             p.ref_level = bound;
         }
     });
@@ -1033,6 +1054,22 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
     }
     if name == "RANDOM" {
         seed_random(value.trim().parse().unwrap_or(0));
+    }
+    if name == "SECONDS"
+        && with_shell(|s| s.param("SECONDS").is_none())
+        && !crate::exec::sh_emulation_pub()
+    {
+        let v = match crate::arith::eval_num(value) {
+            Ok(n) => n.as_float_pub(),
+            Err(e) => {
+                shell_err(&format!("SECONDS: {}", e));
+                return false;
+            }
+        };
+        if let Ok(mut g) = SECONDS_START.lock() {
+            *g = Some((std::time::Instant::now(), v));
+        }
+        return true;
     }
     // zsh: assigning UID, EUID, GID or EGID changes the process's ids.
     if matches!(name, "UID" | "EUID" | "GID" | "EGID")

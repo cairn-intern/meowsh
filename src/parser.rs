@@ -548,8 +548,10 @@ impl Parser {
                 "{" => {
                     self.next()?;
                     self.brace_depth += 1;
+                    self.lex.brace_depth = self.brace_depth;
                     let body = self.parse_list(false);
                     self.brace_depth -= 1;
+                    self.lex.brace_depth = self.brace_depth;
                     let body = body?;
                     self.expect_word("}")?;
                     if self.peek_is_word("always")? {
@@ -563,8 +565,10 @@ impl Parser {
                         // apply to the whole construct.
                         self.next()?;
                         self.brace_depth += 1;
+                        self.lex.brace_depth = self.brace_depth;
                         let always = self.parse_list(false);
                         self.brace_depth -= 1;
+                        self.lex.brace_depth = self.brace_depth;
                         let always = always?;
                         self.expect_word("}")?;
                         Node::Always {
@@ -901,11 +905,12 @@ impl Parser {
                 continue;
             }
             // After arguments only when braces are special (not with
-            // IGNORE_BRACES or in sh, where `}` must start a command).
+            // IGNORE_BRACES, IGNORE_CLOSE_BRACES or in sh).
             if word == "}"
                 && self.brace_depth > 0
                 && !(cmd.words.is_empty() && cmd.assigns.is_empty() && cmd.redirs.is_empty())
                 && braces_split()
+                && !crate::options::is_set("ignoreclosebraces")
             {
                 break;
             }
@@ -1289,14 +1294,7 @@ impl Parser {
     fn parse_loop(&mut self, until: bool) -> PResult<Node> {
         self.next()?;
         let cond = self.parse_list(false)?;
-        let body = if self.peek_is_word("{")? {
-            self.parse_command()?
-        } else {
-            self.expect_word("do")?;
-            let body = self.parse_list(false)?;
-            self.expect_word("done")?;
-            body
-        };
+        let body = self.parse_loop_body()?;
         Ok(Node::Loop {
             cond: Box::new(cond),
             body: Box::new(body),

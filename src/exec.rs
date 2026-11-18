@@ -367,13 +367,22 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
         shell_err(&format!("command not found: {}", name));
         unsafe { libc::_exit(127) }
     };
+    let env_argv0 = argv0
+        .is_none()
+        .then(|| {
+            env.iter()
+                .find(|(k, _)| k == "ARGV0")
+                .map(|(_, v)| v.as_str())
+        })
+        .flatten();
+    let eff_argv0 = argv0.or(env_argv0);
     let to_c = |s: &str| CString::new(s.as_bytes()).ok();
     let (Some(c_path), Some(argv)) = (
         to_c(&path),
         words
             .iter()
             .enumerate()
-            .map(|(k, w)| to_c(if k == 0 { argv0.unwrap_or(w) } else { w }))
+            .map(|(k, w)| to_c(if k == 0 { eff_argv0.unwrap_or(w) } else { w }))
             .collect::<Option<Vec<_>>>(),
     ) else {
         err_line(&format!("meowsh: {}: invalid argument", name));
@@ -381,6 +390,7 @@ pub fn exec_external_as(words: &[String], argv0: Option<&str>, env: &[(String, S
     };
     let envp: Vec<CString> = env
         .iter()
+        .filter(|(k, _)| !(env_argv0.is_some() && k == "ARGV0"))
         .filter_map(|(k, v)| CString::new(format!("{}={}", k, v)).ok())
         .collect();
     let mut argv_p: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
@@ -520,6 +530,9 @@ fn open_redir(r: &Redir) -> Result<Target, Option<String>> {
     // even with (N).
     if r.op != RedirOp::HereStr
         && !crate::options::is_set("noglob")
+        && !r.target.starts_with("<(")
+        && !r.target.starts_with(">(")
+        && !r.target.starts_with("=(")
         && crate::pattern::has_meta(&r.target)
         && r.target.ends_with(')')
     {
@@ -627,7 +640,11 @@ fn redir_words(r: &Redir) -> Vec<Redir> {
             | RedirOp::AppendClobber
             | RedirOp::Read
     );
-    if !plain || !crate::options::is_set("multios") {
+    if !plain
+        || !crate::options::is_set("multios")
+        || r.target.starts_with("<(")
+        || r.target.starts_with(">(")
+    {
         return vec![r.clone()];
     }
     match crate::expand::expand_words(std::slice::from_ref(&r.target)) {
@@ -1624,12 +1641,30 @@ pub fn exec_node(node: &Node) -> i32 {
 /// the command using it completes.
 pub static DEFERRED_FLOW: std::sync::Mutex<Option<Flow>> = std::sync::Mutex::new(None);
 
+/// Set when the current command is the final command of a `-c` invocation
+/// (or a subshell that is itself the final command), so zsh's implicit
+/// exec optimization decrements `SHLVL` by 1 for an external command.
+pub static EXITING_SHELL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn exec_node_inner(node: &Node) -> i32 {
     if flow_pending() {
         return last_status();
     }
     if opt_set(OPT_NOEXEC) && !interactive() {
+        if let Node::Simple(cmd) = node {
+            for w in &cmd.words {
+                if let Err(e) = crate::expand::validate_noexec_word(w) {
+                    return e.status;
+                }
+            }
+        }
         return 0;
+    }
+    if !matches!(
+        node,
+        Node::Simple(_) | Node::Subshell(_) | Node::List(_) | Node::Brace(_)
+    ) {
+        EXITING_SHELL.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     let status = match node {
         Node::Simple(cmd) => {
@@ -2052,7 +2087,15 @@ fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
     }
     let (words, decl) = match expanded {
         Ok(w) => w,
-        Err(e) => return expansion_failed(e),
+        Err(mut e) => {
+            if e.status == 1 {
+                let prev = last_status();
+                if prev != 0 {
+                    e.status = prev;
+                }
+            }
+            return expansion_failed(e);
+        }
     };
     let assigns = match expand_assigns(&cmd.assigns) {
         Ok(a) => a,
@@ -2307,7 +2350,7 @@ fn run_command(
         return crate::builtins::run("cd", &["cd".to_string(), name]);
     }
 
-    let overrides: Vec<(String, String)> = assigns
+    let mut overrides: Vec<(String, String)> = assigns
         .iter()
         .filter(|a| a.subscript.is_none())
         .filter_map(|a| match &a.value {
@@ -2315,6 +2358,16 @@ fn run_command(
             Value::Array(_) => None,
         })
         .collect();
+    if EXITING_SHELL.load(std::sync::atomic::Ordering::Relaxed)
+        && !overrides.iter().any(|(k, _)| k == "SHLVL")
+        && with_shell(|s| {
+            s.func_depth == 0 && !s.traps.contains_key(&0) && !s.functions.contains_key("TRAPEXIT")
+        })
+    {
+        if let Ok(n) = var_get("SHLVL").trim().parse::<i64>() {
+            overrides.push(("SHLVL".to_string(), (n - 1).max(0).to_string()));
+        }
+    }
     let env = build_env(&overrides);
     // `-cmd` (the `-` precommand) gives the program a dashed argument zero;
     // `command -p` looks only in the default PATH.
@@ -2435,13 +2488,21 @@ fn exec_builtin(args: &[String], assigns: &[Expanded], redirs: &[Redir]) -> i32 
         let st = run_command(args.to_vec(), None, assigns, &[], false, false);
         exit_shell(st);
     }
-    let overrides: Vec<(String, String)> = assigns
+    let mut overrides: Vec<(String, String)> = assigns
         .iter()
         .filter_map(|a| match &a.value {
             Value::Scalar(v) if a.subscript.is_none() => Some((a.name.clone(), v.clone())),
             _ => None,
         })
         .collect();
+    if (crate::shell::SUBSHELL_LEVEL.load(std::sync::atomic::Ordering::Relaxed) == 0
+        || EXITING_SHELL.load(std::sync::atomic::Ordering::Relaxed))
+        && !overrides.iter().any(|(k, _)| k == "SHLVL")
+    {
+        if let Ok(n) = var_get("SHLVL").trim().parse::<i64>() {
+            overrides.push(("SHLVL".to_string(), (n - 1).max(0).to_string()));
+        }
+    }
     let env = if clear {
         overrides
     } else {
@@ -2887,7 +2948,14 @@ fn exec_pipeline(cmds: &[Node], bang: bool) -> i32 {
 /// pipeline.
 fn set_pipestatus(codes: &[i32]) {
     let items = codes.iter().map(|c| c.to_string()).collect();
-    with_shell(|s| s.store("pipestatus", crate::params::Value::Array(items)));
+    with_shell(|s| {
+        if s.param("pipestatus")
+            .is_some_and(|p| p.level > 0 && p.attrs & crate::params::HIDE != 0)
+        {
+            return;
+        }
+        s.store("pipestatus", crate::params::Value::Array(items));
+    });
 }
 
 fn run_pipeline(cmds: &[Node]) -> i32 {
@@ -3191,10 +3259,15 @@ fn exec_and_or(first: &Node, rest: &[(AndOrOp, Node)]) -> i32 {
 
 fn exec_list(items: &[ListItem]) -> i32 {
     let mut status = last_status();
-    for item in items {
+    let exiting = EXITING_SHELL.load(std::sync::atomic::Ordering::Relaxed);
+    for (k, item) in items.iter().enumerate() {
         if flow_pending() {
             break;
         }
+        EXITING_SHELL.store(
+            exiting && k + 1 == items.len() && !item.background,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         status = if item.background {
             exec_background(&item.node)
         } else {
@@ -3673,11 +3746,12 @@ fn run_whole(src: &str) -> i32 {
                     ParseError::Incomplete => "syntax error: unexpected end of file".to_string(),
                 };
                 // An unclosed quote is reported where the input ends.
-                let line = if msg.starts_with("unmatched") {
-                    src.matches('\n').count() + 1
-                } else {
-                    parser.line()
-                };
+                let line =
+                    if msg.starts_with("unmatched") && !crate::options::is_set("cshjunkiequotes") {
+                        src.matches('\n').count() + 1
+                    } else {
+                        parser.line()
+                    };
                 crate::shell::with_err_ctx(|e| e.lineno = line);
                 shell_err(&msg);
                 let st = parse_error_status();
@@ -3687,13 +3761,19 @@ fn run_whole(src: &str) -> i32 {
         }
     }
     let mut status = 0;
-    for node in &nodes {
+    let exiting = EXITING_SHELL.swap(false, std::sync::atomic::Ordering::Relaxed);
+    for (k, node) in nodes.iter().enumerate() {
         if flow_pending() {
             break;
         }
+        EXITING_SHELL.store(
+            exiting && k + 1 == nodes.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         status = exec_with_debug(node);
         crate::trap::run_pending();
     }
+    EXITING_SHELL.store(false, std::sync::atomic::Ordering::Relaxed);
     status
 }
 
@@ -3717,11 +3797,12 @@ fn run_parsed(src: &str) -> i32 {
                     ParseError::Incomplete => "syntax error: unexpected end of file".to_string(),
                 };
                 // An unclosed quote is reported where the input ends.
-                let line = if msg.starts_with("unmatched") {
-                    src.matches('\n').count() + 1
-                } else {
-                    parser.line()
-                };
+                let line =
+                    if msg.starts_with("unmatched") && !crate::options::is_set("cshjunkiequotes") {
+                        src.matches('\n').count() + 1
+                    } else {
+                        parser.line()
+                    };
                 crate::shell::with_err_ctx(|e| e.lineno = line);
                 shell_err(&msg);
                 // zsh's `.` gives 126 for a file it can't parse.
@@ -3801,7 +3882,10 @@ fn command_subst_in(src: &str) -> (String, i32) {
             libc::dup2(w, 1);
             libc::close(w);
         }
-        let st = run_string(src);
+        EXITING_SHELL.store(false, std::sync::atomic::Ordering::Relaxed);
+        let base = crate::shell::with_err_ctx(|e| e.lineno.saturating_sub(1));
+        let prefixed = format!("{}{}", "\n".repeat(base), src);
+        let st = run_string(&prefixed);
         exit_child(st);
     }
     close(w);
@@ -3870,7 +3954,10 @@ fn process_subst_in(src: &str, read: bool) -> Option<String> {
             libc::dup2(theirs, if read { 1 } else { 0 });
             libc::close(theirs);
         }
-        let st = run_string(src);
+        EXITING_SHELL.store(false, std::sync::atomic::Ordering::Relaxed);
+        let base = crate::shell::with_err_ctx(|e| e.lineno.saturating_sub(1));
+        let prefixed = format!("{}{}", "\n".repeat(base), src);
+        let st = run_string(&prefixed);
         exit_child(st);
     }
     close(theirs);

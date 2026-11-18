@@ -517,6 +517,8 @@ pub struct Lexer {
     tok_start: usize,
     // Whether `#` at the start of a word starts a comment.
     pub comments: bool,
+    // Inside `{ ... }` command groups: trailing `}` splits off words.
+    pub brace_depth: usize,
 }
 
 impl Lexer {
@@ -532,6 +534,7 @@ impl Lexer {
             line_offset: 0,
             tok_start: 0,
             comments: true,
+            brace_depth: 0,
         }
     }
 
@@ -923,10 +926,24 @@ impl Lexer {
 
     fn read_word(&mut self) -> Result<String, LexError> {
         let mut out = String::new();
+        let mut brace_depth = 0usize;
         while self.pos < self.chars.len() {
             let c = self.chars[self.pos];
             match c {
                 ' ' | '\t' | '\n' => break,
+                // zsh splits an unpaired trailing `}` off a word inside `{ ... }`
+                // groups so `{cmd}` and `ALIAS}` work cleanly before aliases.
+                '}' if !out.is_empty()
+                    && self.brace_depth > 0
+                    && brace_depth == 0
+                    && !crate::options::is_set("ignorebraces")
+                    && !crate::exec::sh_emulation_pub()
+                    && self.chars.get(self.pos + 1).is_none_or(|&n| {
+                        matches!(n, ' ' | '\t' | '\n') || is_operator_start(n)
+                    }) =>
+                {
+                    break;
+                }
                 // Process substitution `<(...)` / `>(...)` at word start.
                 // Process substitution, also inside a word as in zsh.
                 '<' | '>'
@@ -1029,6 +1046,31 @@ impl Lexer {
                     out.extend(&self.chars[self.pos..end]);
                     self.pos = end;
                 }
+                '$' if self.chars.get(self.pos + 1) == Some(&'\\')
+                    && self.chars.get(self.pos + 2) == Some(&'\n')
+                    && self.chars.get(self.pos + 3) == Some(&'(') =>
+                {
+                    let open = self.pos + 3;
+                    let end = match scan_arith(&self.chars, open) {
+                        Some(e) => Some(e),
+                        None => scan_paren(&self.chars, open),
+                    };
+                    match end {
+                        Some(end) => {
+                            out.push('$');
+                            out.extend(&self.chars[open..end]);
+                            self.pos = end;
+                        }
+                        None => {
+                            self.pos = open;
+                            let rest: String = self.chars[open + 1..].iter().collect();
+                            return Err(self.incomplete(&format!(
+                                "parse error near `$({}'",
+                                rest.trim_end_matches('\n')
+                            )));
+                        }
+                    }
+                }
                 '$' if self.pos + 1 < self.chars.len() => {
                     let next = self.chars[self.pos + 1];
                     let end = match next {
@@ -1078,6 +1120,16 @@ impl Lexer {
                             self.pos += 1;
                         }
                     }
+                }
+                '{' => {
+                    brace_depth += 1;
+                    out.push('{');
+                    self.pos += 1;
+                }
+                '}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    out.push('}');
+                    self.pos += 1;
                 }
                 c => {
                     out.push(c);

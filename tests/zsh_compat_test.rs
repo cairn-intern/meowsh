@@ -1639,3 +1639,44 @@ fn local_loops_warning_comes_from_the_caller() {
         err
     );
 }
+
+#[test]
+fn parameter_flags_q_g_qx_and_seconds() {
+    let (_, out, _) = sh("foo='\\u65\\0123^X\\C-x'; print -r -- ${(g::)foo}; \
+         bar='\\u65\\123'; print -r -- ${(g:o:)bar}; \
+         q='playing '\\''stupid'\\'' \"games\"'; print -r -- ${(q-)q}; \
+         s=\"three so-called 'words'\"; print -r -- ${(q+)s}; \
+         SECONDS=8888; print $(( SECONDS >= 8888 ))");
+    assert_eq!(
+        out,
+        "eS^X\\C-x\neS\n'playing '\\'stupid\\'' \"games\"'\n'three so-called '\\''words'\\'\n1\n"
+    );
+    let (st, _, err) = sh("u='unmatched \"'; print ${(QX)u}");
+    assert_eq!(st, 1);
+    assert!(err.contains("unmatched \""), "{}", err);
+}
+
+#[test]
+fn tied_unset_and_shlvl_implicit_exec_and_noexec() {
+    let (_, out, _) = sh(
+        "f() { local S=a:b; typeset -T S s; unset S; set -A s x y; print $S $s; unset s; S=m:n; print $S $s; }; f",
+    );
+    assert_eq!(out, "x y\nm:n\n");
+    let exe = env!("CARGO_BIN_EXE_meowsh");
+    let (_, out, _) = sh(&format!("SHLVL=1 {} -fc 'echo $SHLVL'", exe));
+    assert_eq!(out, "2\n");
+    let (st, _, err) = sh("(setopt noexec\n: ${(el.20..X.)$bar})");
+    assert_eq!(st, 1);
+    assert!(err.contains("bad substitution"), "{}", err);
+}
+
+#[test]
+fn aliases_short_loops_and_ignoreclosebraces() {
+    let (_, out, _) = sh("setopt ignoreclosebraces; alias OPEN='{' CLOSE='};'; \
+         eval '{ OPEN print hi; CLOSE }\nvar=$({ OPEN print bye; CLOSE}) && print $var'; \
+         alias WI='while {false}'; eval 'echo $(WI blah)'");
+    assert_eq!(out, "hi\nbye\n\n");
+    let (st, out, err) = sh("print something=${:-=(echo 'C,D),(F,G)'}");
+    assert_eq!((st, out.as_str()), (1, ""));
+    assert!(err.contains("unterminated `=(...)'"), "{}", err);
+}

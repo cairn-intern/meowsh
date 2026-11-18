@@ -70,6 +70,8 @@ struct Ctx {
     magic_eq: bool,
     // Brace expansion follows: an `=cmd` holding braces waits for it.
     braces_after: bool,
+    // Inside the default word of `${x:-word}`: `=cmd` expands at index 0.
+    in_braced_word: bool,
 }
 
 impl Ctx {
@@ -87,6 +89,7 @@ impl Ctx {
             subst_tag: 0,
             magic_eq: false,
             braces_after: false,
+            in_braced_word: false,
         }
         .with_option_tags()
     }
@@ -146,7 +149,7 @@ enum Val {
 }
 
 fn ifs() -> String {
-    var_get_opt("IFS").unwrap_or_else(|| " \t\n".to_string())
+    var_get_opt("IFS").unwrap_or_else(|| " \t\n\0".to_string())
 }
 
 fn ifs_first() -> String {
@@ -229,6 +232,12 @@ fn lookup(name: &str) -> Val {
         }
         _ => {}
     }
+    if with_shell(|s| {
+        s.param(name)
+            .is_some_and(|p| p.attrs & crate::params::NAMEREF != 0 && p.text().is_empty())
+    }) {
+        return Val::Unset;
+    }
     let resolved = crate::shell::resolve_ref(name);
     if resolved != name {
         return match resolved.find('[') {
@@ -283,7 +292,7 @@ fn emit_tagged(ctx: &mut Ctx, s: &str, flag: u8) {
 
 fn emit_list(ctx: &mut Ctx, items: &[String], star: bool, quoted: bool) {
     if !ctx.split || (quoted && star) {
-        let sep = if star { ifs_first() } else { " ".to_string() };
+        let sep = ifs_first();
         emit_str(ctx, &items.join(&sep), quoted);
         return;
     }
@@ -428,11 +437,14 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
             // `=(cmd)`: a temporary file holding cmd's output.
             '=' if mode == Mode::Unquoted
                 && i == 0
-                && ctx.unquoted_lit == 0
+                && (ctx.unquoted_lit == 0 || ctx.in_braced_word)
                 && chars.get(1) == Some(&'(')
                 && !sh_mode() =>
             {
-                let (ie, next) = bounds(scan_paren(chars, 1), n);
+                let Some(next) = scan_paren(chars, 1) else {
+                    return fail("unterminated `=(...)'");
+                };
+                let ie = next - 1;
                 let src: String = chars[2..ie.max(2)].iter().collect();
                 match crate::exec::output_file_subst(&src) {
                     Some(path) => {
@@ -447,10 +459,10 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
             // EQUALS: `=cmd` is the path of command cmd.
             '=' if mode == Mode::Unquoted
                 && i == 0
-                && ctx.unquoted_lit == 0
-                && chars
-                    .get(1)
-                    .is_some_and(|c| c.is_alphanumeric() || "_-.".contains(*c))
+                && (ctx.unquoted_lit == 0 || ctx.in_braced_word)
+                && chars.get(1).is_some_and(|c| {
+                    c.is_alphanumeric() || "_-.".contains(*c) || (ctx.in_braced_word && *c == ' ')
+                })
                 && !ctx.magic_eq
                 && !(ctx.braces_after && chars.contains(&'{'))
                 && crate::options::is_set("equals") =>
@@ -474,7 +486,7 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
             '<' | '>'
                 if mode == Mode::Unquoted
                     && IN_BRACES.with(|b| b.get()) == 0
-                    && (i > 0 || ctx.unquoted_lit == 0)
+                    && (i > 0 || ctx.unquoted_lit == 0 || ctx.in_braced_word)
                     && chars.get(i + 1) == Some(&'(')
                     // Not the end of a numeric glob such as `<->(.)`.
                     && !(c == '>'
@@ -482,7 +494,10 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                             crate::lexer::numeric_range_len(chars, k) == Some(i + 1 - k)
                         })) =>
             {
-                let (ie, next) = bounds(scan_paren(chars, i + 1), n);
+                let Some(next) = scan_paren(chars, i + 1) else {
+                    return fail(&format!("unterminated `{}(...)'", c));
+                };
+                let ie = next - 1;
                 let src: String = chars[i + 2..ie.max(i + 2)].iter().collect();
                 match crate::exec::process_subst(&src, c == '<') {
                     Some(path) => {
@@ -1016,11 +1031,19 @@ fn name_with_subscript(chars: &[char], i: usize) -> usize {
                 }
             }
             '\\' => k += 1,
-            // Quotes may appear inside a subscript.
-            q @ ('"' | '\'') => match chars[k + 1..].iter().position(|&c| c == q) {
-                Some(p) => k += p + 1,
-                None => return j,
-            },
+            // Quotes may appear inside a subscript (or a single raw `"`).
+            q @ ('"' | '\'') => {
+                let mut p = k + 1;
+                while p < chars.len() && chars[p] != q && chars[p] != '\n' {
+                    if chars[p] == '\\' && q == '"' {
+                        p += 1;
+                    }
+                    p += 1;
+                }
+                if chars.get(p) == Some(&q) {
+                    k = p;
+                }
+            }
             // Blanks may appear inside, as in "$x[p + 1, -1]"; words the
             // lexer split never reach here with them.
             '\n' => return j,
@@ -1338,6 +1361,7 @@ fn word_val(word: &[char], mode: Mode) -> ExpResult<Val> {
     let mut tmp = Ctx::new(true, false);
     if mode == Mode::Unquoted {
         tmp.unquoted_lit = tmp.param_tag;
+        tmp.in_braced_word = true;
     }
     let m = if mode == Mode::Heredoc {
         Mode::Dq
@@ -1345,6 +1369,9 @@ fn word_val(word: &[char], mode: Mode) -> ExpResult<Val> {
         mode
     };
     walk(word, m, &mut tmp)?;
+    if mode == Mode::Unquoted && !crate::options::is_set("ignorebraces") {
+        tmp.fields = tmp.fields.iter().flat_map(|f| brace_expand(f)).collect();
+    }
     Ok(Val::Tagged(tmp.fields))
 }
 
@@ -1366,9 +1393,30 @@ fn ksh_index(i: i64) -> i64 {
     }
 }
 
-// KSH_ARRAYS: `$arr` without a subscript is the first element.
+// KSH_ARRAYS: `$arr` without a subscript is the first element (or key `"0"`
+// of an associative array in ksh emulation).
 fn ksh_first(name: &str, val: Val) -> Val {
-    if !ksh_arrays() || !with_shell(|s| s.array(name).is_some()) {
+    if !ksh_arrays() {
+        return val;
+    }
+    let _swap = crate::shell::RefSwap::enter(name);
+    let resolved = crate::shell::resolve_ref(name);
+    if resolved.contains('[') {
+        return val;
+    }
+    if with_shell(|s| s.assoc(&resolved).is_some()) {
+        if with_shell(|s| s.emulation == crate::options::Emulation::Ksh) {
+            return match assoc_get(&resolved, "0") {
+                Some(v) => Val::Str(v),
+                None => Val::Unset,
+            };
+        }
+        return match val {
+            Val::List(items, _) => items.into_iter().next().map(Val::Str).unwrap_or(Val::Unset),
+            v => v,
+        };
+    }
+    if !with_shell(|s| s.array(&resolved).is_some()) {
         return val;
     }
     match val {
@@ -1426,6 +1474,9 @@ fn apply_subscript(val: Val, sub: &str) -> ExpResult<Val> {
     if second.is_none() {
         if let Some((f, word)) = parse_sub_flags(&first) {
             if f.search() {
+                if matches!(val, Val::Unset) {
+                    return Ok(Val::Unset);
+                }
                 return search_single(&items, list, &f, word);
             }
         }
@@ -1590,20 +1641,32 @@ fn parse_sub_flags(sub: &str) -> Option<(SubSearch, &str)> {
 
 // A subscript pattern: unlike other patterns, characters that come from
 // parameter values are active (zsh tokenizes the expanded subscript).
-fn subscript_pattern(word: &str) -> ExpResult<String> {
-    // zsh keeps the backslash of `\"` in a subscript pattern, so `a\"b`
-    // finds the key `a\"b`.
+fn subscript_pattern(word: &str, in_dq: bool) -> ExpResult<String> {
+    // Unquoted, zsh keeps the backslash of `\"` in a subscript pattern, so
+    // `a\"b` finds the key `a\"b`; in double quotes `\"` was unquoted to `"`.
     let mut text = String::new();
-    let mut bs = 0;
-    for c in word.chars() {
-        if c == '"' && bs % 2 == 1 {
-            text.pop();
-            text.push_str("\\\\\\\\\\\"");
-            bs = 0;
-            continue;
+    if !in_dq {
+        let mut bs = 0;
+        for c in word.chars() {
+            if c == '"' && bs % 2 == 1 {
+                text.pop();
+                text.push_str("\\\\\\\\\\\"");
+                bs = 0;
+                continue;
+            }
+            bs = if c == '\\' { bs + 1 } else { 0 };
+            text.push(c);
         }
-        bs = if c == '\\' { bs + 1 } else { 0 };
-        text.push(c);
+    } else {
+        let mut bs = 0;
+        for c in word.chars() {
+            if c == '"' && bs % 2 == 0 {
+                text.push_str("\\\"");
+                continue;
+            }
+            bs = if c == '\\' { bs + 1 } else { 0 };
+            text.push(c);
+        }
     }
     let chars: Vec<char> = text.chars().collect();
     let mut ctx = Ctx::new(false, false);
@@ -1694,7 +1757,7 @@ fn search_chars(s: &str, f: &SubSearch, word: &str, a2: bool) -> ExpResult<i64> 
     let mut pat = if f.exact {
         crate::pattern::escape(&expand_string(word)?)
     } else {
-        subscript_pattern(word)?
+        subscript_pattern(word, IN_DQ_SUB.with(|d| d.get()))?
     };
     if a2 {
         if !pat.starts_with('*') {
@@ -1798,7 +1861,7 @@ fn unit_matcher(word: &str, exact: bool) -> ExpResult<impl Fn(&str) -> bool> {
     let pat = if exact {
         crate::pattern::escape(&expand_string(word)?)
     } else {
-        subscript_pattern(word)?
+        subscript_pattern(word, IN_DQ_SUB.with(|d| d.get()))?
     };
     let p = crate::pattern::Pattern::new(&pat);
     Ok(move |v: &str| p.matches(v))
@@ -1893,7 +1956,7 @@ fn matcher(word: &str, exact: bool) -> ExpResult<impl Fn(&str) -> bool> {
     let pat = if exact {
         expand_string(word)?
     } else {
-        subscript_pattern(word)?
+        subscript_pattern(word, IN_DQ_SUB.with(|d| d.get()))?
     };
     Ok(move |v: &str| {
         let m = if exact {
@@ -1903,6 +1966,34 @@ fn matcher(word: &str, exact: bool) -> ExpResult<impl Fn(&str) -> bool> {
         };
         m != negate
     })
+}
+
+// `${(k)name[sub]}` (and ksh `${!name[sub]}`): on a hash, the key; on an
+// array, the index (and a range is an invalid subscript).
+fn keys_subscript_value(name: &str, sub: &str) -> ExpResult<Val> {
+    let _swap = crate::shell::RefSwap::enter(name);
+    let resolved = crate::shell::resolve_ref(name);
+    if resolved.contains('[') {
+        return param_value(name, Some(sub));
+    }
+    if assoc_keys(&resolved).is_some() {
+        return Ok(Val::Str(assoc_key(sub)?));
+    }
+    if let Some(items) = with_shell(|s| s.array(&resolved).cloned()) {
+        let subc: Vec<char> = sub.chars().collect();
+        if top_comma(&subc).is_some() {
+            return fail("invalid subscript");
+        }
+        let mut a = sub_index(sub, &items, true, false)?;
+        if a < 0 {
+            a += items.len() as i64 + 1;
+        }
+        if a > 0 && ksh_arrays() {
+            a -= 1;
+        }
+        return Ok(Val::Str(a.to_string()));
+    }
+    param_value(name, Some(sub))
 }
 
 // Value of `name[sub]` for a named parameter.
@@ -2669,66 +2760,94 @@ fn quote_minimal(s: &str, plus: bool) -> String {
         out.push('\'');
         return out;
     }
-    let special = |c: char| c.is_whitespace() || "|&;<>()$`\\\"*?[]#~=%{}!^".contains(c);
-    let needs = s.chars().any(special);
-    if !needs && !s.contains('\'') {
+    let special = |k: usize, c: char| {
+        c == '\''
+            || c.is_whitespace()
+            || "|&;<>()$`\\\"*?[]#%^!".contains(c)
+            || (matches!(c, '~' | '=') && k == 0)
+    };
+    if !s.chars().enumerate().any(|(k, c)| special(k, c)) {
         return s.to_string();
     }
-    if !needs && !plus {
-        return s.replace('\'', "\\'");
-    }
     let rc = crate::options::is_set("rcquotes");
-    let mut out = String::from("'");
-    let mut open = true;
-    for c in s.chars() {
-        if c == '\'' {
-            if rc && open {
-                out.push_str("''");
-            } else {
-                if open {
-                    out.push('\'');
-                    open = false;
+    if plus {
+        let mut out = String::new();
+        let mut inquote = false;
+        for c in s.chars() {
+            if c == '\'' {
+                if rc {
+                    if !inquote {
+                        out.push('\'');
+                        inquote = true;
+                    }
+                    out.push_str("''");
+                } else {
+                    if inquote {
+                        out.push('\'');
+                        inquote = false;
+                    }
+                    out.push_str("\\'");
                 }
-                out.push_str("\\'");
+            } else {
+                if !inquote {
+                    out.push('\'');
+                    inquote = true;
+                }
+                out.push(c);
+            }
+        }
+        if inquote {
+            out.push('\'');
+        }
+        return out;
+    }
+    let mut out = String::new();
+    let mut quotesub = false;
+    let mut quotestart = 0;
+    for (k, c) in s.chars().enumerate() {
+        if special(k, c) {
+            if !quotesub {
+                if c == '\'' {
+                    out.push('\\');
+                    out.push('\'');
+                } else {
+                    out.insert(quotestart, '\'');
+                    quotesub = true;
+                    out.push(c);
+                }
+                quotestart = out.len();
+            } else if c == '\'' {
+                if !rc {
+                    out.push_str("'\\'");
+                    quotesub = false;
+                    quotestart = out.len();
+                } else {
+                    out.push_str("''");
+                }
+            } else {
+                out.push(c);
             }
         } else {
-            if !open {
-                out.push('\'');
-                open = true;
-            }
             out.push(c);
         }
     }
-    if open {
+    if quotesub {
         out.push('\'');
     }
     out
 }
 
-// (g:opts:): echo/print-style escapes; `e` adds \e and \M-, `c` ^X.
+// (g:opts:): echo/print-style escapes; `o` bare octal, `e` \E/\M-/\C-, `c` ^X.
 fn g_escapes(s: &str, opts: &str) -> String {
-    let mut out = decode_escapes(s);
-    if opts.contains('c') {
-        let chars: Vec<char> = out.chars().collect();
-        let mut r = String::new();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '^' && i + 1 < chars.len() {
-                let c = chars[i + 1];
-                r.push(if c == '?' {
-                    '\x7f'
-                } else {
-                    char::from((c.to_ascii_uppercase() as u8) & 0x1f)
-                });
-                i += 2;
-            } else {
-                r.push(chars[i]);
-                i += 1;
-            }
-        }
-        out = r;
-    }
-    out
+    let chars: Vec<char> = s.chars().collect();
+    let emacs = opts.contains('e');
+    ansi_c_opts(
+        &chars,
+        !emacs,
+        opts.contains('o'),
+        emacs,
+        opts.contains('c'),
+    )
 }
 
 pub(crate) fn backslash_quote(s: &str) -> String {
@@ -2747,6 +2866,10 @@ pub(crate) fn backslash_quote(s: &str) -> String {
 
 // One level of shell quote removal, without expansion.
 fn unquote(s: &str) -> String {
+    unquote_checked(s, false).unwrap_or_default()
+}
+
+fn unquote_checked(s: &str, report: bool) -> ExpResult<String> {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -2757,15 +2880,25 @@ fn unquote(s: &str) -> String {
                 i += 2;
             }
             '\'' => {
-                let end = scan_squote(&chars, i).unwrap_or(chars.len() + 1);
-                out.extend(&chars[i + 1..(end - 1).min(chars.len())]);
+                let Some(end) = scan_squote(&chars, i) else {
+                    if report {
+                        return fail("unmatched '");
+                    }
+                    out.extend(&chars[i + 1..]);
+                    break;
+                };
+                out.extend(&chars[i + 1..end - 1]);
                 i = end;
             }
             '$' if chars.get(i + 1) == Some(&'\'') => {
-                let end = scan_dollar_squote(&chars, i + 1).unwrap_or(chars.len() + 1);
-                out.push_str(&dollar_squote_text(
-                    &chars[i + 2..(end - 1).min(chars.len())],
-                ));
+                let Some(end) = scan_dollar_squote(&chars, i + 1) else {
+                    if report {
+                        return fail("unmatched '");
+                    }
+                    out.push_str(&dollar_squote_text(&chars[i + 2..]));
+                    break;
+                };
+                out.push_str(&dollar_squote_text(&chars[i + 2..end - 1]));
                 i = end;
             }
             '"' => {
@@ -2781,6 +2914,9 @@ fn unquote(s: &str) -> String {
                     out.push(chars[i]);
                     i += 1;
                 }
+                if i >= chars.len() && report {
+                    return fail("unmatched \"");
+                }
                 i += 1;
             }
             c => {
@@ -2789,7 +2925,7 @@ fn unquote(s: &str) -> String {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 // `(z)`: splits like the shell lexer, keeping quotes in the words.
@@ -2842,6 +2978,16 @@ fn shell_words(s: &str, opts: &str) -> Vec<String> {
         let tok = match lx.next_token() {
             Ok(t) => t,
             Err(_) => {
+                if crate::options::is_set("cshjunkiequotes") && matches!(chars[p], '\'' | '"' | '`')
+                {
+                    let mut nl = p + 1;
+                    while nl < n && (chars[nl] != '\n' || chars[nl - 1] == '\\') {
+                        nl += 1;
+                    }
+                    out.push(chars[p..nl].iter().collect());
+                    lx.set_pos(nl);
+                    continue;
+                }
                 out.push(rest_from(p));
                 break;
             }
@@ -2927,6 +3073,13 @@ pub fn param_type(name: &str) -> String {
 // `${(t)...}` of the specials computed on each read (no parameter of
 // their own unless a user's hides them), as zsh reports them.
 fn computed_special_type(name: &str) -> Option<String> {
+    if !crate::exec::sh_emulation_pub() && !with_shell(|s| s.param(name).is_some()) {
+        match name {
+            "zsh_eval_context" => return Some("array-readonly-tied-special".to_string()),
+            "ZSH_EVAL_CONTEXT" => return Some("scalar-readonly-tied-special".to_string()),
+            _ => {}
+        }
+    }
     if !crate::shell::DYNAMIC_NAMES.contains(&name) || with_shell(|s| s.param(name).is_some()) {
         return None;
     }
@@ -3196,6 +3349,50 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             ifs_done = true;
             Val::Tagged(out)
         }
+        Val::Tagged(fields)
+            if !quoted
+                && f.quote == 1
+                && !f.quote_min
+                && !f.unquote
+                && !f.eval
+                && f.split.is_none()
+                && f.join.is_none()
+                && !f.ifs_split
+                && f.case.is_none()
+                && f.pad_left.is_none()
+                && f.pad_right.is_none() =>
+        {
+            // zsh's (q) (QT_BACKSLASH) does not untokenize an unquoted
+            // literal word from ${:-word}: tokenized `=` (at index 0) and
+            // pattern characters stay unescaped and active.
+            let mut out = Vec::new();
+            for field in &fields {
+                let clean: Vec<(char, u8)> = field
+                    .iter()
+                    .copied()
+                    .filter(|(_, t)| t & MARK == 0)
+                    .collect();
+                if clean.is_empty() {
+                    out.push(vec![('\'', Q), ('\'', Q)]);
+                    continue;
+                }
+                let mut qf = Vec::new();
+                for (k, &(c, t)) in clean.iter().enumerate() {
+                    if t & B != 0 && ((c == '=' && k == 0) || "*?[]~#^".contains(c)) {
+                        qf.push((c, 0));
+                        continue;
+                    }
+                    if " \t\n\\'\"`$&|;<>()[]{}*?#^".contains(c)
+                        || (matches!(c, '~' | '=') && k == 0)
+                    {
+                        qf.push(('\\', Q));
+                    }
+                    qf.push((c, Q));
+                }
+                out.push(qf);
+            }
+            return Ok(Val::Tagged(out));
+        }
         v => v,
     };
     let mut val = plain(val);
@@ -3294,7 +3491,11 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
     list = is_list(&val) || list;
     let mut items = val_items(&val);
     if matches!(val, Val::Unset) && !list {
-        return Ok(Val::Unset);
+        if f.quote > 0 || f.quote_min || f.pad_left.is_some() || f.pad_right.is_some() {
+            items.push(String::new());
+        } else {
+            return Ok(Val::Unset);
+        }
     }
     for s in items.iter_mut() {
         match f.case {
@@ -3324,7 +3525,7 @@ fn apply_flags(val: Val, f: &PFlags, quoted: bool) -> ExpResult<Val> {
             *s = g_escapes(s, g);
         }
         if f.unquote {
-            *s = unquote(s);
+            *s = unquote_checked(s, f.report)?;
         }
         if f.quote_min {
             *s = quote_minimal(s, f.quote_plus);
@@ -3510,7 +3711,8 @@ fn nofork(body: &[char], quoted: bool) -> ExpResult<Option<Val>> {
             }
         });
     }
-    let mut st = crate::exec::run_string_named(&code, None);
+    let mut st =
+        crate::shell::in_eval_context("cmdsubst", || crate::exec::run_string_named(&code, None));
     with_shell(|s| match s.flow {
         crate::types::Flow::Return(n) => {
             st = n;
@@ -3583,11 +3785,19 @@ thread_local! {
 
 fn braced(body: &[char], mode: Mode) -> ExpResult<Val> {
     IN_BRACES.with(|b| b.set(b.get() + 1));
+    let prev_dq = IN_DQ_SUB.with(|d| {
+        let p = d.get();
+        if mode == Mode::Dq {
+            d.set(true);
+        }
+        p
+    });
     let outer = STAR_EXTGLOB.with(|s| s.replace(false));
     let r = braced_inner(body, mode);
     if STAR_EXTGLOB.with(|s| s.replace(outer)) {
         crate::options::set("extendedglob", false);
     }
+    IN_DQ_SUB.with(|d| d.set(prev_dq));
     IN_BRACES.with(|b| b.set(b.get() - 1));
     r
 }
@@ -3815,6 +4025,11 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             s
         };
         i += end;
+        // In ksh emulation, `${!name...}` is zsh's `${(k)name...}`.
+        if indirect && with_shell(|s| s.emulation == crate::options::Emulation::Ksh) {
+            flags.keys = true;
+            indirect = false;
+        }
         // ${!ref} on a nameref: the name it refers to.
         let is_ref = with_shell(|s| {
             s.param(&name)
@@ -3838,7 +4053,16 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             }
         }
         if set_test && i == body.len() {
-            let set = if (name == "commands" || name == "functions") && sub.is_some() {
+            let set = if flags.no_deref && sub.is_none() {
+                with_shell(|s| {
+                    s.param(&name).is_some_and(|p| {
+                        p.is_set()
+                            && !(p.attrs & crate::params::NAMEREF != 0
+                                && p.attrs & crate::params::DECLARED != 0
+                                && p.text().is_empty())
+                    })
+                })
+            } else if (name == "commands" || name == "functions") && sub.is_some() {
                 !matches!(param_value(&name, sub.as_deref())?, Val::Unset)
             } else if let Some(s) = &sub {
                 // ${+name[key]}: is the element set?
@@ -3848,13 +4072,16 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             };
             return Ok(Val::Str(if set { "1" } else { "0" }.into()));
         }
-        let own_ref = (flags.no_deref && sub.is_none())
+        let own_ref = flags
+            .no_deref
             .then(|| {
                 with_shell(|s| {
                     s.param(&name)
                         .filter(|p| p.attrs & crate::params::NAMEREF != 0)
                         .map(|p| {
-                            if p.attrs & crate::params::UNSET != 0 {
+                            if p.attrs & crate::params::UNSET != 0
+                                || (p.attrs & crate::params::DECLARED != 0 && p.text().is_empty())
+                            {
                                 Val::Unset
                             } else {
                                 Val::Str(p.text())
@@ -3862,7 +4089,12 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
                         })
                 })
             })
-            .flatten();
+            .flatten()
+            .map(|v| match &sub {
+                Some(s) => apply_subscript(v, s),
+                None => Ok(v),
+            })
+            .transpose()?;
         val = if let Some(v) = own_ref {
             v
         } else if name == "commands" && sub.is_none() && flags.keys {
@@ -3881,6 +4113,9 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         {
             // `${(k)h}`, and `${(k)h[@]}` on an association.
             match assoc_keys(&name) {
+                Some(_) if sub.is_none() && ksh_arrays() => {
+                    ksh_first(&name, param_value(&name, None)?)
+                }
                 Some(keys) if flags.values => Val::List(
                     keys.iter()
                         .flat_map(|k| [k.clone(), assoc_get(&name, k).unwrap_or_default()])
@@ -3888,7 +4123,7 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
                     false,
                 ),
                 Some(keys) => Val::List(keys, true),
-                None => param_value(&name, None)?,
+                None => ksh_first(&name, param_value(&name, None)?),
             }
         } else if flags.keys
             && assoc_keys(&name).is_some()
@@ -3919,6 +4154,14 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
                 Some(k) => Val::Str(k),
                 None => Val::Unset,
             }
+        } else if flags.keys
+            && !flags.values
+            && sub
+                .as_deref()
+                .is_some_and(|s| !matches!(s, "@" | "*") && search_flags(s).is_none())
+        {
+            let s = sub.clone().unwrap();
+            keys_subscript_value(&name, &s)?
         } else if sub.is_none() {
             ksh_first(&name, param_value(&name, None)?)
         } else {
@@ -3976,7 +4219,28 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
             return bad();
         }
         let s: String = body[i + 1..k].iter().collect();
-        val = apply_subscript(val, &s)?;
+        val = if flags.keys
+            && !flags.values
+            && is_list(&val)
+            && !matches!(s.as_str(), "@" | "*")
+            && search_flags(&s).is_none()
+        {
+            let subc: Vec<char> = s.chars().collect();
+            if top_comma(&subc).is_some() {
+                return fail("invalid subscript");
+            }
+            let items = val_items(&val);
+            let mut a = sub_index(&s, &items, true, false)?;
+            if a < 0 {
+                a += items.len() as i64 + 1;
+            }
+            if a > 0 && ksh_arrays() {
+                a -= 1;
+            }
+            Val::Str(a.to_string())
+        } else {
+            apply_subscript(val, &s)?
+        };
         i = k + 1;
     }
 
@@ -4134,7 +4398,8 @@ fn braced_inner(body: &[char], mode: Mode) -> ExpResult<Val> {
         // (@)) is expanded element by element.
         val = match plain(val) {
             Val::List(items, false) => Val::Rc(items),
-            other if mode == Mode::Unquoted => Val::Rc(val_items(&other)),
+            Val::List(items, true) if mode == Mode::Unquoted => Val::Rc(items),
+            Val::Str(s) if mode == Mode::Unquoted => Val::Rc(vec![s]),
             other => other,
         };
     }
@@ -4220,10 +4485,38 @@ fn assign_word(
         // `${=x=a "b c"}` splits the word, not the stored string.
         return word_val(word, mode);
     }
+    if pf.no_deref {
+        if let Some(v) = with_shell(|s| {
+            s.param(name)
+                .filter(|p| p.attrs & crate::params::NAMEREF != 0)
+                .map(|p| {
+                    if p.attrs & crate::params::UNSET != 0 {
+                        Val::Unset
+                    } else {
+                        Val::Str(p.text())
+                    }
+                })
+        }) {
+            return Ok(v);
+        }
+    }
     param_value(name, None)
 }
 
 fn assign_whole(name: &str, word: &[char], mode: Mode, pf: &PFlags) -> ExpResult<Val> {
+    if pf.no_deref
+        && pf.assign_array == 0
+        && with_shell(|s| {
+            s.param(name)
+                .is_some_and(|p| p.attrs & crate::params::NAMEREF != 0)
+        })
+    {
+        let v = word_string(word, mode)?;
+        if !crate::shell::set_ref_target(name, &v) {
+            return Err(ExpError { status: 1 });
+        }
+        return Ok(Val::Str(v));
+    }
     if pf.assign_array > 0 {
         let items = match word_val(word, mode)? {
             Val::Tagged(fields) => {
@@ -4419,6 +4712,9 @@ fn apply_operator(
             let off = eval_arith_str(&word_string(off_part, Mode::Unquoted)?)?;
             let len = match len_part {
                 Some([]) => return fail("unrecognized modifier"),
+                Some(l) if l.first() == Some(&'$') && l.contains(&'"') => {
+                    return fail(&format!("unrecognized modifier `{}'", l[0]));
+                }
                 Some(l) => Some(eval_arith_str(&word_string(l, Mode::Unquoted)?)?),
                 None => None,
             };
@@ -4619,6 +4915,10 @@ fn pattern_of(word: &[char]) -> ExpResult<String> {
     Ok(pattern_text(&ctx))
 }
 
+thread_local! {
+    static IN_DQ_SUB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// An associative array key as zsh reads a subscript: quotes are
 /// literal, a backslash is dropped only before `\`, `[` or `]`, and
 /// parameter, command and arithmetic substitutions apply.
@@ -4716,6 +5016,16 @@ fn pattern_text(ctx: &Ctx) -> String {
 
 // `keep_unknown`: an unknown escape keeps its backslash (echo); `$'...'` drops it, as zsh does.
 fn ansi_c(chars: &[char], keep_unknown: bool) -> String {
+    ansi_c_opts(chars, keep_unknown, true, true, false)
+}
+
+fn ansi_c_opts(
+    chars: &[char],
+    keep_unknown: bool,
+    octal_no_zero: bool,
+    emacs: bool,
+    caret: bool,
+) -> String {
     let mut out = String::new();
     let mut i = 0;
     let n = chars.len();
@@ -4738,7 +5048,11 @@ fn ansi_c(chars: &[char], keep_unknown: bool) -> String {
         if (*meta || *ctrl) && out.chars().count() > mark {
             let mut v = out.pop().unwrap_or_default() as u32;
             if *ctrl {
-                v = if v == u32::from(b'?') { 0x7f } else { v & 0x1f };
+                v = if v == u32::from(b'?') {
+                    0x7f
+                } else {
+                    (v as u8).to_ascii_uppercase() as u32 & 0x1f
+                };
             }
             if *meta {
                 v |= 0x80;
@@ -4751,6 +5065,11 @@ fn ansi_c(chars: &[char], keep_unknown: bool) -> String {
     while i < n {
         modify(&mut out, &mut meta, &mut ctrl, mark);
         mark = out.chars().count();
+        if caret && !ctrl && chars[i] == '^' && i + 1 < n {
+            ctrl = true;
+            i += 1;
+            continue;
+        }
         if chars[i] != '\\' || i + 1 >= n {
             out.push(chars[i]);
             i += 1;
@@ -4760,7 +5079,7 @@ fn ansi_c(chars: &[char], keep_unknown: bool) -> String {
         let c = chars[i];
         i += 1;
         match c {
-            'M' | 'C' => {
+            'M' | 'C' if emacs => {
                 if chars.get(i) == Some(&'-') {
                     i += 1;
                 }
@@ -4776,15 +5095,17 @@ fn ansi_c(chars: &[char], keep_unknown: bool) -> String {
             'r' => out.push('\r'),
             'a' => out.push('\x07'),
             'b' => out.push('\x08'),
-            'e' | 'E' => out.push('\x1b'),
+            'e' => out.push('\x1b'),
+            'E' if emacs => out.push('\x1b'),
             'f' => out.push('\x0c'),
             'v' => out.push('\x0b'),
             '\\' | '\'' | '"' | '?' => out.push(c),
-            '0'..='7' => {
-                i -= 1;
-                if let Some(v) = take_digits(&mut i, 8, 3) {
-                    out.push(char::from_u32(v & 0xff).unwrap_or('?'));
+            '0'..='7' if octal_no_zero || c == '0' => {
+                if octal_no_zero {
+                    i -= 1;
                 }
+                let v = take_digits(&mut i, 8, 3).unwrap_or(0);
+                out.push(char::from_u32(v & 0xff).unwrap_or('?'));
             }
             'x' => match take_digits(&mut i, 16, 2) {
                 Some(v) => out.push(char::from_u32(v).unwrap_or('?')),
@@ -5282,6 +5603,175 @@ pub fn expand_words(words: &[String]) -> ExpResult<Vec<String>> {
         ctxs.push(ctx);
     }
     finish_all(ctxs, do_glob)
+}
+
+/// Validates parameter expansion syntax in `word` without executing
+/// substitutions or failing on unset parameters (used under NO_EXEC).
+pub fn validate_noexec_word(word: &str) -> ExpResult<()> {
+    let chars: Vec<char> = word.chars().collect();
+    validate_walk(&chars, Mode::Unquoted)
+}
+
+fn validate_walk(chars: &[char], mode: Mode) -> ExpResult<()> {
+    let mut i = 0;
+    let n = chars.len();
+    while i < n {
+        match chars[i] {
+            '\\' => i += 2,
+            '\'' if mode == Mode::Unquoted => {
+                i = scan_squote(chars, i).unwrap_or(n);
+            }
+            '"' if mode == Mode::Unquoted => {
+                let Some(end) = scan_dquote(chars, i) else {
+                    return Ok(());
+                };
+                validate_walk(&chars[i + 1..end - 1], Mode::Dq)?;
+                i = end;
+            }
+            '`' => i = scan_bquote(chars, i).unwrap_or(n),
+            '$' if i + 1 < n => match chars[i + 1] {
+                '{' => {
+                    let Some(end) = scan_brace(chars, i + 1, mode == Mode::Dq) else {
+                        return fail("bad substitution");
+                    };
+                    validate_braced(&chars[i + 2..end - 1], mode)?;
+                    i = end;
+                }
+                '(' => {
+                    i = scan_arith(chars, i + 1)
+                        .or_else(|| scan_paren(chars, i + 1))
+                        .unwrap_or(n);
+                }
+                '\'' if mode == Mode::Unquoted => {
+                    i = scan_dollar_squote(chars, i + 1).unwrap_or(n);
+                }
+                _ => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+fn validate_braced(body: &[char], mode: Mode) -> ExpResult<()> {
+    if body.is_empty() {
+        return fail("bad substitution");
+    }
+    if matches!(body.first(), Some('|' | ' ' | '\t' | '\n')) {
+        return Ok(());
+    }
+    let mut i = 0;
+    if body[0] == '(' {
+        let Some((_, end)) = parse_flags_syntax(body) else {
+            return fail("bad substitution");
+        };
+        i = end;
+    }
+    while let Some(&c) = body.get(i) {
+        let next = body.get(i + 1).copied();
+        let starts_param = |n: Option<char>| {
+            n.is_some_and(|n| {
+                n == '_'
+                    || n == '.'
+                    || n == '$'
+                    || n == '('
+                    || n.is_alphanumeric()
+                    || is_special_param(n)
+            })
+        };
+        match c {
+            '#' if starts_param(next) && !(next == Some('#') && i + 2 < body.len()) => {}
+            '+' if starts_param(next) => {}
+            '^' if starts_param(next) || matches!(next, Some('^' | ':' | '~' | '=')) => {
+                if next == Some('^') {
+                    i += 1;
+                }
+            }
+            '=' if starts_param(next) || matches!(next, Some('=' | ':' | '~' | '^' | '"')) => {
+                if next == Some('=') {
+                    i += 1;
+                }
+            }
+            '~' => {}
+            '!' if starts_param(next) && i == 0 => {}
+            _ => break,
+        }
+        i += 1;
+    }
+    if body.get(i) == Some(&'"') {
+        let Some(end) = scan_dquote(body, i) else {
+            return fail("bad substitution");
+        };
+        validate_walk(&body[i + 1..end - 1], Mode::Dq)?;
+        i = end;
+    } else if body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'{') {
+        let Some(end) = scan_brace(body, i + 1, false) else {
+            return fail("bad substitution");
+        };
+        validate_braced(&body[i + 2..end - 1], mode)?;
+        i = end;
+    } else if body.get(i) == Some(&'$') && body.get(i + 1) == Some(&'(') {
+        let Some(end) = scan_arith(body, i + 1).or_else(|| scan_paren(body, i + 1)) else {
+            return fail("bad substitution");
+        };
+        i = end;
+    } else if let Some((_, _, end)) = parse_param(&body[i..]) {
+        i += end;
+    } else if matches!(body.get(i), Some(':' | '-' | '+' | '=' | '?')) || i == body.len() {
+    } else {
+        return fail("bad substitution");
+    }
+    while body.get(i) == Some(&'[') {
+        let end = scan_bracket_end(body, i);
+        if body.get(end) != Some(&']') {
+            return fail("bad substitution");
+        }
+        i = end + 1;
+    }
+    if i < body.len() {
+        if !matches!(
+            body[i],
+            ':' | '-' | '+' | '=' | '?' | '#' | '%' | '/' | '^' | ','
+        ) {
+            return fail("bad substitution");
+        }
+        validate_walk(&body[i..], mode)?;
+    }
+    Ok(())
+}
+
+// Lightweight flag parser that ignores runtime arithmetic errors inside
+// `(l:expr:)` during NO_EXEC syntax checks.
+fn parse_flags_syntax(body: &[char]) -> Option<(PFlags, usize)> {
+    if parse_flags(body).is_some() {
+        return parse_flags(body);
+    }
+    let mut i = 1;
+    while i < body.len() {
+        if body[i] == ')' {
+            return Some((PFlags::default(), i + 1));
+        }
+        if matches!(body[i], 'l' | 'r') {
+            i += 1;
+            let d = *body.get(i)?;
+            let close = closing_delim(d);
+            let mut k = 0;
+            while k < 3 && body.get(i) == Some(&d) {
+                i += 1;
+                while i < body.len() && body[i] != close {
+                    i += 1;
+                }
+                if i >= body.len() {
+                    return None;
+                }
+                i += 1;
+                k += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Expands a word to one string without field splitting or globbing

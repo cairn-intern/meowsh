@@ -514,9 +514,9 @@ fn builtin_eval(words: &[String]) -> i32 {
     with_shell(|s| {
         if s.error_exit {
             s.error_exit = false;
-            if matches!(s.flow, Flow::Exit(_)) {
+            if let Flow::Exit(code) = s.flow {
                 s.flow = Flow::None;
-                return 1;
+                return code;
             }
         }
         st
@@ -892,29 +892,34 @@ fn builtin_unset(words: &[String]) -> i32 {
             continue;
         }
         // A local stays local after unset (zsh): only its value goes.
+        // Unsetting either side of a non-special tied pair unsets both.
         with_shell(|s| {
-            let local = s
+            let partner = s
                 .param(a.as_str())
-                .is_some_and(|p| p.level > 0 && p.tie.is_none());
-            if local {
-                if let Some(p) = s.param_mut(a.as_str()) {
-                    // A private keeps its kind, as its own unset function
-                    // leaves it declared.
-                    let private = p.attrs & crate::params::PRIVATE != 0;
-                    p.value = match &p.value {
-                        crate::params::Value::Array(_) if private => {
-                            crate::params::Value::Array(Vec::new())
-                        }
-                        crate::params::Value::Assoc(_) if private => {
-                            crate::params::Value::Assoc(Default::default())
-                        }
-                        _ => crate::params::Value::Scalar(String::new()),
-                    };
-                    p.attrs = crate::params::UNSET
-                        | (p.attrs & (crate::params::PRIVATE | crate::params::HIDE));
+                .and_then(|p| p.tie.as_ref().map(|(o, _)| o.clone()));
+            for name in std::iter::once(a.as_str()).chain(partner.as_deref()) {
+                let local = s.param(name).is_some_and(|p| p.level > 0);
+                if local {
+                    if let Some(p) = s.param_mut(name) {
+                        // A private keeps its kind, as its own unset function
+                        // leaves it declared.
+                        let private = p.attrs & crate::params::PRIVATE != 0;
+                        p.value = match &p.value {
+                            crate::params::Value::Array(_) if private => {
+                                crate::params::Value::Array(Vec::new())
+                            }
+                            crate::params::Value::Assoc(_) if private => {
+                                crate::params::Value::Assoc(Default::default())
+                            }
+                            _ => crate::params::Value::Scalar(String::new()),
+                        };
+                        p.tie = None;
+                        p.attrs = crate::params::UNSET
+                            | (p.attrs & (crate::params::PRIVATE | crate::params::HIDE));
+                    }
+                } else {
+                    s.remove_param(name);
                 }
-            } else {
-                s.remove_param(a.as_str());
             }
         });
     }

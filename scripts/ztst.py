@@ -294,7 +294,7 @@ def build_driver(work, testdir, prep, tests, clean):
             lines.append(f"cat $ZTST_work/inraw.{k} >$ZTST_work/in.{k}")
         lines.append("ZTST_skip=")
         lines.append(
-            f'() {{ eval "$(<$ZTST_work/code.{k})" }} <$ZTST_work/in.{k} >$ZTST_work/out.{k} 2>$ZTST_work/err.{k}; '
+            f'() {{ () {{ () {{ eval "$(<$ZTST_work/code.{k})" }} }} }} <$ZTST_work/in.{k} >$ZTST_work/out.{k} 2>$ZTST_work/err.{k}; '
             f"print -r -- $? >$ZTST_work/st.{k}; "
             f'print -r -- "$ZTST_skip" >$ZTST_work/skip.{k}'
         )

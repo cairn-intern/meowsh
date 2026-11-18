@@ -234,6 +234,7 @@ impl Shell {
             .entry(name.to_string())
             .or_insert_with(|| Param::with(Value::Scalar(String::new())));
         p.value = value;
+        p.attrs &= !UNSET;
         self.sync_tie(name);
     }
 

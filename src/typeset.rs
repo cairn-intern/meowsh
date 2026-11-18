@@ -376,6 +376,9 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
     on &= !off;
 
     let posix = crate::options::is_set("posixbuiltins");
+    if cmd == "readonly" && posix && !ops.plus('g') && !ops.minus('g') {
+        ops.minus.push('g');
+    }
     let mut pf = PrintFlags::default();
     if ops.isset('p') {
         pf.typeset = true;
@@ -457,6 +460,22 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
             };
             if ops.plus('m') && value.is_none() {
                 list_params(on | roff, 0, &pf, Some(&pat));
+                if !crate::exec::sh_emulation_pub() && (on | roff) == 0 {
+                    for (ec, line) in [
+                        (
+                            "zsh_eval_context",
+                            "array readonly tied ZSH_EVAL_CONTEXT zsh_eval_context\n",
+                        ),
+                        (
+                            "ZSH_EVAL_CONTEXT",
+                            "readonly tied zsh_eval_context ZSH_EVAL_CONTEXT\n",
+                        ),
+                    ] {
+                        if with_shell(|s| s.param(ec).is_none()) && pat == ec {
+                            out(line);
+                        }
+                    }
+                }
                 continue;
             }
             let mut names: Vec<String> = with_shell(|s| {
@@ -467,6 +486,17 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
                     .collect()
             });
             names.retain(|k| crate::pattern::matches(&pat, k));
+            if value.is_none()
+                && (on | roff) == 0
+                && !ops.isset('p')
+                && !crate::exec::sh_emulation_pub()
+            {
+                for ec in ["zsh_eval_context", "ZSH_EVAL_CONTEXT"] {
+                    if with_shell(|s| s.param(ec).is_none()) && pat == ec {
+                        names.push(ec.to_string());
+                    }
+                }
+            }
             // zsh walks its parameter hash table here, unsorted: bucket
             // order of its string hash in the initial 151-slot table.
             let bucket = |n: &str| {
@@ -476,6 +506,16 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
             };
             names.sort_by(|a, b| bucket(a).cmp(&bucket(b)).then(a.cmp(b)));
             for n in names {
+                if n == "zsh_eval_context" && with_shell(|s| s.param(&n).is_none()) {
+                    let ctx = crate::shell::eval_context();
+                    out(&format!("zsh_eval_context=( {} )\n", ctx.join(" ")));
+                    continue;
+                }
+                if n == "ZSH_EVAL_CONTEXT" && with_shell(|s| s.param(&n).is_none()) {
+                    let ctx = crate::shell::eval_context();
+                    out(&format!("ZSH_EVAL_CONTEXT={}\n", ctx.join(":")));
+                    continue;
+                }
                 let asg = DeclArg::Assign {
                     name: n.clone(),
                     append: false,
@@ -512,6 +552,8 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
                     ));
                 }
                 // zsh's $status: a read-only integer special.
+                None if matches!(name.as_str(), "zsh_eval_context" | "ZSH_EVAL_CONTEXT")
+                    && !crate::exec::sh_emulation_pub() => {}
                 None if name == "status" && !crate::exec::sh_emulation_pub() => {
                     out(&format!(
                         "typeset -i10 -r status={}\n",
@@ -935,8 +977,17 @@ fn typeset_single(
             return false;
         }
         with_shell(|s| {
+            let partner = s.param(base_name).and_then(|p| {
+                let (other, _) = p.tie.as_ref()?;
+                (p.attrs & SPECIAL != 0).then(|| other.clone())
+            });
             if let Some(p) = s.param_mut(base_name) {
                 p.attrs |= on & READONLY;
+            }
+            if let Some(other) = partner {
+                if let Some(o) = s.param_mut(&other) {
+                    o.attrs = (o.attrs | (on & READONLY)) & !(off & READONLY);
+                }
             }
         });
         return true;
@@ -1005,6 +1056,9 @@ fn typeset_single(
         };
         let mut p = Param::with(value);
         p.attrs = on & !(READONLY | K_ARRAY | K_ASSOC | TIED | LOCAL);
+        if on & NAMEREF != 0 && !has_value(asg) && carried.is_none() {
+            p.attrs |= DECLARED;
+        }
         if crate::options::is_set_in(s, "typesettounset") && !has_value(asg) && carried.is_none() {
             p.attrs |= UNSET | DECLARED;
         }
@@ -1480,7 +1534,7 @@ pub fn print_param(name: &str, p: &Param, pf: &PrintFlags, locallevel: usize) ->
             altname = 'r';
             out.push_str("readonly ");
         } else if p.attrs & EXPORT != 0 && kind_bits(p) == 0 {
-            if p.level > 0 && p.level >= locallevel {
+            if p.level > 0 && p.level >= locallevel && p.attrs & SPECIAL == 0 {
                 out.push_str("local ");
             } else {
                 altname = 'x';
@@ -1513,7 +1567,9 @@ pub fn print_param(name: &str, p: &Param, pf: &PrintFlags, locallevel: usize) ->
             let doprint = if how == 3 {
                 p.level > 0
             } else {
-                (bit != EXPORT || p.level > 0 || kind_bits(p) != 0) && flags & bit != 0 && bit != 0
+                (bit != EXPORT || (p.level > 0 && p.attrs & SPECIAL == 0) || kind_bits(p) != 0)
+                    && flags & bit != 0
+                    && bit != 0
             };
             if !doprint {
                 continue;
@@ -1554,13 +1610,19 @@ pub fn print_param(name: &str, p: &Param, pf: &PrintFlags, locallevel: usize) ->
             out.push(' ');
         }
     }
-    let swapped = pf.typeset && p.tie.is_some() && kind_bits(p) == 0;
+    let swapped = pf.typeset && !posix_list && p.tie.is_some() && kind_bits(p) == 0;
     let shown_name = if swapped {
         p.tie.as_ref().unwrap().0.clone()
     } else {
         name.to_string()
     };
-    if pf.nameonly || (p.attrs & HIDEVAL != 0 && !pf.include_value) {
+    if pf.nameonly
+        || (p.attrs & HIDEVAL != 0 && !pf.include_value)
+        || (p.attrs & NAMEREF != 0
+            && p.attrs & DECLARED != 0
+            && p.text().is_empty()
+            && p.attrs & HIDE == 0)
+    {
         out.push_str(&quote_value(&shown_name));
     } else {
         out.push_str(&quote_value(&shown_name));

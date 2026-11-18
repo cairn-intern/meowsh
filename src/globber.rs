@@ -17,6 +17,7 @@ pub struct Quals {
     // File-type and permission tests; each must pass.
     tests: Vec<Test>,
     sort: Option<(char, bool)>,
+    sort_code: Option<(String, bool)>,
     // `:h`, `:t`, ... applied to each match.
     modifiers: String,
     // `(e:code:)` / `(+func)`: shell code each match must pass, with
@@ -243,7 +244,26 @@ fn parse_quals(s: &str) -> Option<Quals> {
             'o' | 'O' => {
                 let key = *chars.get(i)?;
                 i += 1;
-                q.sort = Some((key, c == 'O'));
+                let rev = (c == 'O') != negate;
+                match key {
+                    'e' => {
+                        q.sort_code = Some((delimited(&chars, &mut i)?, rev));
+                    }
+                    '+' => {
+                        let start = i;
+                        while chars
+                            .get(i)
+                            .is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                        {
+                            i += 1;
+                        }
+                        if start == i {
+                            return None;
+                        }
+                        q.sort_code = Some((chars[start..i].iter().collect(), rev));
+                    }
+                    _ => q.sort = Some((key, rev)),
+                }
                 continue;
             }
             // Accepted without effect.
@@ -373,6 +393,33 @@ fn walk_dirs(dir: &str, dots: bool, out: &mut Vec<String>) {
 }
 
 fn sort_matches(out: &mut Vec<String>, q: &Quals) {
+    if let Some((code, rev)) = &q.sort_code {
+        let saved = crate::shell::var_get_opt("REPLY");
+        let mut keyed: Vec<(String, String)> = out
+            .iter()
+            .map(|p| {
+                crate::shell::var_set("REPLY", p, false);
+                crate::shell::in_eval_context("globsort", || {
+                    crate::exec::run_string_named(code, None);
+                });
+                (crate::shell::var_get("REPLY"), p.clone())
+            })
+            .collect();
+        match saved {
+            Some(v) => {
+                crate::shell::var_set("REPLY", &v, false);
+            }
+            None => crate::shell::with_shell(|s| {
+                s.remove_param("REPLY");
+            }),
+        }
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        if *rev {
+            keyed.reverse();
+        }
+        *out = keyed.into_iter().map(|(_, p)| p).collect();
+        return;
+    }
     match q.sort {
         Some((key, rev)) => {
             match key {
