@@ -395,7 +395,8 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "comptry" => crate::zle::comp::computil_rest::builtin_comptry(words),
         "compfiles" => crate::zle::comp::computil_rest::builtin_compfiles(words),
         "compgroups" => crate::zle::comp::computil_rest::builtin_compgroups(words),
-        "compdef" | "zcompile" | "zrecompile" | "complete" | "compctl" => 0,
+        "compdef" | "zrecompile" | "complete" | "compctl" => 0,
+        "zcompile" => crate::zwc::builtin_zcompile(words),
         _ => {
             builtin_err(name, "not a builtin");
             1
@@ -698,17 +699,22 @@ fn find_sourced(file: &str) -> Option<String> {
 
 /// Runs a file in the current shell, as `.` does.
 pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
-    let content = match std::fs::read(path) {
-        Ok(b) => crate::shell::bytes_to_zstr(&b),
-        Err(e) => {
-            err_line(&format!(
-                "meowsh: {}: {}",
-                path,
-                strerror(e.raw_os_error().unwrap_or(0))
-            ));
-            return 1;
+    let bytes = if let Some(zwc_bytes) = crate::zwc::try_load_for_source(path) {
+        zwc_bytes
+    } else {
+        match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                err_line(&format!(
+                    "meowsh: {}: {}",
+                    path,
+                    strerror(e.raw_os_error().unwrap_or(0))
+                ));
+                return 1;
+            }
         }
     };
+    let content = crate::shell::bytes_to_zstr(&bytes);
     if is_zsh_completion_script(&content) {
         return 0;
     }

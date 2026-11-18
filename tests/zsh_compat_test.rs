@@ -1833,3 +1833,58 @@ fn raw_bytes_multibyte_zstat_and_zformat_compat() {
         "one\nq=X$'\\300'Y$'\\a'Z$'\\177'T\npx=f0\nraw_cmp\nutf_class\nregex_mb\nc_range\nc_hash\nzf=<\\M-^?>\n\\M-C\\M-):\nzstat=0\n"
     );
 }
+
+#[test]
+fn zwc_compile_and_invalid_description_compat() {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("zmod.zsh");
+    let zwc = dir.path().join("zmod.zsh.zwc");
+    std::fs::write(&script, "zwc_fn() { echo from_zwc:$1; }\n").unwrap();
+
+    let (st, out, err) = sh(&format!(
+        "zcompile {zwc} {script}\nzcompile -t {zwc}\necho ok\n",
+        zwc = zwc.display(),
+        script = script.display(),
+    ));
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(out, "ok\n", "err={:?}", err);
+
+    let zwc_bytes = std::fs::read(&zwc).unwrap();
+    assert!(zwc_bytes.len() > 60 && zwc_bytes[0..4] == 0x0405_0607u32.to_ne_bytes());
+
+    // Keep source mtime older than .zwc so source loads from the compiled file.
+    std::fs::write(&script, "CORRUPTED\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&script)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+        .unwrap();
+    let (st_zwc, out_zwc, err_zwc) = sh(&format!(
+        "source {script}\nzwc_fn ok\n",
+        script = script.display(),
+    ));
+    assert_eq!(st_zwc, 0, "out={:?} err={:?}", out_zwc, err_zwc);
+    assert_eq!(out_zwc, "from_zwc:ok\n", "err={:?}", err_zwc);
+
+    // Corrupt FDHead.npats (offset 56); .zwc is 0444 so recreate it.
+    let mut bad_bytes = zwc_bytes;
+    bad_bytes[56..60].copy_from_slice(&0x7fff_ffff_u32.to_ne_bytes());
+    let _ = std::fs::remove_file(&zwc);
+    std::fs::write(&zwc, bad_bytes).unwrap();
+    std::fs::write(&script, "zwc_fn() { echo from_src:$1; }\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&script)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+        .unwrap();
+    let (st2, out2, err2) = sh(&format!(
+        "source {script}\nzwc_fn fallback\n",
+        script = script.display(),
+    ));
+    assert_eq!(st2, 0, "out={:?} err={:?}", out2, err2);
+    assert_eq!(out2, "from_src:fallback\n", "err={:?}", err2);
+    assert!(err2.contains("invalid description:"), "err={:?}", err2);
+}

@@ -156,7 +156,8 @@ widgets and `bindkey` bindings are recorded but not used while typing,
 so zle plugins such as zsh-autosuggestions load but stay inactive
 (meowsh shows its own history suggestions). `compinit` runs zsh's
 function of that name when `$fpath` holds one and otherwise does nothing;
-`compdef` and `zcompile` do nothing.
+`compdef` does nothing. `zcompile` builds, tests (`-t`), and loads
+`.zwc` wordcode dump files on `source` / `.`.
 
 A port of zsh's own line editor (zle: keymaps, widgets, vi mode, the
 `$BUFFER`/`$CURSOR` parameters) is in progress. Set `MEOWSH_ZLE=1` in the

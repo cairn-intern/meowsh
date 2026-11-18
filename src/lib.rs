@@ -31,6 +31,7 @@ pub mod zstat;
 pub mod zstyle;
 pub mod zsystem;
 pub mod zutil;
+pub mod zwc;
 
 pub use exec::*;
 pub use expand::*;
