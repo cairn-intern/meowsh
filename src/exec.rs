@@ -915,6 +915,7 @@ fn redir_to_var(r: &Redir, var: &str) -> Result<(), RedirError> {
     });
     if readonly && hidden {
         shell_err(&crate::shell::readonly_message(var));
+        abort_command(1);
         return Err(RedirError);
     }
     if readonly {
@@ -2195,24 +2196,37 @@ fn exec_simple_inner(cmd: &SimpleCmd, in_child: bool) -> i32 {
     }
     if words.is_empty() {
         xtrace_cmd(&assigns, &[], None);
+        let saved = match apply_redirs(&cmd.redirs, true) {
+            Ok(saved) => saved,
+            Err(RedirError) => return 1,
+        };
+        let mut quiet_status = 0;
         for a in &assigns {
             if let Err(st) = apply_assign(a, false) {
+                if crate::shell::take_ref_missing_upper() {
+                    quiet_status = st;
+                    continue;
+                }
+                restore_redirs(saved);
                 if !interactive() {
                     set_error_exit(st);
                 }
                 return st;
             }
         }
-        match apply_redirs(&cmd.redirs, true) {
-            Ok(saved) => restore_redirs(saved),
-            Err(RedirError) => return 1,
-        }
-        return with_shell(|s| s.last_cmdsub_status).unwrap_or(0);
+        restore_redirs(saved);
+        return with_shell(|s| s.last_cmdsub_status).unwrap_or(quiet_status);
     }
 
     xtrace_cmd(&assigns, &words, decl.as_deref());
-    // $_: the last word of the previous command.
-    let last = words.last().cloned();
+    // $_: the last non-assignment word of the previous command.
+    let last = match decl.as_deref() {
+        Some(args) => args.iter().rev().find_map(|a| match a {
+            crate::typeset::DeclArg::Word(w) => Some(w.clone()),
+            _ => None,
+        }),
+        None => words.last().cloned(),
+    };
     let st = run_command(words, decl, &assigns, &cmd.redirs, in_child, dash);
     if let Some(l) = last {
         set_last_arg(&l);

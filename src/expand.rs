@@ -165,19 +165,31 @@ fn pos_params() -> Vec<String> {
 }
 
 fn lookup(name: &str) -> Val {
-    let _swap = crate::shell::RefSwap::enter(name);
-    crate::zparam::ensure(name);
-    // A parameter autoload (zmodload -ap) loads its module on first use.
-    if crate::modules::has_autoparam(name) && !crate::shell::var_exists(name) {
-        if let Some(Err(msg)) = crate::modules::autoload_feature(&format!("p:{}", name)) {
-            if !msg.is_empty() {
-                crate::shell::shell_err(&msg);
-                crate::exec::abort_command(1);
+    let target = with_shell(|s| s.resolve_ref_target(name));
+    let target_base = crate::shell::split_target_pub(&target.name);
+    if crate::modules::has_autoparam(&target_base) {
+        let missing_or_bypassed = !crate::modules::feature_enabled(&format!("p:{}", target_base))
+            && (target.scope.is_some()
+                || with_shell(|s| {
+                    s.param(&target_base).is_none_or(|tp| {
+                        name != target_base
+                            && tp.level > 0
+                            && s.param(name).is_some_and(|rp| rp.ref_level == Some(0))
+                    })
+                }));
+        if missing_or_bypassed {
+            if let Some(Err(msg)) = crate::modules::autoload_feature(&format!("p:{}", target_base))
+            {
+                if !msg.is_empty() {
+                    crate::shell::shell_err(&msg);
+                    crate::exec::abort_command(1);
+                }
+                return Val::Unset;
             }
-            return Val::Unset;
         }
-        crate::zparam::ensure(name);
     }
+    let _swap = crate::shell::RefSwap::enter(name);
+    crate::zparam::ensure(&target_base);
     match name {
         "@" => return Val::List(pos_params(), false),
         "*" => return Val::List(pos_params(), true),
@@ -541,16 +553,17 @@ fn walk(chars: &[char], mode: Mode, ctx: &mut Ctx) -> ExpResult<()> {
                     }
                 }
                 match tilde(chars, i, ctx.assign) {
-                    Some((dir, next)) => {
+                    Ok(Some((dir, next))) => {
                         for d in dir.chars() {
                             ctx.push(d, Q);
                         }
                         i = next;
                     }
-                    None => {
+                    Ok(None) => {
                         ctx.push('~', 0);
                         i += 1;
                     }
+                    Err(msg) => return fail(&msg),
                 }
             }
             _ => {
@@ -614,22 +627,34 @@ pub fn dynamic_dir(kind: char, arg: &str) -> Option<Vec<String>> {
     None
 }
 
-fn tilde(chars: &[char], i: usize, assign: bool) -> Option<(String, usize)> {
+fn tilde(chars: &[char], i: usize, assign: bool) -> Result<Option<(String, usize)>, String> {
     let mut j = i + 1;
     while j < chars.len() && chars[j] != '/' && !(assign && chars[j] == ':') {
         if matches!(chars[j], '\'' | '"' | '\\' | '$' | '`') {
-            return None;
+            return Ok(None);
         }
         j += 1;
     }
     let user: String = chars[i + 1..j].iter().collect();
     let dir = match user.as_str() {
-        "" => var_get_opt("HOME").or_else(|| home_of(None))?,
-        "+" => var_get_opt("PWD")?,
-        "-" => var_get_opt("OLDPWD")?,
-        u => crate::shell::named_dir(u).or_else(|| home_of(Some(u)))?,
+        "" => var_get_opt("HOME").or_else(|| home_of(None)),
+        "+" => var_get_opt("PWD"),
+        "-" => var_get_opt("OLDPWD"),
+        u => match crate::shell::named_dir(u).or_else(|| home_of(Some(u))) {
+            Some(d) => Some(d),
+            None => {
+                if !u.is_empty()
+                    && u.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                    && crate::options::is_set("nomatch")
+                {
+                    return Err(format!("no such user or named directory: {}", u));
+                }
+                None
+            }
+        },
     };
-    Some((dir, j))
+    Ok(dir.map(|d| (d, j)))
 }
 
 fn home_of(user: Option<&str>) -> Option<String> {
@@ -2041,11 +2066,12 @@ fn keys_subscript_value(name: &str, sub: &str) -> ExpResult<Val> {
 // Value of `name[sub]` for a named parameter.
 fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
     let _swap = crate::shell::RefSwap::enter(name);
-    crate::zparam::ensure(name);
+    let resolved = crate::shell::resolve_ref(name);
+    let target_base = crate::shell::split_target_pub(&resolved);
+    crate::zparam::ensure(&target_base);
     let Some(sub) = sub else {
         return Ok(lookup(name));
     };
-    let resolved = crate::shell::resolve_ref(name);
     let name = if resolved.contains('[') {
         name
     } else {
@@ -5573,7 +5599,7 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
         {
             let chars: Vec<char> = piece.iter().map(|&(c, _)| c).collect();
             match tilde(&chars, 0, false) {
-                Some((dir, end)) => {
+                Ok(Some((dir, end))) => {
                     expanded = dir
                         .chars()
                         .map(|c| (c, Q))
@@ -5581,7 +5607,8 @@ fn glob_piece(piece: &[(char, u8)], do_glob: bool) -> Globbed {
                         .collect::<Vec<_>>();
                     &expanded[..]
                 }
-                None => piece,
+                Ok(None) => piece,
+                Err(msg) => return Globbed::Err(msg),
             }
         }
         _ => piece,

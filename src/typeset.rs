@@ -419,7 +419,7 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
         return 0;
     }
 
-    if cmd == "private" || (cmd == "local" && ops.minus('P')) {
+    if (cmd == "private" || (cmd == "local" && ops.minus('P'))) && !ops.bare_plus {
         // A hidden local that functions it calls do not see.
         on |= LOCAL | HIDE | crate::params::PRIVATE;
     } else if cmd == "local" || ops.plus('g') {
@@ -529,6 +529,7 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
         return status;
     }
 
+    let mut p_out = String::new();
     for a in rest {
         let name = match a {
             DeclArg::Word(w) => w.clone(),
@@ -539,12 +540,22 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
                 .filter(|p| p.attrs & crate::params::PRIVATE_HIDDEN == 0);
             match found {
                 Some(p) => {
-                    out(&print_param(&name, &p, &pf, locallevel()));
+                    p_out.push_str(&print_param(&name, &p, &pf, locallevel()));
+                }
+                // zsh's $0: the script/function name.
+                None if name == "0" && !crate::exec::sh_emulation_pub() => {
+                    let v = with_shell(|s| s.argv0.clone());
+                    p_out.push_str(&print_param(
+                        &name,
+                        &Param::with(Value::Scalar(v)),
+                        &pf,
+                        locallevel(),
+                    ));
                 }
                 // zsh's $argv: the positional parameters.
                 None if name == "argv" && !crate::exec::sh_emulation_pub() => {
                     let pos = with_shell(|s| s.pos_params.clone());
-                    out(&print_param(
+                    p_out.push_str(&print_param(
                         &name,
                         &Param::with(Value::Array(pos)),
                         &pf,
@@ -555,7 +566,7 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
                 None if matches!(name.as_str(), "zsh_eval_context" | "ZSH_EVAL_CONTEXT")
                     && !crate::exec::sh_emulation_pub() => {}
                 None if name == "status" && !crate::exec::sh_emulation_pub() => {
-                    out(&format!(
+                    p_out.push_str(&format!(
                         "typeset -i10 -r status={}\n",
                         with_shell(|s| s.last_status)
                     ));
@@ -567,7 +578,7 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
                     let g = if locallevel() > 0 { "-g " } else { "" };
                     let float = name == "SECONDS"
                         && crate::shell::SECONDS_FLOAT.load(std::sync::atomic::Ordering::Relaxed);
-                    out(&format!(
+                    p_out.push_str(&format!(
                         "typeset {}{} {}={}\n",
                         g,
                         if float { "-F" } else { "-i10" },
@@ -600,6 +611,9 @@ fn typeset_inner(cmd: &str, args: &[DeclArg]) -> i32 {
         if !typeset_single(cmd, &name, on, off, roff, &asg, &ops, None) {
             status = 1;
         }
+    }
+    if !p_out.is_empty() {
+        out(&p_out);
     }
     status
 }
@@ -704,6 +718,7 @@ fn typeset_single(
         } else {
             warn(cmd, &format!("not valid in this context: {}", pname));
         }
+        crate::exec::abort_command(1);
         return false;
     }
     // $status stays the read-only special, even made local (but -h hides it).
@@ -726,6 +741,11 @@ fn typeset_single(
     let level = locallevel();
     // A nameref stands for what it refers to, unless -n/+n is given or a
     // new local is being made.
+    let _swap = if (on | off) & NAMEREF == 0 {
+        crate::shell::RefSwap::enter(base_name)
+    } else {
+        None
+    };
     let resolved;
     let base_name = if (on | off) & NAMEREF == 0
         && with_shell(|s| {
@@ -1051,6 +1071,8 @@ fn typeset_single(
             Value::Assoc(Default::default())
         } else if on & K_ARRAY != 0 || made_tie.as_ref().is_some_and(|m| m.1) {
             Value::Array(Vec::new())
+        } else if on & (INTEGER | FLOAT_E | FLOAT_F) != 0 {
+            Value::Scalar("0".to_string())
         } else {
             Value::Scalar(String::new())
         };
@@ -1427,7 +1449,8 @@ pub fn quote_value(s: &str) -> String {
         out.push('\'');
         return out;
     }
-    let special = |c: char| "#$^*()=|{}[]`<>?~;&\n\t \\'\"!".contains(c);
+    let quote_bang = crate::options::quick("interactive") && crate::options::quick("banghist");
+    let special = |c: char| "#$^*()=|{}[]`<>?~;&\n\t \\'\"".contains(c) || (quote_bang && c == '!');
     if !s.chars().any(special) {
         return s.to_string();
     }
@@ -1676,17 +1699,31 @@ pub fn print_param(name: &str, p: &Param, pf: &PrintFlags, locallevel: usize) ->
 fn list_params(flags: u32, exclude: u32, pf: &PrintFlags, pattern: Option<&str>) {
     let level = locallevel();
     // Copied out first: printing a tied pair looks up its partner.
-    let mut params: Vec<(String, Param)> = with_shell(|s| {
-        s.params
+    let (mut params, stashed_flags): (
+        Vec<(String, Param)>,
+        std::collections::HashMap<String, u32>,
+    ) = with_shell(|s| {
+        let p = s
+            .params
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .collect();
+        let mut st = std::collections::HashMap::new();
+        for (_, k, sp) in s.private_stash.iter().rev() {
+            st.entry(k.clone())
+                .or_insert_with(|| flags_of(sp) | if sp.level > 0 { LOCAL } else { 0 });
+        }
+        (p, st)
     });
     params.sort_by(|a, b| a.0.cmp(&b.0));
     let mut text = String::new();
     for (n, p) in &params {
         let f = flags_of(p) | if p.level > 0 { LOCAL } else { 0 };
-        if flags != 0 && f & flags == 0 {
+        let st_f = (p.attrs & crate::params::PRIVATE_HIDDEN == 0)
+            .then(|| stashed_flags.get(n).copied())
+            .flatten()
+            .unwrap_or(0);
+        if flags != 0 && (f | st_f) & flags == 0 {
             continue;
         }
         if f & exclude != 0 {

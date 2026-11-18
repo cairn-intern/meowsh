@@ -2,7 +2,7 @@
 //! `words[0]`) and returns an exit status. Output goes straight to the
 //! file descriptors so redirections apply.
 
-use crate::exec::{call_function, last_status, run_string, set_flow, strerror};
+use crate::exec::{call_function, last_status, set_flow, strerror};
 use crate::jobs::{builtin_bg, builtin_fg, builtin_jobs, builtin_wait, kill_targets};
 use crate::lexer::is_valid_name;
 use crate::shell::{
@@ -892,12 +892,37 @@ fn builtin_unset(words: &[String]) -> i32 {
             }
             continue;
         }
+        let _swap = if no_deref {
+            None
+        } else {
+            crate::shell::RefSwap::enter(a)
+        };
         let target = if no_deref {
             a.clone()
         } else {
             with_shell(|s| s.resolve_name(a))
         };
         let a = &target;
+        if a == "ARGC"
+            && with_shell(|s| s.param("ARGC").is_none())
+            && !crate::exec::sh_emulation_pub()
+        {
+            crate::shell::shell_err("read-only variable: ARGC");
+            status = 1;
+            continue;
+        }
+        if !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = a.parse::<usize>() {
+                if n > 0 {
+                    with_shell(|s| {
+                        if n <= s.pos_params.len() {
+                            s.pos_params.remove(n - 1);
+                        }
+                    });
+                }
+                continue;
+            }
+        }
         // A placeholder reference (referring to nothing) stays.
         if !no_deref
             && with_shell(|s| {
@@ -5145,7 +5170,9 @@ fn builtin_emulate(words: &[String]) -> i32 {
             .lock()
             .ok()
             .and_then(|mut c| c.replace(sticky));
-        let st = run_string(&cmd);
+        let st = crate::shell::in_eval_context("eval", || {
+            crate::exec::run_string_named(&cmd, Some("(eval)"))
+        });
         if let Ok(mut c) = crate::options::CUR_STICKY.lock() {
             *c = saved_sticky;
         }

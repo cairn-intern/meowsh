@@ -68,14 +68,16 @@ pub fn name_end(c: &[char], i: usize) -> Option<usize> {
     if c.get(j) == Some(&'.') {
         let k = j + 1;
         let mut e = k;
-        if c.get(e).is_some_and(char::is_ascii_digit) {
+        if dotted && c.get(e).is_some_and(char::is_ascii_digit) {
             while c.get(e).is_some_and(char::is_ascii_digit) {
                 e += 1;
             }
             if c.get(e).is_some_and(|&x| is_name_char(x)) {
                 return None;
             }
-        } else if c.get(e).is_some_and(|&x| is_name_start(x)) {
+        } else if (!dotted && c.get(e).is_some_and(|&x| is_name_char(x)))
+            || (dotted && c.get(e).is_some_and(|&x| is_name_start(x)))
+        {
             while c.get(e).is_some_and(|&x| is_name_char(x)) {
                 e += 1;
             }

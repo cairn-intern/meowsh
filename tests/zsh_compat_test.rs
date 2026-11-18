@@ -1769,3 +1769,35 @@ fn modules_commands_quote_subscript_and_eval_error_compat() {
         "'--foo='\n%pct\n'a'\\''b'\ntypeset -a b=( 'a'\\''b' )\n<f>|<>\nm=2\nafter=1 +x=1 t=scalar-local\n"
     );
 }
+
+#[test]
+fn private_and_nameref_scope_compat() {
+    // V10private: `private +`, private-hidden readonly via `exec {fd}` and nameref,
+    // and bare integer/float default values + typeset listing of stashed flags.
+    let (st, out, err) = sh("zmodload zsh/param/private; \
+         x=ok; () { private + x; } 2>/dev/null; \
+         () { private -hr r=init; () { r=XX; print AFTER; } 2>&1; }; \
+         () { private -hr fd=1; exec {fd}>&2; print AFTER_FD; } 2>/dev/null");
+    assert_eq!(st, 1, "out={:?} err={:?}", out, err);
+    assert!(out.contains("read-only"), "out={:?}", out);
+    assert!(!out.contains("AFTER"), "out={:?}", out);
+
+    // K01nameref: self-preferring `local -n ref=ref`, `-nu` missing-upper non-abort,
+    // invalid variable name / identifier aborts, `$_` on `local -n`, bang quoting,
+    // `foo.4ar` namespace, and `emulate ksh -c` frozen LINENO.
+    let (st, out, err) = sh("ref=enclosing; \
+         () { local -n ref=ref; print \"self=$ref\"; }; \
+         () { local v=inner; local -nu p=v; p=changed; print \"st=$? p=$p v=$v\"; }; \
+         () { local -n ref=$1; print \"under=$_\" } _; \
+         () { local -n x='!'; typeset -p x }; \
+         () { local -n -- okref=foo.4ar; print \"ns=${(P)+okref}:${!okref}\" }; \
+         { local -n -- badref=. } always { e1=$TRY_BLOCK_ERROR; TRY_BLOCK_ERROR=0 }; \
+         { local -n -- . } always { e2=$TRY_BLOCK_ERROR; TRY_BLOCK_ERROR=0 }; \
+         print \"errs=$e1:$e2\"; \
+         emulate ksh -c 'print \"ln1=$LINENO\"; print \"ln2=$LINENO\"' 2>/dev/null");
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert_eq!(
+        out,
+        "self=enclosing\nst=1 p= v=inner\nunder=-n\ntypeset -n x=!\nns=0:foo.4ar\nerrs=1:1\nln1=1\nln2=1\n"
+    );
+}

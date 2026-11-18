@@ -148,6 +148,16 @@ pub fn split_tied(value: &str, sep: &str) -> Vec<String> {
     }
 }
 
+/// Where a nameref chain finally points, honoring each link's bound scope.
+#[derive(Clone, Debug)]
+pub struct ResolvedRef {
+    pub name: String,
+    /// `None`: target is in `params` (or absent). `Some(Some(j))`: in
+    /// `local_scopes[j]`. `Some(None)`: `UPPER` (`-u`) blocked by a local.
+    pub scope: Option<Option<usize>>,
+    pub missing_upper: bool,
+}
+
 impl Shell {
     pub fn param(&self, name: &str) -> Option<&Param> {
         self.params.get(name)
@@ -201,25 +211,180 @@ impl Shell {
         }
     }
 
+    /// Returns the chain of `Param` definitions for `name` from the visible
+    /// one (`None`) outward through `local_scopes` (`Some(j)`).
+    pub fn param_chain<'a>(&'a self, name: &str) -> Vec<(Option<usize>, &'a Param)> {
+        let mut chain = Vec::new();
+        if let Some(p) = self.params.get(name) {
+            chain.push((None, p));
+            for j in (0..self.local_scopes.len()).rev() {
+                match self.local_scopes[j].get(name) {
+                    Some(Some(old)) => chain.push((Some(j), old)),
+                    Some(None) => {
+                        if self
+                            .private_stash
+                            .iter()
+                            .any(|(_, k, sp)| k == name && sp.level == j + 1)
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                    None => {}
+                }
+            }
+        }
+        chain
+    }
+
+    fn upscope_in_chain<'a>(
+        chain: &[(Option<usize>, &'a Param)],
+        ref_p: &Param,
+    ) -> Option<(Option<usize>, &'a Param)> {
+        if ref_p.attrs & UPPER != 0 {
+            if ref_p.level == 0 {
+                return None;
+            }
+            return chain.iter().find(|(_, p)| p.level < ref_p.level).copied();
+        }
+        if chain.is_empty() {
+            return None;
+        }
+        let base = ref_p.ref_level.unwrap_or(0);
+        let mut k = 0;
+        while chain.get(k + 1).is_some_and(|(_, old)| old.level >= base) {
+            k += 1;
+        }
+        Some(chain[k])
+    }
+
+    /// Resolves `name` through namerefs, honoring each link's bound scope
+    /// (`ref_level`) and `UPPER` (`-u`).
+    pub fn resolve_ref_target(&self, name: &str) -> ResolvedRef {
+        let mut cur = name.to_string();
+        let mut cur_loc: Option<usize> = None;
+        let mut cur_p = self.params.get(name);
+        for _ in 0..64 {
+            match cur_p {
+                Some(p) if p.attrs & NAMEREF != 0 && p.attrs & UNSET == 0 => {
+                    let Value::Scalar(target) = &p.value else {
+                        return ResolvedRef {
+                            name: cur,
+                            scope: cur_loc.map(Some),
+                            missing_upper: false,
+                        };
+                    };
+                    if target.is_empty() {
+                        return ResolvedRef {
+                            name: cur,
+                            scope: cur_loc.map(Some),
+                            missing_upper: false,
+                        };
+                    }
+                    let base = target.split('[').next().unwrap_or(target);
+                    let chain = self.param_chain(base);
+                    match Self::upscope_in_chain(&chain, p) {
+                        Some((next_loc, next_p)) => {
+                            let cur_base = cur.split('[').next().unwrap_or(&cur);
+                            if base == cur_base && next_loc == cur_loc && next_p.level == p.level {
+                                return ResolvedRef {
+                                    name: cur,
+                                    scope: cur_loc.map(Some),
+                                    missing_upper: false,
+                                };
+                            }
+                            if next_p.attrs & UNSET != 0 {
+                                return ResolvedRef {
+                                    name: target.clone(),
+                                    scope: next_loc.map(Some),
+                                    missing_upper: false,
+                                };
+                            }
+                            cur = target.clone();
+                            cur_loc = next_loc;
+                            cur_p = Some(next_p);
+                        }
+                        None => {
+                            let missing_upper = p.attrs & UPPER != 0 && !chain.is_empty();
+                            return ResolvedRef {
+                                name: target.clone(),
+                                scope: if missing_upper { Some(None) } else { None },
+                                missing_upper,
+                            };
+                        }
+                    }
+                }
+                _ => {
+                    return ResolvedRef {
+                        name: cur,
+                        scope: cur_loc.map(Some),
+                        missing_upper: false,
+                    };
+                }
+            }
+        }
+        ResolvedRef {
+            name: cur,
+            scope: cur_loc.map(Some),
+            missing_upper: false,
+        }
+    }
+
+    /// Checks whether pointing nameref `(ref_name, ref_lvl)` at `first_target`
+    /// with `(first_bound, upper)` forms a self-reference cycle.
+    pub fn is_ref_cycle_from(
+        &self,
+        ref_name: &str,
+        ref_lvl: usize,
+        first_target: &str,
+        first_bound: Option<usize>,
+        upper: bool,
+    ) -> bool {
+        let mut probe = Param::scalar(first_target);
+        probe.level = ref_lvl;
+        probe.ref_level = first_bound;
+        probe.attrs = NAMEREF | if upper { UPPER } else { 0 };
+        let mut cur_name = first_target.to_string();
+        let chain = self.param_chain(&cur_name);
+        let Some((mut cur_loc, mut cur_p)) = Self::upscope_in_chain(&chain, &probe) else {
+            return false;
+        };
+        for _ in 0..64 {
+            let cur_real_lvl = match cur_loc {
+                Some(j) => self.local_scopes[j]
+                    .get(&cur_name)
+                    .and_then(|o| o.as_ref())
+                    .map_or(cur_p.level, |p| p.level),
+                None => cur_p.level,
+            };
+            if cur_name == ref_name && cur_real_lvl == ref_lvl {
+                return true;
+            }
+            if cur_p.attrs & NAMEREF == 0 || cur_p.attrs & UNSET != 0 {
+                return false;
+            }
+            let Value::Scalar(t) = &cur_p.value else {
+                return false;
+            };
+            if t.is_empty() {
+                return false;
+            }
+            let base = t.split('[').next().unwrap_or(t).to_string();
+            let next_chain = self.param_chain(&base);
+            let Some((next_loc, next_p)) = Self::upscope_in_chain(&next_chain, cur_p) else {
+                return false;
+            };
+            cur_name = base;
+            cur_loc = next_loc;
+            cur_p = next_p;
+        }
+        true
+    }
+
     /// Follows namerefs (`typeset -n`) from `name` to the parameter they
     /// finally refer to. The result may carry a subscript (`arr[2]`).
     pub fn resolve_name(&self, name: &str) -> String {
-        let mut cur = name.to_string();
-        for _ in 0..64 {
-            match self.params.get(&cur) {
-                Some(p) if p.attrs & NAMEREF != 0 && p.attrs & UNSET == 0 => {
-                    let Value::Scalar(target) = &p.value else {
-                        return cur;
-                    };
-                    if target.is_empty() || *target == cur {
-                        return cur;
-                    }
-                    cur = target.clone();
-                }
-                _ => return cur,
-            }
-        }
-        cur
+        self.resolve_ref_target(name).name
     }
 
     pub fn has_param(&self, name: &str) -> bool {
@@ -487,9 +652,9 @@ impl Shell {
         }
     }
 
-    pub fn pop_scope(&mut self) -> bool {
+    pub fn pop_scope(&mut self) -> (bool, Vec<String>) {
         let Some(scope) = self.local_scopes.pop() else {
-            return false;
+            return (false, Vec::new());
         };
         let mut cursor_form_changed = false;
         for (name, prev) in scope {
@@ -528,7 +693,103 @@ impl Shell {
             }
             self.params.insert(name, p);
         }
-        cursor_form_changed
+        // Rebind namerefs whose target scope has ended (zsh's scoperefs).
+        struct ReboundRef {
+            loc: Option<usize>,
+            name: String,
+            lvl: usize,
+            base: String,
+            bound: Option<usize>,
+        }
+        let mut rebound: Vec<ReboundRef> = Vec::new();
+        let rebind_one =
+            |s: &Shell, name: &str, p: &mut Param| -> Option<(usize, String, Option<usize>)> {
+                if p.attrs & NAMEREF == 0 || p.attrs & UNSET != 0 || p.attrs & UPPER != 0 {
+                    return None;
+                }
+                if p.ref_level.is_none_or(|b| b <= depth) {
+                    return None;
+                }
+                let Value::Scalar(target) = &p.value else {
+                    return None;
+                };
+                let base = target.split('[').next().unwrap_or(target).to_string();
+                let bound = if base == name {
+                    s.bind_level(&base, p.level, true).or(Some(0))
+                } else {
+                    s.params.get(&base).map(|tp| tp.level).or(Some(0))
+                };
+                p.ref_level = bound;
+                (!base.is_empty()).then_some((p.level, base, bound))
+            };
+        let visible_keys: Vec<String> = self.params.keys().cloned().collect();
+        for k in visible_keys {
+            if let Some(mut p) = self.params.remove(&k) {
+                if let Some((lvl, base, bound)) = rebind_one(self, &k, &mut p) {
+                    rebound.push(ReboundRef {
+                        loc: None,
+                        name: k.clone(),
+                        lvl,
+                        base,
+                        bound,
+                    });
+                }
+                self.params.insert(k, p);
+            }
+        }
+        for j in 0..self.local_scopes.len() {
+            let keys: Vec<String> = self.local_scopes[j]
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.as_ref().and_then(|p| {
+                        (p.attrs & NAMEREF != 0
+                            && p.attrs & UNSET == 0
+                            && p.attrs & UPPER == 0
+                            && p.ref_level.is_some_and(|b| b > depth))
+                        .then(|| k.clone())
+                    })
+                })
+                .collect();
+            for k in keys {
+                if let Some(Some(mut p)) = self.local_scopes[j].remove(&k) {
+                    if let Some((lvl, base, bound)) = rebind_one(self, &k, &mut p) {
+                        rebound.push(ReboundRef {
+                            loc: Some(j),
+                            name: k.clone(),
+                            lvl,
+                            base,
+                            bound,
+                        });
+                    }
+                    self.local_scopes[j].insert(k, Some(p));
+                }
+            }
+        }
+        let mut loop_errs = Vec::new();
+        for r in rebound {
+            if self.is_ref_cycle_from(&r.name, r.lvl, &r.base, r.bound, false) {
+                let clear = |p: &mut Param| {
+                    p.attrs |= UNSET;
+                    p.attrs &= !DECLARED;
+                    p.value = Value::Scalar(String::new());
+                    p.ref_level = None;
+                };
+                match r.loc {
+                    None => {
+                        if let Some(p) = self.params.get_mut(&r.name) {
+                            clear(p);
+                        }
+                    }
+                    Some(j) => {
+                        if let Some(Some(p)) = self.local_scopes[j].get_mut(&r.name) {
+                            clear(p);
+                        }
+                    }
+                }
+                loop_errs.push(r.base);
+            }
+        }
+        (cursor_form_changed, loop_errs)
     }
 }
 

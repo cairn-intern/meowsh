@@ -70,7 +70,24 @@ pub fn ensure(name: &str) {
                     .into_iter()
                     .filter(|n| n != "parameters")
                     .map(|n| {
-                        let t = crate::expand::param_type(&n);
+                        let is_ref = with_shell(|s| {
+                            s.param(&n).is_some_and(|p| {
+                                p.attrs & crate::params::NAMEREF != 0
+                                    && p.attrs & crate::params::UNSET == 0
+                                    && !p.text().is_empty()
+                            })
+                        });
+                        let mut t = crate::expand::param_type(&n);
+                        if is_ref && !t.is_empty() {
+                            let _swap = crate::shell::RefSwap::enter(&n);
+                            let target =
+                                crate::shell::split_target_pub(&crate::shell::resolve_ref(&n));
+                            let tt = crate::expand::param_type(&target);
+                            if !tt.is_empty() {
+                                t.push('-');
+                                t.push_str(&tt);
+                            }
+                        }
                         (n, t)
                     })
                     .filter(|(_, t)| !t.is_empty()),
@@ -124,7 +141,7 @@ pub fn ensure(name: &str) {
     };
     with_shell(|s| {
         let mut p = Param::with(value);
-        p.attrs |= READONLY | SPECIAL;
+        p.attrs |= READONLY | SPECIAL | crate::params::HIDE | crate::params::HIDEVAL;
         s.params.insert(name.to_string(), p);
     });
 }

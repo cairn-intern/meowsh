@@ -281,7 +281,26 @@ pub static NAMED_DIRS: std::sync::Mutex<BTreeMap<String, String>> =
     std::sync::Mutex::new(BTreeMap::new());
 
 pub fn named_dir(name: &str) -> Option<String> {
-    NAMED_DIRS.lock().ok()?.get(name).cloned()
+    if let Some(d) = NAMED_DIRS.lock().ok()?.get(name).cloned() {
+        return Some(d);
+    }
+    let val = with_shell(|s| {
+        let p = s.param(name)?;
+        if p.level == 0
+            && p.attrs & (INTEGER | FLOAT_E | FLOAT_F | crate::params::NAMEREF | UNSET) == 0
+            && !p.is_array()
+            && !p.is_assoc()
+        {
+            let v = p.text();
+            v.starts_with('/').then_some(v)
+        } else {
+            None
+        }
+    })?;
+    if let Ok(mut t) = NAMED_DIRS.lock() {
+        t.insert(name.to_string(), val.clone());
+    }
+    Some(val)
 }
 
 /// zsh's $zsh_eval_context: how the code now running was reached
@@ -327,7 +346,7 @@ fn dynamic_var(name: &str) -> Option<String> {
         return None;
     }
     match name {
-        "SRANDOM" => {
+        "SRANDOM" if crate::modules::feature_available("p:SRANDOM") => {
             crate::typeset::SRANDOM_LOADED.store(true, Ordering::Relaxed);
             let mut b = [0u8; 4];
             unsafe {
@@ -458,11 +477,15 @@ pub fn placeholder_ref(name: &str) -> bool {
 }
 
 pub fn var_get(name: &str) -> String {
+    let r = with_shell(|s| s.resolve_ref_target(name));
+    if r.missing_upper {
+        return String::new();
+    }
     let _swap = crate::shell::RefSwap::enter(name);
     if let Some(v) = dynamic_var(name) {
         return v;
     }
-    let resolved = resolve_ref(name);
+    let resolved = r.name;
     if resolved != name {
         let (base, sub) = split_target(&resolved);
         return match sub {
@@ -516,18 +539,26 @@ pub fn var_get(name: &str) -> String {
             return String::new();
         }
     }
-    shell.param(name).map(|p| p.text()).unwrap_or_default()
+    shell
+        .param(name)
+        .filter(|p| p.attrs & crate::params::NAMEREF == 0)
+        .map(|p| p.text())
+        .unwrap_or_default()
 }
 
 pub fn var_exists(name: &str) -> bool {
+    let r = with_shell(|s| s.resolve_ref_target(name));
+    if r.missing_upper {
+        return false;
+    }
     let _swap = crate::shell::RefSwap::enter(name);
-    let resolved = resolve_ref(name);
+    let resolved = r.name;
     if resolved != name {
         return var_exists(&split_target(&resolved).0);
     }
     let shadowed = DYNAMIC_NAMES.contains(&name) && with_shell(|s| s.param(name).is_some());
-    // zsh/datetime's parameters go with the module.
-    let unloaded = matches!(name, "EPOCHSECONDS" | "EPOCHREALTIME")
+    // zsh/datetime and zsh/random parameters go with their modules.
+    let unloaded = matches!(name, "EPOCHSECONDS" | "EPOCHREALTIME" | "SRANDOM")
         && !crate::modules::feature_available(&format!("p:{}", name));
     if !shadowed
         && !unloaded
@@ -731,55 +762,69 @@ pub fn justify(v: &str, attrs: u32, width: usize) -> String {
 
 /// Points nameref `name` at `target`, rejecting bad names and loops.
 pub fn set_ref_target(name: &str, target: &str) -> bool {
-    let (base, sub) = split_target(target);
+    let (lvl, upper) = with_shell(|s| {
+        s.param(name).map_or((0, false), |p| {
+            (p.level, p.attrs & crate::params::UPPER != 0)
+        })
+    });
+    let upper_disallowed = upper
+        && (target.starts_with(|c: char| c.is_ascii_digit()) || matches!(target, "argv" | "ARGC"));
     let valid = !target.is_empty()
-        && (crate::lexer::is_valid_name(&base) || base.chars().all(|c| c.is_ascii_digit()))
-        && sub
-            .as_ref()
-            .is_none_or(|_| target.ends_with(']') && target.matches('[').count() == 1);
+        && !upper_disallowed
+        && (matches!(target, "!" | "?" | "$" | "-")
+            || crate::lexer::is_valid_name(target)
+            || target.chars().all(|c| c.is_ascii_digit()));
     if !target.is_empty() && !valid {
         shell_err(&format!("invalid variable name: {}", target));
+        crate::exec::abort_command(1);
         return false;
     }
-    // Referring to an enclosing parameter of the same name is fine.
-    let enclosing = base == name
-        && with_shell(|s| {
-            let lvl = s.param(name).map_or(0, |p| p.level);
-            s.bind_level(&base, lvl, true).is_some()
-        });
-    let looping = !enclosing
-        && with_shell(|s| {
-            let mut cur = base.clone();
-            for _ in 0..64 {
-                if cur == name {
-                    return true;
+    if !target.is_empty() {
+        let local_shadow = with_shell(|s| s.param(target).is_some_and(|p| p.level > 0));
+        if !local_shadow {
+            crate::zparam::ensure(target);
+            if crate::modules::has_autoparam(target) {
+                if let Some(Err(msg)) = crate::modules::autoload_feature(&format!("p:{}", target)) {
+                    if !msg.is_empty() {
+                        shell_err(&msg);
+                        crate::exec::abort_command(1);
+                    }
+                    return false;
                 }
-                match s.param(&cur) {
-                    Some(p) if p.attrs & crate::params::NAMEREF != 0 => match &p.value {
-                        Value::Scalar(t) if !t.is_empty() => cur = split_target(t).0,
-                        _ => return false,
-                    },
-                    _ => return false,
-                }
+                crate::zparam::ensure(target);
             }
-            true
-        });
+        }
+    }
+    let (bound, looping) = with_shell(|s| {
+        let bound = if upper {
+            None
+        } else if target == name {
+            s.bind_level(target, lvl, true).or(Some(0))
+        } else {
+            s.params.get(target).map(|p| p.level).or(Some(0))
+        };
+        let looping = !target.is_empty() && s.is_ref_cycle_from(name, lvl, target, bound, upper);
+        (bound, looping)
+    });
     if looping {
-        shell_err(&format!("{}: invalid self reference", base));
+        shell_err(&format!("{}: invalid self reference", target));
+        with_shell(|s| {
+            if let Some(p) = s.param_mut(name) {
+                p.value = Value::Scalar(String::new());
+                p.attrs |= UNSET;
+                p.attrs &= !crate::params::DECLARED;
+                p.ref_level = None;
+            }
+        });
         return false;
+    }
+    if !upper && bound.is_some_and(|b| b > lvl) && crate::options::is_set("warnnestedvar") {
+        shell_err(&format!(
+            "reference {} in enclosing scope set to local variable {}",
+            name, target
+        ));
     }
     with_shell(|s| {
-        let (lvl, upper) = s.param(name).map_or((0, false), |p| {
-            (p.level, p.attrs & crate::params::UPPER != 0)
-        });
-        // A reference to its own name means the enclosing one; to a
-        // name not set yet, the scope of the reference.
-        let bound = if base == name {
-            s.bind_level(&base, lvl, true)
-        } else {
-            s.bind_level(&base, lvl, upper)
-        }
-        .or(Some(if upper { lvl.saturating_sub(1) } else { lvl }));
         if let Some(p) = s.param_mut(name) {
             p.value = Value::Scalar(target.to_string());
             p.attrs &= !(UNSET | crate::params::DECLARED);
@@ -791,12 +836,18 @@ pub fn set_ref_target(name: &str, target: &str) -> bool {
 
 thread_local! {
     static REF_TYPE_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REF_MISSING_UPPER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether an assignment through a reference just tried to change a hidden
 /// parameter's type (and was undone).
 pub fn take_ref_type_error() -> bool {
     REF_TYPE_ERROR.with(|e| e.replace(false))
+}
+
+/// Whether an assignment through an upper reference had no enclosing target.
+pub fn take_ref_missing_upper() -> bool {
+    REF_MISSING_UPPER.with(|e| e.replace(false))
 }
 
 /// While alive, the parameter a nameref was bound to sits in place of
@@ -817,15 +868,12 @@ impl RefSwap {
             if p.attrs & crate::params::NAMEREF == 0 {
                 return None;
             }
-            let level = p.ref_level?;
-            let Value::Scalar(t) = &p.value else {
-                return None;
-            };
-            let target = split_target(t).0;
+            let r = s.resolve_ref_target(name);
+            let target = split_target(&r.name).0;
             if target.is_empty() {
                 return None;
             }
-            match s.hidden_scope(&target, level)? {
+            match r.scope? {
                 Some(scope) => {
                     let hidden = s.local_scopes[scope].get(&target).cloned().flatten()?;
                     let visible = s.params.insert(target.clone(), hidden.clone());
@@ -999,41 +1047,43 @@ pub fn var_set(name: &str, value: &str, export: bool) -> bool {
         shell_err(&format!("{}: can't modify read-only parameter", name));
         return false;
     }
-    let ok = var_set_inner(name, value, export);
-    // AUTO_NAME_DIRS: a global set to a directory's absolute path names it.
-    if ok
-        && value.starts_with('/')
-        && crate::lexer::is_valid_name(name)
-        && crate::options::is_set("autonamedirs")
-        && with_shell(|s| {
-            s.param(name)
-                .is_some_and(|p| p.level == 0 && p.attrs & crate::params::NAMEREF == 0)
+    let was_placeholder = with_shell(|s| {
+        s.param(name).is_some_and(|p| {
+            p.attrs & crate::params::NAMEREF != 0
+                && matches!(&p.value, Value::Scalar(t) if t.is_empty())
         })
-        && std::path::Path::new(value).is_dir()
-    {
-        if let Ok(mut t) = NAMED_DIRS.lock() {
-            t.insert(name.to_string(), value.to_string());
+    });
+    let ok = var_set_inner(name, value, export);
+    // AUTO_NAME_DIRS & named directory updates for global scalar parameters.
+    if ok && !was_placeholder {
+        let _swap = crate::shell::RefSwap::enter(name);
+        let target = split_target(&resolve_ref(name)).0;
+        if crate::lexer::is_valid_name(&target)
+            && with_shell(|s| {
+                s.param(&target).is_some_and(|p| {
+                    p.level == 0
+                        && p.attrs & (INTEGER | FLOAT_E | FLOAT_F | crate::params::NAMEREF | UNSET)
+                            == 0
+                        && !p.is_array()
+                        && !p.is_assoc()
+                })
+            })
+        {
+            if let Ok(mut t) = NAMED_DIRS.lock() {
+                if value.starts_with('/') {
+                    if t.contains_key(&target) || crate::options::is_set("autonamedirs") {
+                        t.insert(target, value.to_string());
+                    }
+                } else {
+                    t.remove(&target);
+                }
+            }
         }
     }
     ok
 }
 
 fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
-    let _swap = crate::shell::RefSwap::enter(name);
-    // `1=x` (and `for 1 in ...`) sets a positional parameter.
-    if let Some(n) = name
-        .parse::<usize>()
-        .ok()
-        .filter(|&n| n > 0 && name.chars().all(|c| c.is_ascii_digit()))
-    {
-        with_shell(|s| {
-            if s.pos_params.len() < n {
-                s.pos_params.resize(n, String::new());
-            }
-            s.pos_params[n - 1] = value.to_string();
-        });
-        return true;
-    }
     // A nameref without a target yet: the value becomes its target.
     let placeholder = with_shell(|s| {
         s.param(name).is_some_and(|p| {
@@ -1044,13 +1094,62 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
     if placeholder {
         return set_ref_target(name, value);
     }
-    let resolved = resolve_ref(name);
+    let r = with_shell(|s| s.resolve_ref_target(name));
+    if r.missing_upper {
+        REF_MISSING_UPPER.with(|e| e.set(true));
+        return false;
+    }
+    let _swap = crate::shell::RefSwap::enter(name);
+    let resolved = r.name;
     if resolved != name {
         let (base, sub) = split_target(&resolved);
+        if sub.is_none() {
+            let stashed_ref = with_shell(|s| {
+                let p = s.param(&base)?;
+                if p.attrs & (READONLY | PRIVATE_HIDDEN) == (READONLY | PRIVATE_HIDDEN) {
+                    return s
+                        .private_stash
+                        .iter()
+                        .rev()
+                        .find(|(_, k, _)| k == &base)
+                        .and_then(|(_, _, sp)| {
+                            (sp.attrs & crate::params::NAMEREF != 0)
+                                .then_some(sp.attrs & UNSET != 0)
+                        });
+                }
+                None
+            });
+            if let Some(was_unset) = stashed_ref {
+                if was_unset {
+                    readonly_error(&base, 0);
+                } else {
+                    readonly_error(name, PRIVATE_HIDDEN);
+                }
+                return false;
+            }
+        }
         return match sub {
             Some(sub) => array_set_subscript(&base, &sub, value.to_string(), false),
             None => var_set(&base, value, export),
         };
+    }
+    // `0=x`, `1=x` (and `for 1 in ...`) set positional parameters / $0.
+    if let Some(n) = name
+        .parse::<usize>()
+        .ok()
+        .filter(|_| !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()))
+    {
+        with_shell(|s| {
+            if n == 0 {
+                s.argv0 = value.to_string();
+            } else {
+                if s.pos_params.len() < n {
+                    s.pos_params.resize(n, String::new());
+                }
+                s.pos_params[n - 1] = value.to_string();
+            }
+        });
+        return true;
     }
     if name == "RANDOM" {
         seed_random(value.trim().parse().unwrap_or(0));
@@ -1145,6 +1244,13 @@ pub fn array_set(name: &str, items: Vec<String>) -> bool {
     let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
+    if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+        shell_err(&format!(
+            "{}: attempt to assign array value to non-array",
+            name
+        ));
+        return false;
+    }
     let kind = if with_shell(|s| s.assoc(name).is_some()) {
         "association"
     } else {
@@ -1212,6 +1318,13 @@ pub fn array_assign_items(name: &str, items: Vec<ArrItem>, append: bool) -> bool
     }
     // A private parameter keeps its type.
     let resolved = resolve_ref(name);
+    if !resolved.is_empty() && resolved.chars().all(|c| c.is_ascii_digit()) {
+        shell_err(&format!(
+            "{}: attempt to assign array value to non-array",
+            resolved
+        ));
+        return false;
+    }
     if with_shell(|s| {
         s.param(&resolved).is_some_and(|p| {
             p.attrs & crate::params::PRIVATE != 0 && !p.is_array() && !p.is_assoc()
@@ -1546,15 +1659,38 @@ pub fn assoc_get(name: &str, key: &str) -> Option<String> {
 pub fn assoc_values(name: &str) -> Option<Vec<String>> {
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
+    let keys = assoc_keys(name)?;
     let shell = SHELL.shell.lock().unwrap();
-    shell.assoc(name).map(|m| m.values().cloned().collect())
+    let m = shell.assoc(name)?;
+    Some(
+        keys.into_iter()
+            .filter_map(|k| m.get(&k).cloned())
+            .collect(),
+    )
 }
 
 pub fn assoc_keys(name: &str) -> Option<Vec<String>> {
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
     let shell = SHELL.shell.lock().unwrap();
-    shell.assoc(name).map(|m| m.keys().cloned().collect())
+    shell.assoc(name).map(|m| {
+        let mut keys: Vec<String> = m.keys().cloned().collect();
+        if name == "nameddirs"
+            && shell
+                .param("nameddirs")
+                .is_some_and(|p| p.attrs & crate::params::SPECIAL != 0 && p.level == 0)
+        {
+            // zsh's nameddirtab has 201 buckets (hashnameddir.c:createnameddirtable);
+            // ${(k)nameddirs} and ${(kv)nameddirs} iterate in bucket order.
+            keys.sort_by_key(|k| {
+                let h = k
+                    .bytes()
+                    .fold(0u32, |h, c| h.wrapping_add(h << 5).wrapping_add(c as u32));
+                (h % 201, k.clone())
+            });
+        }
+        keys
+    })
 }
 
 fn prepare_array_mutation(shell: &mut Shell, name: &str) -> bool {
@@ -1618,9 +1754,13 @@ pub fn push_scope() {
 }
 
 pub fn pop_scope() {
-    let changed = SHELL.shell.lock().unwrap().pop_scope();
+    let (changed, loop_errs) = SHELL.shell.lock().unwrap().pop_scope();
     if changed {
         crate::zle::termctl::cursor_form_param_changed();
+    }
+    if let Some(target) = loop_errs.first() {
+        shell_err(&format!("{}: invalid self reference", target));
+        crate::exec::abort_command(1);
     }
 }
 
