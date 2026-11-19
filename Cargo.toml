@@ -6,7 +6,7 @@ license = "Unlicense"
 
 [dependencies]
 libc = "0.2"
-rustyline = "19"
+rustyline = { version = "19", features = ["buffer-redux"] }
 
 [profile.release]
 lto = true

@@ -850,6 +850,16 @@ fn pasted_control_characters_are_neither_drawn_nor_run() {
 }
 
 #[test]
+fn input_typed_ahead_of_the_prompt_is_kept() {
+    // Both lines arrive in one read; the second used to be dropped.
+    let out = on_terminal(
+        "PROMPT='> '\n",
+        "print one\rprint two\rprint \"[ri\"\"ght]\"\r",
+    );
+    assert!(out.contains("\r\ntwo\r\n"), "output: {:?}", out);
+}
+
+#[test]
 fn read_k_honours_its_timeout() {
     // The harness for zsh's ZLE tests waits this way between keys; it
     // used to block until the writer went away.
