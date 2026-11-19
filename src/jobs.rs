@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn status_to_exit_reports_stopped_signal_status() {
-        let status = libc::W_STOPCODE(libc::SIGTSTP);
+        let status = (libc::SIGTSTP << 8) | 0x7f;
 
         assert_eq!(status_to_exit(status), 128 + libc::SIGTSTP);
     }

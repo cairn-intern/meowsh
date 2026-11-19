@@ -37,12 +37,24 @@ fn open_pty() -> Option<(i32, std::ffi::CString)> {
             libc::close(m);
             return None;
         }
-        let mut buf = [0 as libc::c_char; 128];
-        if libc::ptsname_r(m, buf.as_mut_ptr(), buf.len()) != 0 {
-            libc::close(m);
-            return None;
-        }
-        let name = std::ffi::CStr::from_ptr(buf.as_ptr()).to_owned();
+        #[cfg(target_os = "linux")]
+        let name = {
+            let mut buf = [0 as libc::c_char; 128];
+            if libc::ptsname_r(m, buf.as_mut_ptr(), buf.len()) != 0 {
+                libc::close(m);
+                return None;
+            }
+            std::ffi::CStr::from_ptr(buf.as_ptr()).to_owned()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let name = {
+            let ptr = libc::ptsname(m);
+            if ptr.is_null() {
+                libc::close(m);
+                return None;
+            }
+            std::ffi::CStr::from_ptr(ptr).to_owned()
+        };
         Some((m, name))
     }
 }

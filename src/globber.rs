@@ -379,8 +379,8 @@ fn passes(path: &Path, test: &Test) -> bool {
                 Test::Regular => m.is_file(),
                 Test::Dir => m.is_dir(),
                 Test::Exec => m.is_file() && m.permissions().mode() & 0o111 != 0,
-                Test::Socket => m.mode() & libc::S_IFMT == libc::S_IFSOCK,
-                Test::Fifo => m.mode() & libc::S_IFMT == libc::S_IFIFO,
+                Test::Socket => (m.mode() as libc::mode_t) & libc::S_IFMT == libc::S_IFSOCK,
+                Test::Fifo => (m.mode() as libc::mode_t) & libc::S_IFMT == libc::S_IFIFO,
                 Test::Perm(bits) => m.permissions().mode() & bits != 0,
                 Test::Full => {
                     m.is_dir() && fs::read_dir(path).is_ok_and(|mut d| d.next().is_some())

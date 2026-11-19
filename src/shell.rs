@@ -383,8 +383,13 @@ fn dynamic_var(name: &str) -> Option<String> {
         "SRANDOM" if crate::modules::feature_available("p:SRANDOM") => {
             crate::typeset::SRANDOM_LOADED.store(true, Ordering::Relaxed);
             let mut b = [0u8; 4];
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, 4, 0);
+            }
+            #[cfg(not(target_os = "linux"))]
+            unsafe {
+                libc::arc4random_buf(b.as_mut_ptr() as *mut libc::c_void, 4);
             }
             Some(u32::from_ne_bytes(b).to_string())
         }

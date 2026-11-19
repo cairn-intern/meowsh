@@ -1067,6 +1067,7 @@ fn putfilecol(group: Option<&str>, filename: &str, m: u32, special: i32) -> i32 
         }
     }
 
+    let m = m as libc::mode_t;
     let fmt = m & libc::S_IFMT;
     let colour: Option<usize> = if special != -1 {
         Some(special as usize)
