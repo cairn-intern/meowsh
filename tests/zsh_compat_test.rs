@@ -316,8 +316,9 @@ fn read_keys_and_yes_no() {
 
 #[test]
 fn colors_and_prompt_truncation() {
-    let (_, out, _) = sh("colors; print -n $fg[red]x$reset_color | od -An -c | tr -s ' ' | sed 's/ $//'; print -P '%5<..<abcdefgh%<<'");
-    assert_eq!(out, " 033 [ 3 1 m x 033 [ 0 0 m\n..fgh\n");
+    let (_, out, _) =
+        sh("colors; print -rn -- \"$fg[red]x$reset_color\"; print; print -P '%5<..<abcdefgh%<<'");
+    assert_eq!(out, "\x1b[31mx\x1b[00m\n..fgh\n");
 }
 
 #[test]
