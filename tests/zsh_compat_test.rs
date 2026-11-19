@@ -242,7 +242,7 @@ fn always_here_string_and_redirect_both() {
         "cd; f() { { return 3 } always { echo cleanup } }; f; echo $?; \
          read x <<< 'from string'; echo $x; \
          { echo out; echo err >&2 } &> both; cat both; \
-         (echo bg > bgout) &|; while [ ! -s bgout ]; do :; done; cat bgout; jobs | wc -l",
+         (echo bg > bgout) &|; while [ ! -s bgout ]; do :; done; cat bgout; jobs | wc -l | tr -d ' '",
         &home,
     );
     assert_eq!(out, "cleanup\n3\nfrom string\nout\nerr\nbg\n0\n");
@@ -316,7 +316,7 @@ fn read_keys_and_yes_no() {
 
 #[test]
 fn colors_and_prompt_truncation() {
-    let (_, out, _) = sh("colors; print -n $fg[red]x$reset_color | od -An -c | tr -s ' '; print -P '%5<..<abcdefgh%<<'");
+    let (_, out, _) = sh("colors; print -n $fg[red]x$reset_color | od -An -c | tr -s ' ' | sed 's/ $//'; print -P '%5<..<abcdefgh%<<'");
     assert_eq!(out, " 033 [ 3 1 m x 033 [ 0 0 m\n..fgh\n");
 }
 
@@ -1696,7 +1696,9 @@ fn aliases_short_loops_and_ignoreclosebraces() {
 #[test]
 fn glob_approx_pattern_disables_realpath_and_qualifiers() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let d = tmp.path().to_str().unwrap();
+    // macOS temp dirs live behind the /var -> /private/var symlink.
+    let real = std::fs::canonicalize(tmp.path()).unwrap();
+    let d = real.to_str().unwrap();
     std::fs::create_dir_all(format!("{}/dir3/subdir", d)).unwrap();
     std::fs::create_dir_all(format!("{}/hello/world", d)).unwrap();
     std::os::unix::fs::symlink("dir3/subdir", format!("{}/link", d)).unwrap();
