@@ -738,7 +738,7 @@ fn on_terminal(zshrc: &str, input: &str) -> String {
     let home = TempDir::new().unwrap();
     std::fs::write(home.path().join(".zshrc"), zshrc).unwrap();
     let (mut master, mut slave) = (0, 0);
-    let ws = libc::winsize {
+    let mut ws = libc::winsize {
         ws_row: 10,
         ws_col: 60,
         ws_xpixel: 0,
@@ -749,8 +749,8 @@ fn on_terminal(zshrc: &str, input: &str) -> String {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &ws,
+            std::ptr::null_mut(),
+            &mut ws as *mut _ as _,
         )
     };
     assert_eq!(ok, 0, "openpty");
