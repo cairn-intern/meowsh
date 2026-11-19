@@ -9,7 +9,11 @@ fn on_terminal(zshrc: &str, input: &str) -> String {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
     let home = TempDir::new().unwrap();
-    std::fs::write(home.path().join(".zshrc"), zshrc).unwrap();
+    std::fs::write(
+        home.path().join(".zshrc"),
+        format!(".term.extensions=( -query )\n{}", zshrc),
+    )
+    .unwrap();
     let (mut master, mut slave) = (0, 0);
     let mut ws = libc::winsize {
         ws_row: 10,
@@ -39,24 +43,44 @@ fn on_terminal(zshrc: &str, input: &str) -> String {
         .spawn()
         .unwrap();
     unsafe { libc::close(slave) };
-    let mut m = unsafe { std::fs::File::from_raw_fd(master) };
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    m.write_all(input.as_bytes()).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(800));
-    let _ = child.kill();
-    let _ = child.wait();
-    let mut out = Vec::new();
     unsafe {
         let flags = libc::fcntl(master, libc::F_GETFL);
         libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
+    let mut m = unsafe { std::fs::File::from_raw_fd(master) };
+    let mut out = Vec::new();
     let mut buf = [0u8; 4096];
-    while let Ok(n) = m.read(&mut buf) {
-        if n == 0 {
+    let mut drain = |m: &mut std::fs::File, out: &mut Vec<u8>| {
+        while let Ok(n) = m.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    };
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(3) {
+        drain(&mut m, &mut out);
+        if !out.is_empty() {
             break;
         }
-        out.extend_from_slice(&buf[..n]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    drain(&mut m, &mut out);
+    m.write_all(input.as_bytes()).unwrap();
+    let sent = std::time::Instant::now();
+    while sent.elapsed() < std::time::Duration::from_secs(5) {
+        drain(&mut m, &mut out);
+        if String::from_utf8_lossy(&out).contains("[B=") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    drain(&mut m, &mut out);
+    let _ = child.kill();
+    let _ = child.wait();
+    drain(&mut m, &mut out);
     String::from_utf8_lossy(&out).into_owned()
 }
 
