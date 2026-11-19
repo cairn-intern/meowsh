@@ -686,6 +686,19 @@ fn function_keyword_with_parens_is_anonymous() {
 }
 
 #[test]
+fn assignments_before_special_builtins_are_temporary() {
+    let (_, out, err) = sh(
+        "x=0; x=1 :; x=2 eval 'print in=$x'; x=3 source /dev/null; x=4 export y=5; \
+         print $x $y; IFS=: eval true; v='a:b c'; print ${#${=v}}; \
+         a=(1 2); f() { print $a }; a=(3 4) f; a=(5) eval 'print $a'; print $a; \
+         setopt posixbuiltins; x=6 :; print $x",
+    );
+    assert_eq!(out, "in=2\n0 5\n2\n3 4\n5\n1 2\n6\n", "stderr: {}", err);
+    let (st, out, _) = sh("readonly r=1; r=2 :; print after");
+    assert_eq!((st, out.as_str()), (1, ""));
+}
+
+#[test]
 fn not_found_handler_math_functions_and_argv() {
     let (_, out, err) = sh(
         "command_not_found_handler() { print handled $1 ${argv[2,-1]}; return 3 }; \

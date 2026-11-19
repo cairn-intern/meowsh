@@ -1398,20 +1398,27 @@ impl TempVars {
     fn set_as(assigns: &[Expanded], export: bool) -> Result<TempVars, i32> {
         let mut saved = TempVars(Vec::new());
         for a in assigns {
-            let Value::Scalar(v) = &a.value else { continue };
-            // `HELLO[2,4]=oo cmd`: the element changes for the command too.
-            if a.subscript.is_some() {
-                let prev = with_shell(|s| s.param(&a.name).cloned());
-                saved.0.push((a.name.clone(), prev));
-                if let Err(st) = apply_assign(a, export) {
-                    saved.restore();
-                    return Err(st);
+            // `HELLO[2,4]=oo cmd`: the element changes for the command
+            // too, and so does an array.
+            let v = match &a.value {
+                Value::Scalar(v) if a.subscript.is_none() => v,
+                _ => {
+                    let prev = with_shell(|s| s.param(&a.name).cloned());
+                    saved.0.push((a.name.clone(), prev));
+                    if let Err(st) = apply_assign(a, export) {
+                        saved.restore();
+                        return Err(st);
+                    }
+                    continue;
                 }
-                continue;
-            }
+            };
             if is_readonly(&a.name) {
                 shell_err(&crate::shell::readonly_message(&a.name));
                 saved.restore();
+                // The error ends a script, as zsh's does.
+                if !interactive() && !crate::options::is_set("continueonerror") {
+                    set_error_exit(1);
+                }
                 return Err(1);
             }
             let prev = with_shell(|s| s.param(&a.name).cloned());
@@ -2342,7 +2349,12 @@ fn run_command(
         return exec_builtin(&words[1..], assigns, redirs);
     }
 
-    if crate::builtins::is_special_builtin(&name) && !via_command {
+    // Assignments before a special builtin outlast it only with
+    // POSIX_BUILTINS; otherwise they are temporary, as for any builtin.
+    if crate::builtins::is_special_builtin(&name)
+        && !via_command
+        && (assigns.is_empty() || crate::options::is_set("posixbuiltins"))
+    {
         for a in assigns {
             if let Err(st) = apply_assign(a, false) {
                 if !interactive() && !crate::options::is_set("continueonerror") {
