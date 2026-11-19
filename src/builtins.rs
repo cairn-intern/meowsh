@@ -3579,53 +3579,130 @@ enum LimKind {
     Micro,
 }
 
-const LIMITS: &[(&str, char, LimKind, &str)] = &[
-    ("cputime", 't', LimKind::Time, "cpu time (seconds)"),
-    ("filesize", 'f', LimKind::Blocks, "file size (blocks)"),
-    ("datasize", 'd', LimKind::Kbytes, "data seg size (kbytes)"),
-    ("stacksize", 's', LimKind::Kbytes, "stack size (kbytes)"),
+const LIMITS: &[(&str, char, LimKind, &str, libc::c_int)] = &[
+    (
+        "cputime",
+        't',
+        LimKind::Time,
+        "cpu time (seconds)",
+        libc::RLIMIT_CPU as _,
+    ),
+    (
+        "filesize",
+        'f',
+        LimKind::Blocks,
+        "file size (blocks)",
+        libc::RLIMIT_FSIZE as _,
+    ),
+    (
+        "datasize",
+        'd',
+        LimKind::Kbytes,
+        "data seg size (kbytes)",
+        libc::RLIMIT_DATA as _,
+    ),
+    (
+        "stacksize",
+        's',
+        LimKind::Kbytes,
+        "stack size (kbytes)",
+        libc::RLIMIT_STACK as _,
+    ),
     (
         "coredumpsize",
         'c',
         LimKind::Blocks,
         "core file size (blocks)",
+        libc::RLIMIT_CORE as _,
     ),
     (
         "resident",
         'm',
         LimKind::Kbytes,
         "resident set size (kbytes)",
+        libc::RLIMIT_RSS as _,
     ),
-    ("maxproc", 'u', LimKind::Number, "processes"),
-    ("descriptors", 'n', LimKind::Number, "file descriptors"),
+    (
+        "maxproc",
+        'u',
+        LimKind::Number,
+        "processes",
+        libc::RLIMIT_NPROC as _,
+    ),
+    (
+        "descriptors",
+        'n',
+        LimKind::Number,
+        "file descriptors",
+        libc::RLIMIT_NOFILE as _,
+    ),
     (
         "memorylocked",
         'l',
         LimKind::Kbytes,
         "locked-in-memory size (kbytes)",
+        libc::RLIMIT_MEMLOCK as _,
     ),
     (
         "addressspace",
         'v',
         LimKind::Kbytes,
         "address space (kbytes)",
+        libc::RLIMIT_AS as _,
     ),
-    ("maxfilelocks", 'x', LimKind::Number, "file locks"),
-    ("sigpending", 'i', LimKind::Number, "pending signals"),
+    #[cfg(target_os = "linux")]
+    (
+        "maxfilelocks",
+        'x',
+        LimKind::Number,
+        "file locks",
+        libc::RLIMIT_LOCKS as _,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "sigpending",
+        'i',
+        LimKind::Number,
+        "pending signals",
+        libc::RLIMIT_SIGPENDING as _,
+    ),
+    #[cfg(target_os = "linux")]
     (
         "msgqueue",
         'q',
         LimKind::Number,
         "bytes in POSIX msg queues",
+        libc::RLIMIT_MSGQUEUE as _,
     ),
-    ("nice", 'e', LimKind::Number, "max nice"),
-    ("rt_priority", 'r', LimKind::Number, "max rt priority"),
-    ("rt_time", 'N', LimKind::Micro, "rt cpu time (microseconds)"),
+    #[cfg(target_os = "linux")]
+    (
+        "nice",
+        'e',
+        LimKind::Number,
+        "max nice",
+        libc::RLIMIT_NICE as _,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "rt_priority",
+        'r',
+        LimKind::Number,
+        "max rt priority",
+        libc::RLIMIT_RTPRIO as _,
+    ),
+    #[cfg(target_os = "linux")]
+    (
+        "rt_time",
+        'N',
+        LimKind::Micro,
+        "rt cpu time (microseconds)",
+        libc::RLIMIT_RTTIME as _,
+    ),
 ];
 
 fn get_limit(res: usize, hard: bool) -> Option<u64> {
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(res as _, &mut lim) } != 0 {
+    if unsafe { libc::getrlimit(LIMITS[res].4 as _, &mut lim) } != 0 {
         return None;
     }
     Some(if hard { lim.rlim_max } else { lim.rlim_cur } as u64)
@@ -3633,7 +3710,7 @@ fn get_limit(res: usize, hard: bool) -> Option<u64> {
 
 fn set_limit(name: &str, res: usize, hard: bool, soft: bool, val: u64) -> bool {
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrlimit(res as _, &mut lim) } != 0 {
+    if unsafe { libc::getrlimit(LIMITS[res].4 as _, &mut lim) } != 0 {
         return false;
     }
     if hard {
@@ -3642,7 +3719,7 @@ fn set_limit(name: &str, res: usize, hard: bool, soft: bool, val: u64) -> bool {
     if soft {
         lim.rlim_cur = val as libc::rlim_t;
     }
-    if unsafe { libc::setrlimit(res as _, &lim) } != 0 {
+    if unsafe { libc::setrlimit(LIMITS[res].4 as _, &lim) } != 0 {
         let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         builtin_err(
             name,

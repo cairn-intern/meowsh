@@ -569,10 +569,11 @@ pub fn builtin_syswrite(words: &[String]) -> i32 {
 }
 
 /// `sysopen -o` names and their open(2) flags.
-const OPENOPTS: [(&str, libc::c_int); 10] = [
+const OPENOPTS: &[(&str, libc::c_int)] = &[
     ("cloexec", libc::O_CLOEXEC),
     ("nofollow", libc::O_NOFOLLOW),
     ("sync", libc::O_SYNC),
+    #[cfg(target_os = "linux")]
     ("noatime", libc::O_NOATIME),
     ("nonblock", libc::O_NONBLOCK),
     ("excl", libc::O_EXCL | libc::O_CREAT),

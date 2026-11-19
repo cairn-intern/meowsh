@@ -89,10 +89,16 @@ fn api() -> Option<&'static Pcre2Api> {
     static API: OnceLock<Option<Pcre2Api>> = OnceLock::new();
     API.get_or_init(|| unsafe {
         let mut handle = std::ptr::null_mut();
-        for name in [
-            b"libpcre2-8.so.0\0".as_slice(),
-            b"libpcre2-8.so\0".as_slice(),
-        ] {
+        #[cfg(target_os = "macos")]
+        let names: &[&[u8]] = &[
+            b"libpcre2-8.0.dylib\0",
+            b"libpcre2-8.dylib\0",
+            b"/opt/homebrew/lib/libpcre2-8.0.dylib\0",
+            b"/usr/local/lib/libpcre2-8.0.dylib\0",
+        ];
+        #[cfg(not(target_os = "macos"))]
+        let names: &[&[u8]] = &[b"libpcre2-8.so.0\0", b"libpcre2-8.so\0"];
+        for name in names {
             handle = libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY);
             if !handle.is_null() {
                 break;
