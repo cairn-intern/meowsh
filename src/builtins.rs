@@ -3576,6 +3576,7 @@ enum LimKind {
     Blocks,
     Kbytes,
     Number,
+    #[cfg(target_os = "linux")]
     Micro,
 }
 
@@ -3886,6 +3887,7 @@ fn limit_text(v: u64, kind: LimKind) -> String {
                 format!("{}kB", v / 1024)
             }
         }
+        #[cfg(target_os = "linux")]
         LimKind::Micro => format!("{}us", v),
         LimKind::Number => v.to_string(),
     }
