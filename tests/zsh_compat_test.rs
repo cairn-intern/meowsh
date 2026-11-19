@@ -679,6 +679,13 @@ fn anonymous_functions_with_glob_args_and_redirections() {
 }
 
 #[test]
+fn function_keyword_with_parens_is_anonymous() {
+    let (_, out, err) = sh("function () { print a $1 } x; function() { print b }; \
+         for i in 1 2; do function () { print $i; break }; done");
+    assert_eq!(out, "a x\nb\n1\n", "stderr: {}", err);
+}
+
+#[test]
 fn not_found_handler_math_functions_and_argv() {
     let (_, out, err) = sh(
         "command_not_found_handler() { print handled $1 ${argv[2,-1]}; return 3 }; \

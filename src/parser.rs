@@ -1039,7 +1039,13 @@ impl Parser {
                 break;
             }
         }
-        // `function { ... } args`: an anonymous function.
+        // `function { ... } args` or `function () { ... } args`: an
+        // anonymous function.
+        if self.peek_is_op("(")? {
+            self.next()?;
+            self.expect_op(")")?;
+            return self.anon_func_rest(line, traced);
+        }
         if self.peek_is_word("{")? {
             return self.anon_func_rest(line, traced);
         }
