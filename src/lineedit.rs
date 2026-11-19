@@ -648,6 +648,14 @@ fn hint_clears_right_prompt(hint: &str) -> bool {
 
 impl Highlighter for MeowshHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        let line = match visible_line(line) {
+            Cow::Borrowed(l) => l,
+            Cow::Owned(l) => {
+                let mut colored = self.highlight_line(&l);
+                colored.push_str(&right_prompt_overlay(&l));
+                return Cow::Owned(colored);
+            }
+        };
         let overlay = right_prompt_overlay(line);
         if line.is_empty() {
             return if overlay.is_empty() {
@@ -819,11 +827,33 @@ pub fn run_fd(fd: i32, prompts: bool) -> i32 {
     )
 }
 
-// A paste right after Ctrl-V (quoted insert) leaves the terminal's
-// start-of-paste marker in the line as text. The terminal swallows it when
-// the line is drawn, so the command would not be the one on screen.
-fn strip_paste_markers(line: &str) -> String {
-    line.replace("\x1b[200~", "").replace("\x1b[201~", "")
+// The line without what the editor gives no width: escape sequences as
+// rustyline measures them, and other control characters. A paste or
+// Ctrl-V can put them in the line; drawn raw, the terminal would act on
+// them and show a different command from the one that runs. They are
+// neither drawn nor run.
+fn visible_line(line: &str) -> Cow<'_, str> {
+    let hidden = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !line.chars().any(hidden) {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut esc = 0;
+    for c in line.chars() {
+        if !hidden(c) && (esc == 0 || c == '\n' || c == '\t') {
+            out.push(c);
+            continue;
+        }
+        esc = match esc {
+            // After ESC: `[` starts a CSI sequence, anything else ends it.
+            1 if c == '[' => 2,
+            // CSI parameters; the first other character is the last.
+            2 if c == ';' || c.is_ascii_digit() => 2,
+            0 if c == '\x1b' => 1,
+            _ => 0,
+        };
+    }
+    Cow::Owned(out)
 }
 
 /// The interactive read-eval loop with line editing and history.
@@ -888,7 +918,7 @@ pub fn run_interactive() -> i32 {
             crate::menu::reset();
             let line = rl.borrow_mut().readline(&prompt);
             match line {
-                Ok(line) => InputLine::Line(strip_paste_markers(&line) + "\n"),
+                Ok(line) => InputLine::Line(visible_line(&line).into_owned() + "\n"),
                 Err(ReadlineError::Interrupted) => InputLine::Interrupted,
                 Err(ReadlineError::Eof) => InputLine::Eof,
                 Err(err) => {
@@ -1044,6 +1074,14 @@ mod tests {
     use super::*;
     use crate::shell::SHELL;
     use crate::TEST_LOCK;
+
+    #[test]
+    fn visible_line_drops_what_has_no_width() {
+        assert_eq!(visible_line("ls -l\tx\ny"), "ls -l\tx\ny");
+        assert_eq!(visible_line("safe\x08\x08evil\x7f"), "safeevil");
+        assert_eq!(visible_line("a \x1b[200~b\x1b[201~ c"), "a b c");
+        assert_eq!(visible_line("a\x1b[1;31mb\x1bcd"), "abd");
+    }
 
     #[test]
     fn right_prompt_needs_a_blank_before_it() {
@@ -1216,11 +1254,11 @@ mod tests {
         let _lock = crate::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let helper = MeowshHelper;
 
-        // "ec\x1b[90mho" should be seen as "echo" which is a builtin (green)
+        // "ec\x1b[90mho" is seen as "echo", a builtin (green); the escape
+        // in the line is not sent to the terminal.
         let h = helper.highlight("ec\x1b[90mho hello", 0);
-        assert!(h.contains("\x1b[32m")); // Green start
-        assert!(h.contains("ec\x1b[90mho")); // Original text preserved
-        assert!(h.contains("\x1b[0m")); // Reset at end of word
+        assert!(h.contains("\x1b[32mecho\x1b[0m"), "{:?}", h);
+        assert!(!h.contains("\x1b[90m"), "{:?}", h);
     }
 
     #[test]

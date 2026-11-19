@@ -838,6 +838,18 @@ fn paste_after_quoted_insert_runs_the_line_as_drawn() {
 }
 
 #[test]
+fn pasted_control_characters_are_neither_drawn_nor_run() {
+    // Backspaces in a paste used to be drawn raw, so the terminal showed
+    // `evil` while `safe^H^H^H^Hevil` ran.
+    let out = on_terminal(
+        "PROMPT='> '\n",
+        "print -r -- \x1b[200~safe\x08\x08\x08\x08evil\x1b[201~; print \"[ri\"\"ght]\"\r",
+    );
+    assert!(out.contains("\r\nsafeevil\r\n"), "output: {:?}", out);
+    assert!(!out.contains("safe\x08"), "output: {:?}", out);
+}
+
+#[test]
 fn read_k_honours_its_timeout() {
     // The harness for zsh's ZLE tests waits this way between keys; it
     // used to block until the writer went away.
