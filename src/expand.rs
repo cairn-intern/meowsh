@@ -3299,6 +3299,7 @@ fn computed_special_type(name: &str) -> Option<String> {
             "integer-special".to_string()
         }
         "ZSH_SUBSHELL" | "LINENO" => "integer-readonly-special".to_string(),
+        "ZSH_EXEPATH" => "scalar-readonly-special".to_string(),
         "USERNAME" => "scalar-special".to_string(),
         "EPOCHSECONDS" if module(name) => format!("integer-readonly{}-hideval-special", hide),
         "EPOCHREALTIME" if module(name) => format!("float-readonly{}-hideval-special", hide),

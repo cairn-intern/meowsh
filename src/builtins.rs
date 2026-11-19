@@ -729,10 +729,11 @@ fn find_sourced(file: &str) -> Option<String> {
 
 /// Runs a file in the current shell, as `.` does.
 pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
-    let bytes = if let Some(zwc_bytes) = crate::zwc::try_load_for_source(path) {
-        zwc_bytes
+    let compiled = crate::zwc::try_load_compiled(path);
+    let content = if compiled.is_some() {
+        None
     } else {
-        match std::fs::read(path) {
+        let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
                 err_line(&format!(
@@ -742,12 +743,13 @@ pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
                 ));
                 return 1;
             }
+        };
+        let text = crate::shell::bytes_to_zstr(&bytes);
+        if is_zsh_completion_script(&text) {
+            return 0;
         }
+        Some(text)
     };
-    let content = crate::shell::bytes_to_zstr(&bytes);
-    if is_zsh_completion_script(&content) {
-        return 0;
-    }
     let saved = args.map(|a| with_shell(|s| std::mem::replace(&mut s.pos_params, a.to_vec())));
     // zsh: $0 is the sourced file while it runs.
     crate::exec::set_next_frame_file(crate::exec::code_origin());
@@ -758,8 +760,10 @@ pub fn source_file(path: &str, args: Option<&[String]>) -> i32 {
             s.source_file.replace(path.to_string()),
         )
     });
-    let mut st = crate::shell::in_eval_context("file", || {
-        crate::exec::run_string_named(&content, Some(path))
+    let mut st = crate::shell::in_eval_context("file", || match (&compiled, &content) {
+        (Some(nodes), _) => crate::exec::run_nodes_named(nodes, Some(path)),
+        (None, Some(text)) => crate::exec::run_string_named(text, Some(path)),
+        (None, None) => 0,
     });
     with_shell(|s| {
         s.source_depth -= 1;

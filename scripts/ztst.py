@@ -364,7 +364,7 @@ def run_file(meowsh, testdir, path, timeout, verbose):
     # caller's leaks into results.
     env = {k: os.environ[k] for k in ("PATH", "USER", "LOGNAME") if k in os.environ}
     env["LANG"] = "C"
-    env["TERM"] = "dumb"
+    env["TERM"] = "xterm-256color"
     env["SHELL"] = meowsh
     # Interactive shells the tests start under zpty use meowsh's ZLE.
     env["MEOWSH_ZLE"] = "1"
@@ -445,6 +445,7 @@ def main():
     ap.add_argument("--zsh-src", required=True, help="zsh source checkout")
     ap.add_argument("--meowsh", default=os.path.join(os.path.dirname(__file__), "..", "target", "release", "meowsh"))
     ap.add_argument("--timeout", type=float, default=60)
+    ap.add_argument("--native", action="store_true", help="run zsh's own Test/ztst.zsh directly with meowsh")
     ap.add_argument("-v", "--verbose", action="store_true", help="show each failing test")
     ap.add_argument("files", nargs="*")
     args = ap.parse_args()
@@ -461,7 +462,11 @@ def main():
         testdir = os.path.join(root, "Test")
         shutil.copytree(src_test, testdir, symlinks=True)
         os.makedirs(os.path.join(root, "Src"), exist_ok=True)
-        os.symlink(meowsh, os.path.join(root, "Src", "zsh"))
+        zsh_bin = os.path.join(root, "Src", "zsh")
+        try:
+            os.link(meowsh, zsh_bin)
+        except OSError:
+            shutil.copy2(meowsh, zsh_bin)
         # Some tests source helper scripts from Misc/ (globtests).
         for extra in ("Misc", "Functions", "Completion"):
             src_extra = os.path.join(args.zsh_src, extra)
@@ -495,6 +500,63 @@ def main():
         # Build features some tests check before running.
         with open(os.path.join(root, "config.h"), "w") as f:
             f.write("#define PATH_DEV_FD 1\n#define HAVE_FIFOS 1\n#define MULTIBYTE_SUPPORT 1\n")
+        if args.native:
+            passed_files = 0
+            xpass_files = 0
+            skipped_files = 0
+            failed_files = 0
+            zsh_bin = os.path.join(root, "Src", "zsh")
+            ztst_sh = os.path.join(testdir, "ztst.zsh")
+            for name in names:
+                env = {k: os.environ[k] for k in ("PATH", "USER", "LOGNAME") if k in os.environ}
+                env["LANG"] = "C"
+                env["TERM"] = "xterm-256color"
+                env["SHELL"] = zsh_bin
+                env["MEOWSH_ZLE"] = "1"
+                env["ZTST_testdir"] = testdir
+                env["ZTST_srcdir"] = testdir
+                env["ZTST_exe"] = zsh_bin
+                env["HOME"] = os.path.join(testdir, "home.tmp")
+                os.makedirs(env["HOME"], exist_ok=True)
+                try:
+                    p = subprocess.run(
+                        [zsh_bin, "-f", ztst_sh, os.path.join(testdir, name)],
+                        cwd=testdir,
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        errors="surrogateescape",
+                        timeout=args.timeout,
+                    )
+                    if p.returncode == 0:
+                        status_str = "PASS"
+                        passed_files += 1
+                    elif p.returncode == 2:
+                        status_str = "SKIP"
+                        skipped_files += 1
+                    elif "test XPassed." in p.stdout:
+                        status_str = "XPASS"
+                        xpass_files += 1
+                    else:
+                        status_str = f"FAIL({p.returncode})"
+                        failed_files += 1
+                    print(f"{name[:-5]:24} {status_str}")
+                    if status_str.startswith("FAIL") and args.verbose:
+                        if p.stdout.strip():
+                            print("  " + p.stdout.strip().replace("\n", "\n  "))
+                        if p.stderr.strip():
+                            print("  " + p.stderr.strip().replace("\n", "\n  "))
+                except subprocess.TimeoutExpired:
+                    failed_files += 1
+                    print(f"{name[:-5]:24} TIMEOUT")
+            print(
+                f"\nnative ztst.zsh: {passed_files} pass, {xpass_files} xpass, "
+                f"{skipped_files} skip, {failed_files} fail"
+            )
+            if failed_files:
+                sys.exit(1)
+            return
         total = {}
         print(f"{'file':24} {'pass':>5} {'out-ok':>6} {'fail':>5} {'abort':>5} {'skip':>5}")
         for name in names:

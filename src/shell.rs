@@ -89,6 +89,35 @@ pub fn shell_init() {
     // ZSH_VERSION. The suffix keeps per-version files (for example
     // ~/.zcompdump-host-$ZSH_VERSION) apart from real zsh's.
     set(&mut shell, "ZSH_VERSION", "5.9-meowsh".to_string(), 0);
+    let ostype = if cfg!(target_os = "linux") {
+        "linux-gnu"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else if cfg!(target_os = "netbsd") {
+        "netbsd"
+    } else if cfg!(target_os = "openbsd") {
+        "openbsd"
+    } else {
+        std::env::consts::OS
+    };
+    set_default(&mut shell, "OSTYPE", ostype.to_string(), 0);
+    set_default(&mut shell, "CPUTYPE", std::env::consts::ARCH.to_string(), 0);
+    set_default(
+        &mut shell,
+        "MACHTYPE",
+        std::env::consts::ARCH.to_string(),
+        0,
+    );
+    let vendor = if cfg!(target_os = "macos") {
+        "apple"
+    } else if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
+        "pc"
+    } else {
+        "unknown"
+    };
+    set_default(&mut shell, "VENDOR", vendor.to_string(), 0);
     set(
         &mut shell,
         "ZSH_PATCHLEVEL",
@@ -405,6 +434,9 @@ fn dynamic_var(name: &str) -> Option<String> {
             })
         }
         "ZSH_SUBSHELL" => Some(SUBSHELL_LEVEL.load(Ordering::Relaxed).to_string()),
+        "ZSH_EXEPATH" => std::env::current_exe()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
         "LINENO" => Some(lineno().to_string()),
         // zsh's user and group ids.
         "UID" => Some(unsafe { libc::getuid() }.to_string()),
@@ -433,6 +465,7 @@ pub const DYNAMIC_NAMES: &[&str] = &[
     "EPOCHSECONDS",
     "EPOCHREALTIME",
     "ZSH_SUBSHELL",
+    "ZSH_EXEPATH",
     "UID",
     "EUID",
     "GID",
@@ -575,6 +608,7 @@ pub fn var_exists(name: &str) -> bool {
                 | "EPOCHSECONDS"
                 | "EPOCHREALTIME"
                 | "ZSH_SUBSHELL"
+                | "ZSH_EXEPATH"
                 | "UID"
                 | "EUID"
                 | "GID"
@@ -1290,10 +1324,19 @@ pub fn array_set(name: &str, mut items: Vec<String>) -> bool {
             return false;
         }
         let lvl = shell.param(name).map(|p| p.level).unwrap_or(0);
+        let is_special_opts =
+            name == "options" && shell.param("options").is_some_and(|p| p.level == 0);
         let assoc = assoc_from_items(items);
         let copy = assoc.clone();
         shell.store(name, Value::Assoc(assoc));
         drop(shell);
+        if is_special_opts {
+            for (k, v) in &copy {
+                if v == "on" || v == "off" {
+                    crate::options::set(k, v == "on");
+                }
+            }
+        }
         crate::zgdbm::on_replace_all(name, lvl, &copy);
         return true;
     }
@@ -1571,6 +1614,8 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
     }
     if shell.assoc(name).is_some() {
         let lvl = shell.param(name).map(|p| p.level).unwrap_or(0);
+        let is_special_opts =
+            name == "options" && shell.param("options").is_some_and(|p| p.level == 0);
         let new_value = {
             let assoc = shell.assoc_mut(name).unwrap();
             let nv = if append {
@@ -1584,6 +1629,9 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
             nv
         };
         drop(shell);
+        if is_special_opts && (new_value == "on" || new_value == "off") {
+            crate::options::set(subscript, new_value == "on");
+        }
         crate::zgdbm::on_set_key(name, lvl, subscript, &new_value);
         return true;
     }

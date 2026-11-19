@@ -1852,6 +1852,10 @@ fn zwc_compile_and_invalid_description_compat() {
 
     let zwc_bytes = std::fs::read(&zwc).unwrap();
     assert!(zwc_bytes.len() > 60 && zwc_bytes[0..4] == 0x0405_0607u32.to_ne_bytes());
+    assert!(
+        zwc_bytes.windows(4).any(|w| w == b"MWC1"),
+        "expected compiled MWC1 wordcode payload in .zwc"
+    );
 
     // Keep source mtime older than .zwc so source loads from the compiled file.
     std::fs::write(&script, "CORRUPTED\n").unwrap();
@@ -1938,4 +1942,23 @@ fi
     if meowsh::zgdbm::is_available() {
         assert!(out.contains("gdbm=v1\n"), "out={:?}", out);
     }
+}
+
+#[test]
+fn ostype_exepath_and_options_assoc_sync_compat() {
+    let (st, out, err) = sh(r#"
+print "os=$OSTYPE"
+[[ -n $ZSH_EXEPATH && -x $ZSH_EXEPATH ]] && print "exe=ok"
+setopt extendedglob
+options[extendedglob]=off
+[[ -o extendedglob ]] && print "eg=on" || print "eg=off"
+"#);
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert!(
+        out.contains("os=linux-gnu\n") || !out.contains("os=\n"),
+        "out={:?}",
+        out
+    );
+    assert!(out.contains("exe=ok\n"), "out={:?}", out);
+    assert!(out.contains("eg=off\n"), "out={:?}", out);
 }

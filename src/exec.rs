@@ -3845,6 +3845,44 @@ pub fn run_string_named(src: &str, ctx: Option<&str>) -> i32 {
     st
 }
 
+/// Runs pre-compiled AST nodes (e.g. from `.zwc`) in a named frame without re-parsing.
+pub fn run_nodes_named(nodes: &[Node], ctx: Option<&str>) -> i32 {
+    let saved_line = match ctx {
+        Some(c) => push_frame(c, 0, (c != "(eval)").then(|| format!("{}:0", c))),
+        None => crate::shell::with_err_ctx(|e| e.lineno),
+    };
+    let run = || {
+        let mut status = 0;
+        let exiting = EXITING_SHELL.swap(false, std::sync::atomic::Ordering::Relaxed);
+        for (k, node) in nodes.iter().enumerate() {
+            if flow_pending() {
+                break;
+            }
+            EXITING_SHELL.store(
+                exiting && k + 1 == nodes.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            status = exec_with_debug(node);
+            crate::trap::run_pending();
+        }
+        EXITING_SHELL.store(false, std::sync::atomic::Ordering::Relaxed);
+        status
+    };
+    let st = if ctx.is_some() {
+        in_cmd_scope(run)
+    } else {
+        run()
+    };
+    crate::shell::with_err_ctx(|e| {
+        if ctx.is_some() {
+            e.stack.pop();
+            e.calls.pop();
+        }
+        e.lineno = saved_line;
+    });
+    st
+}
+
 fn run_whole(src: &str) -> i32 {
     let mut parser = Parser::new(src, true);
     let mut nodes = Vec::new();
