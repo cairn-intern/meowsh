@@ -1072,6 +1072,11 @@ fn set_raw(fd: i32) -> Option<libc::termios> {
         for c in [libc::VQUIT, libc::VDISCARD, libc::VSUSP, libc::VLNEXT] {
             t.c_cc[c] = 0;
         }
+        // BSD and macOS also reserve ^Y (delayed suspend) in the line discipline.
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        {
+            t.c_cc[libc::VDSUSP] = 0;
+        }
         t.c_cc[libc::VMIN] = 1;
         t.c_cc[libc::VTIME] = 0;
         t.c_iflag |= libc::INLCR | libc::ICRNL;
