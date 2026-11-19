@@ -1649,6 +1649,7 @@ fn ztat(nam: &str, ls: bool) -> Option<u32> {
 
 /// The character `ls -F` shows for a file mode.
 pub fn file_type(mode: u32) -> char {
+    let mode = mode as libc::mode_t;
     match mode & libc::S_IFMT {
         libc::S_IFBLK => '#',
         libc::S_IFCHR => '%',

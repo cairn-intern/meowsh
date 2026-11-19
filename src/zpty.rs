@@ -87,7 +87,7 @@ fn new_cmd(name: &str, args: &[String], echo: bool, nblock: bool) -> i32 {
             if slave < 0 {
                 libc::_exit(1);
             }
-            libc::ioctl(slave, libc::TIOCSCTTY, 0);
+            libc::ioctl(slave, libc::TIOCSCTTY as _, 0);
             if !echo {
                 let mut t: libc::termios = std::mem::zeroed();
                 if libc::tcgetattr(slave, &mut t) == 0 {
