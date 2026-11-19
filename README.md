@@ -11,9 +11,13 @@ A POSIX-compliant shell implementation.
 - Variable expansion
 - Redirections
 
+## Installing
+
+Prebuilt binaries for Linux (`x86_64`, `aarch64`) and macOS (`aarch64`, `x86_64`) are published on the [GitHub Releases](https://github.com/euxarist/meowsh/releases) page as `meowsh-<tag>-<target>.tar.gz` archives with `SHA256SUMS.txt`.
+
 ## Building
 
-To build `meowsh`, run:
+To build `meowsh` from source, run:
 
 ```bash
 make
