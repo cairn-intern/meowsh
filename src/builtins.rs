@@ -111,6 +111,16 @@ const REGULAR: &[&str] = &[
     "comptry",
     "compfiles",
     "compgroups",
+    "echoti",
+    "echotc",
+    "log",
+    "pcre_compile",
+    "pcre_match",
+    "pcre_study",
+    "ztie",
+    "zuntie",
+    "zgdbmpath",
+    "zgdbmclear",
 ];
 
 const KEYWORDS: &[&str] = &[
@@ -162,7 +172,18 @@ pub fn is_special_builtin(name: &str) -> bool {
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    if matches!(name, "stat" | "zstat") {
+    if matches!(
+        name,
+        "stat"
+            | "zstat"
+            | "ztie"
+            | "zuntie"
+            | "zgdbmpath"
+            | "zgdbmclear"
+            | "pcre_compile"
+            | "pcre_match"
+            | "pcre_study"
+    ) {
         return !builtin_disabled(name) && crate::modules::feature_enabled(&format!("b:{}", name));
     }
     (SPECIAL.contains(&name) || REGULAR.contains(&name))
@@ -395,8 +416,17 @@ pub fn run(name: &str, words: &[String]) -> i32 {
         "comptry" => crate::zle::comp::computil_rest::builtin_comptry(words),
         "compfiles" => crate::zle::comp::computil_rest::builtin_compfiles(words),
         "compgroups" => crate::zle::comp::computil_rest::builtin_compgroups(words),
-        "compdef" | "zrecompile" | "complete" | "compctl" => 0,
+        "compdef" | "zrecompile" | "complete" | "compctl" | "log" => 0,
         "zcompile" => crate::zwc::builtin_zcompile(words),
+        "echoti" => crate::zle::refresh::refresh_term::builtin_echoti(words),
+        "echotc" => crate::zle::refresh::refresh_term::builtin_echotc(words),
+        "pcre_compile" => crate::zpcre::builtin_pcre_compile(words),
+        "pcre_match" => crate::zpcre::builtin_pcre_match(words),
+        "pcre_study" => crate::zpcre::builtin_pcre_study(words),
+        "ztie" => crate::zgdbm::builtin_ztie(words),
+        "zuntie" => crate::zgdbm::builtin_zuntie(words),
+        "zgdbmpath" => crate::zgdbm::builtin_zgdbmpath(words),
+        "zgdbmclear" => crate::zgdbm::builtin_zgdbmclear(words),
         _ => {
             builtin_err(name, "not a builtin");
             1
@@ -878,13 +908,16 @@ fn builtin_unset(words: &[String]) -> i32 {
                 }
                 Some((true, _, _)) => {
                     let key = crate::expand::expand_string(sub).unwrap_or_else(|_| sub.to_string());
-                    with_shell(|s| {
+                    let lvl = with_shell(|s| {
+                        let lvl = s.param(&target).map(|p| p.level).unwrap_or(0);
                         if let Some(crate::params::Value::Assoc(m)) =
                             s.param_mut(&target).map(|p| &mut p.value)
                         {
                             m.remove(&key);
                         }
+                        lvl
                     });
+                    crate::zgdbm::on_del_key(&target, lvl, &key);
                 }
                 Some((false, is_array, _)) => {
                     let sub = crate::expand::expand_string(sub).unwrap_or_else(|_| sub.to_string());

@@ -95,8 +95,6 @@ thread_local! {
     static UNKNOWN: Cell<Zattr> = const { Cell::new(0) };
     // The terminal's own colours, from the startup query.
     static MEMO_TERM_COLOR: Cell<Zattr> = const { Cell::new(0) };
-    // Whether zsh/nearcolor's get_color_attr hook is installed.
-    static NEARCOLOR: Cell<bool> = const { Cell::new(false) };
     static SEQS: RefCell<Option<[ColourSeq; 2]>> = const { RefCell::new(None) };
     static COLSEQ_ALLOCS: Cell<i32> = const { Cell::new(0) };
     static HL_ENTERED: Cell<bool> = const { Cell::new(false) };
@@ -230,16 +228,37 @@ fn truecolor_terminal() -> bool {
 }
 
 fn nearcolor_loaded() -> bool {
-    NEARCOLOR.with(|n| n.get())
-        || crate::modules::modules_param()
-            .get("zsh/nearcolor")
-            .is_some_and(|s| s == "loaded")
+    crate::modules::modules_param()
+        .get("zsh/nearcolor")
+        .is_some_and(|s| s == "loaded")
 }
 
 // load_module("zsh/nearcolor"): zsh loads it on demand.
 fn load_nearcolor() -> bool {
-    NEARCOLOR.with(|n| n.set(true));
-    true
+    if nearcolor_loaded() {
+        return true;
+    }
+    crate::modules::builtin_zmodload(&["zmodload".into(), "zsh/nearcolor".into()]) == 0
+}
+
+/// Formats `#rrggbb` / `#rgb` for `%F{...}` / `%K{...}` prompts, autoloading
+/// `zsh/nearcolor` when the terminal is not truecolor.
+pub fn prompt_hex_color(r: u8, g: u8, b: u8, is_fg: bool) -> String {
+    let prefix = if is_fg { 38 } else { 48 };
+    if truecolor_terminal() {
+        return format!("\x1b[{};2;{};{};{}m", prefix, r, g, b);
+    }
+    if nearcolor_loaded() || load_nearcolor() {
+        let c = getcolorattr(r as u32, g as u32, b as u32);
+        if c > 0 {
+            return format!("\x1b[{};5;{}m", prefix, c - 1);
+        }
+    }
+    if is_fg {
+        "\x1b[39m".to_string()
+    } else {
+        "\x1b[49m".to_string()
+    }
 }
 
 /// runhookdef(GETCOLORATTR): 0 when no hook is installed, else the

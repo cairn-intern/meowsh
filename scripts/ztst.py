@@ -470,9 +470,10 @@ def main():
         # The modules meowsh has built in, as a static zsh build lists them
         # in config.modules (V01zmodload reads it and each .mdd file).
         provided = {
-            "zsh/main", "zsh/complete", "zsh/complist", "zsh/computil", "zsh/datetime",
-            "zsh/langinfo", "zsh/mathfunc", "zsh/parameter", "zsh/random", "zsh/regex",
-            "zsh/rlimits", "zsh/system", "zsh/zle", "zsh/zleparameter", "zsh/zpty",
+            "zsh/main", "zsh/complete", "zsh/complist", "zsh/computil", "zsh/datetime", "zsh/db/gdbm",
+            "zsh/langinfo", "zsh/mathfunc", "zsh/parameter", "zsh/pcre", "zsh/random", "zsh/regex",
+            "zsh/rlimits", "zsh/system", "zsh/termcap", "zsh/terminfo", "zsh/watch",
+            "zsh/zle", "zsh/zleparameter", "zsh/zpty",
             "zsh/zselect", "zsh/zutil", "zsh/param/private", "zsh/nearcolor",
         }
         config = []

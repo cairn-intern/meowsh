@@ -170,6 +170,8 @@ fn build(name: &str) -> Term {
         (vec![VT100], true, -1)
     } else if name.contains("256color") {
         (vec![XTERM_256, XTERM], true, 256)
+    } else if name.contains("88color") || name == "rxvt-unicode" {
+        (vec![XTERM_256, XTERM], true, 88)
     } else {
         (vec![XTERM], true, 8)
     };
@@ -228,9 +230,7 @@ pub(super) fn reload() {
 }
 
 fn with<R>(f: impl FnOnce(&Term) -> R) -> R {
-    if TERM.with(|t| t.borrow().is_none()) {
-        reload();
-    }
+    reload();
     TERM.with(|t| f(t.borrow().as_ref().expect("terminal description")))
 }
 
@@ -440,4 +440,161 @@ pub(super) fn tsetcap(cap: usize) {
             write_bytes(tputs(&s).as_bytes());
         }
     }
+}
+
+const TERMINFO_MAP: &[(&str, &str)] = &[
+    ("clear", "cl"),
+    ("cub1", "le"),
+    ("cub", "LE"),
+    ("cuf1", "nd"),
+    ("cuf", "RI"),
+    ("cuu1", "up"),
+    ("cuu", "UP"),
+    ("cud1", "do"),
+    ("cud", "DO"),
+    ("dch1", "dc"),
+    ("dch", "DC"),
+    ("ich1", "ic"),
+    ("ich", "IC"),
+    ("ed", "cd"),
+    ("el", "ce"),
+    ("il1", "al"),
+    ("dl1", "dl"),
+    ("ht", "ta"),
+    ("bold", "md"),
+    ("dim", "mh"),
+    ("smso", "so"),
+    ("smul", "us"),
+    ("sitm", "ZH"),
+    ("sgr0", "me"),
+    ("rmso", "se"),
+    ("rmul", "ue"),
+    ("ritm", "ZR"),
+    ("hpa", "ch"),
+    ("kcuu1", "ku"),
+    ("kcud1", "kd"),
+    ("kcub1", "kl"),
+    ("kcuf1", "kr"),
+    ("sc", "sc"),
+    ("rc", "rc"),
+    ("setaf", "AF"),
+    ("setab", "AB"),
+    ("civis", "vi"),
+    ("cnorm", "ve"),
+];
+
+pub fn termcap_lookup(key: &str) -> Option<String> {
+    with(|t| match key {
+        "Co" => (t.colours >= 0).then(|| t.colours.to_string()),
+        "li" => Some(
+            crate::shell::var_get_opt("LINES")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "24".to_string()),
+        ),
+        "co" => Some(
+            crate::shell::var_get_opt("COLUMNS")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "80".to_string()),
+        ),
+        "am" => t.am.then(|| "yes".to_string()),
+        _ => NAMES
+            .iter()
+            .position(|&n| n == key)
+            .and_then(|i| t.caps[i].clone()),
+    })
+}
+
+pub fn terminfo_lookup(key: &str) -> Option<String> {
+    match key {
+        "colors" => with(|t| (t.colours >= 0).then(|| t.colours.to_string())),
+        "lines" => termcap_lookup("li"),
+        "cols" => termcap_lookup("co"),
+        "am" => with(|t| t.am.then(|| "yes".to_string())),
+        _ => TERMINFO_MAP
+            .iter()
+            .find(|(ti, _)| *ti == key)
+            .and_then(|(_, tc)| termcap_lookup(tc)),
+    }
+}
+
+pub fn termcap_entries() -> Vec<(String, String)> {
+    with(|t| {
+        let mut out = Vec::new();
+        if t.colours >= 0 {
+            out.push(("Co".to_string(), t.colours.to_string()));
+        }
+        if t.am {
+            out.push(("am".to_string(), "yes".to_string()));
+        }
+        for (i, &name) in NAMES.iter().enumerate() {
+            if let Some(ref val) = t.caps[i] {
+                out.push((name.to_string(), val.clone()));
+            }
+        }
+        out
+    })
+}
+
+pub fn terminfo_entries() -> Vec<(String, String)> {
+    with(|t| {
+        let mut out = Vec::new();
+        if t.colours >= 0 {
+            out.push(("colors".to_string(), t.colours.to_string()));
+        }
+        if t.am {
+            out.push(("am".to_string(), "yes".to_string()));
+        }
+        for &(ti, tc) in TERMINFO_MAP {
+            if let Some(i) = NAMES.iter().position(|&n| n == tc) {
+                if let Some(ref val) = t.caps[i] {
+                    out.push((ti.to_string(), val.clone()));
+                }
+            }
+        }
+        out
+    })
+}
+
+fn run_echo_cap(builtin: &str, words: &[String], is_terminfo: bool) -> i32 {
+    let Some(cap) = words.get(1) else {
+        crate::shell::builtin_err(builtin, "not enough arguments");
+        return 1;
+    };
+    let is_num = if is_terminfo {
+        matches!(cap.as_str(), "colors" | "lines" | "cols")
+    } else {
+        matches!(cap.as_str(), "Co" | "li" | "co")
+    };
+    let val = if is_terminfo {
+        terminfo_lookup(cap)
+    } else {
+        termcap_lookup(cap)
+    };
+    let Some(val) = val else {
+        crate::shell::builtin_err(builtin, &format!("no such capability: {}", cap));
+        return 1;
+    };
+    if is_num {
+        crate::sys::out(&format!("{}\n", val));
+        return 0;
+    }
+    let a1 = words
+        .get(2)
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0);
+    let formatted = if words.len() > 2 {
+        tparm(&val, a1)
+    } else {
+        tputs(&val)
+    };
+    crate::sys::out(&formatted);
+    0
+}
+
+pub fn builtin_echoti(words: &[String]) -> i32 {
+    run_echo_cap("echoti", words, true)
+}
+
+pub fn builtin_echotc(words: &[String]) -> i32 {
+    run_echo_cap("echotc", words, false)
 }

@@ -1472,6 +1472,20 @@ impl Parser {
             match self.next()? {
                 Tok::Word(w) if w == "]]" => break,
                 Tok::Word(w) => args.push(w),
+                Tok::Op("(")
+                    if args.last().is_some_and(|w| {
+                        matches!(
+                            w.as_str(),
+                            "=~" | "-pcre-match" | "-regex-match" | "=" | "==" | "!="
+                        )
+                    }) =>
+                {
+                    if let Some(w) = self.lex.glob_word_after_paren() {
+                        args.push(w);
+                    } else {
+                        args.push("(".to_string());
+                    }
+                }
                 Tok::Op(op) => args.push(op.to_string()),
                 Tok::IoNumber(n) => args.push(n.to_string()),
                 Tok::IoVar(v) => args.push(format!("{{{}}}", v)),

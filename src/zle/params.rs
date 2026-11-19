@@ -226,6 +226,7 @@ pub fn make_params(z: &mut Zle) {
             let level = sh.local_scopes.len();
             let mut p = Param::with(value);
             p.level = level;
+            p.attrs |= crate::params::SPECIAL;
             if kind.1 == Kind::Integer {
                 p.attrs |= INTEGER;
             }

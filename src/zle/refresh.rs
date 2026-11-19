@@ -12,9 +12,9 @@
 //! queued earlier, exactly as with zsh.
 
 #[path = "refresh_attr.rs"]
-mod refresh_attr;
+pub mod refresh_attr;
 #[path = "refresh_term.rs"]
-mod refresh_term;
+pub mod refresh_term;
 
 use super::*;
 use crate::zle::comp::result::{self, zterm_columns, zterm_lines};
@@ -2105,51 +2105,76 @@ pub fn get_region_highlight(z: &Zle) -> Vec<String> {
         .collect()
 }
 
+fn parse_region_highlight_item(item: &str) -> RegionHighlight {
+    let blank = |b: u8| b == b' ' || b == b'\t';
+    let s = item.as_bytes();
+    let predisplay = s.first() == Some(&b'P');
+    let mut i = usize::from(predisplay);
+    while i < s.len() && blank(s[i]) {
+        i += 1;
+    }
+    let (v, e) = zstrtol(s, i, 10);
+    let start = if e == i { -1 } else { v };
+    i = e;
+    while i < s.len() && blank(s[i]) {
+        i += 1;
+    }
+    let (v, e) = zstrtol(s, i, 10);
+    let end = if e == i { -1 } else { v };
+    i = e;
+    while i < s.len() && blank(s[i]) {
+        i += 1;
+    }
+    let m = match_highlight(&item[i..], true);
+    i += m.consumed;
+    while i < s.len() && blank(s[i]) {
+        i += 1;
+    }
+    // The memo ends at a comma, blank, or NUL, leaving room for more fields.
+    let memo = item[i..].strip_prefix("memo=").map(|r| {
+        r.chars()
+            .take_while(|&c| c != '\0' && c != ',' && c != ' ' && c != '\t')
+            .collect::<String>()
+    });
+    let mut attr = output_highlight(m.atr, m.mask);
+    let layer = m.layer.unwrap_or(10);
+    if layer != 10 {
+        attr.push_str(&format!(",layer={}", layer));
+    }
+    RegionHighlight {
+        start,
+        end,
+        attr,
+        memo,
+        predisplay,
+    }
+}
+
+/// Normalizes `$region_highlight` entries as zsh's `set_region_highlight` does.
+pub fn normalize_region_highlight(items: Vec<String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| {
+            let rh = parse_region_highlight_item(&item);
+            let mut s = format!(
+                "{}{} {} {}",
+                if rh.predisplay { "P" } else { "" },
+                rh.start,
+                rh.end,
+                rh.attr
+            );
+            if let Some(m) = &rh.memo {
+                s.push_str(&format!(" memo={}", m));
+            }
+            s
+        })
+        .collect()
+}
+
 /// Sets $region_highlight from its elements: `[P]start end style [memo=x]`.
 pub fn set_region_highlight(z: &mut Zle, items: &[String]) {
-    let blank = |b: u8| b == b' ' || b == b'\t';
     z.region_highlights.clear();
     for item in items {
-        let s = item.as_bytes();
-        let predisplay = s.first() == Some(&b'P');
-        let mut i = usize::from(predisplay);
-        while i < s.len() && blank(s[i]) {
-            i += 1;
-        }
-        let (v, e) = zstrtol(s, i, 10);
-        let start = if e == i { -1 } else { v };
-        i = e;
-        while i < s.len() && blank(s[i]) {
-            i += 1;
-        }
-        let (v, e) = zstrtol(s, i, 10);
-        let end = if e == i { -1 } else { v };
-        i = e;
-        while i < s.len() && blank(s[i]) {
-            i += 1;
-        }
-        let m = match_highlight(&item[i..], true);
-        i += m.consumed;
-        while i < s.len() && blank(s[i]) {
-            i += 1;
-        }
-        // The memo ends at a comma or blank, leaving room for more fields.
-        let memo = item[i..].strip_prefix("memo=").map(|r| {
-            r.chars()
-                .take_while(|&c| c != '\0' && c != ',' && c != ' ' && c != '\t')
-                .collect::<String>()
-        });
-        let mut attr = output_highlight(m.atr, m.mask);
-        let layer = m.layer.unwrap_or(10);
-        if layer != 10 {
-            attr.push_str(&format!(",layer={}", layer));
-        }
-        z.region_highlights.push(RegionHighlight {
-            start,
-            end,
-            attr,
-            memo,
-            predisplay,
-        });
+        z.region_highlights.push(parse_region_highlight_item(item));
     }
 }

@@ -938,9 +938,9 @@ fn glob_group_words_after_a_command_word() {
 
 #[test]
 fn loading_an_unavailable_module_fails() {
-    let (st, _, err) = sh("zmodload zsh/pcre");
+    let (st, _, err) = sh("zmodload zsh/zftp");
     assert_eq!(st, 1);
-    assert!(err.contains("failed to load module `zsh/pcre'"), "{}", err);
+    assert!(err.contains("failed to load module `zsh/zftp'"), "{}", err);
 }
 
 #[test]
@@ -1897,4 +1897,45 @@ fn nofork_stdout_parse_wrapper_lineno_and_comment_compat() {
     assert_eq!(st, 1, "out={:?} err={:?}", out, err);
     assert_eq!(out, "hi\n");
     assert_eq!(err, "(eval):3: parse error near `}'\n");
+}
+
+#[test]
+fn terminfo_nearcolor_watch_pcre_and_gdbm_modules_compat() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("t.gdbm");
+    let (st, out, err) = sh(&format!(
+        r#"
+TERM=xterm-256color
+print "ti=$terminfo[colors] tc=$termcap[Co] fg=${{(V)${{(%):-%F{{#123456}}}}}}"
+WATCH=a:b
+print "watch=${{watch[1]}},${{watch[2]}}"
+if zmodload zsh/pcre 2>/dev/null; then
+  setopt rematch_pcre
+  [[ "foo/bar-42" =~ '(?<k>[^/]+)/(?<v>\w+)-(\d+)' ]]
+  print "pcre=${{.pcre.match[k]}}:${{.pcre.match[v]}}:${{match[3]}}"
+fi
+if zmodload zsh/db/gdbm 2>/dev/null; then
+  ztie -d db/gdbm -f {db} dbase
+  dbase[k1]=v1
+  zuntie dbase
+  ztie -r -d db/gdbm -f {db} dbase
+  print "gdbm=$dbase[k1]"
+  zuntie -u dbase
+fi
+"#,
+        db = db.display()
+    ));
+    assert_eq!(st, 0, "out={:?} err={:?}", out, err);
+    assert!(
+        out.contains("ti=256 tc=256 fg=^[[38;5;24m\n"),
+        "out={:?}",
+        out
+    );
+    assert!(out.contains("watch=a,b\n"), "out={:?}", out);
+    if meowsh::zpcre::is_available() {
+        assert!(out.contains("pcre=foo:bar:42\n"), "out={:?}", out);
+    }
+    if meowsh::zgdbm::is_available() {
+        assert!(out.contains("gdbm=v1\n"), "out={:?}", out);
+    }
 }

@@ -145,11 +145,16 @@ and builtins include:
   (`sysread`, `sysopen`, `zsystem flock`, ...), zsh/mathfunc,
   zsh/parameter (assigning to `$functions` defines functions;
   `$funcsourcetrace`, `$functions_source`), zsh/param/private (`private`,
-  `local -P`), zsh/stat (`zstat`, `stat`), zsh/random and the completion modules. `zmodload`
+  `local -P`), zsh/stat (`zstat`, `stat`), zsh/termcap (`$termcap`,
+  `echotc`), zsh/terminfo (`$terminfo`, `echoti`), zsh/nearcolor,
+  zsh/watch (`WATCH`/`watch`), zsh/pcre (`pcre_compile`, `pcre_match`,
+  `-pcre-match`, `REMATCH_PCRE` via `libpcre2-8`), zsh/db/gdbm (`ztie`,
+  `zuntie`, `zgdbmpath`, `$zgdbm_tied` via `libgdbm`), zsh/random and
+  the completion modules. `zmodload`
   tracks them as zsh does (features, `-F`, autoloads, `-u`); a module's
   builtins work without loading it until `zmodload` is given that
-  module. Loading one meowsh does not have (zsh/pcre, zsh/db/gdbm,
-  zsh/compctl, ...) fails
+  module. Loading one meowsh does not have (zsh/compctl, zsh/zftp, ...)
+  fails
 
 By default meowsh edits lines with its own editor, not zle: `zle`
 widgets and `bindkey` bindings are recorded but not used while typing,

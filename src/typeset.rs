@@ -1592,7 +1592,9 @@ pub fn print_param(name: &str, p: &Param, pf: &PrintFlags, locallevel: usize) ->
                 altname = 'x';
                 out.push_str("export ");
             }
-        } else if locallevel > 0 && p.level >= locallevel {
+        } else if locallevel > 0
+            && (p.level >= locallevel || (p.level > 0 && p.attrs & SPECIAL != 0))
+        {
             out.push_str(if p.attrs & EXPORT != 0 {
                 "local "
             } else {

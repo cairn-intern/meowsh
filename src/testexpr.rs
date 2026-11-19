@@ -58,6 +58,7 @@ fn is_binary(op: &str) -> bool {
             | "-ot"
             | "-ef"
             | "=~"
+            | "-pcre-match"
     )
 }
 
@@ -603,7 +604,14 @@ impl DbParser<'_> {
                             _ => a >= b,
                         })
                     }
-                    "=~" => regex_match_set(&l, &exp(&rhs)?),
+                    "=~" => {
+                        if crate::options::is_set("rematchpcre") && crate::zpcre::is_available() {
+                            crate::zpcre::cond_pcre_match(&l, &exp(&rhs)?)
+                        } else {
+                            regex_match_set(&l, &exp(&rhs)?)
+                        }
+                    }
+                    "-pcre-match" => crate::zpcre::cond_pcre_match(&l, &exp(&rhs)?),
                     _ => binary(&l, &op, &exp(&rhs)?),
                 };
             }

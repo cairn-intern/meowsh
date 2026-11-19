@@ -582,6 +582,8 @@ pub fn var_exists(name: &str) -> bool {
                 | "USERNAME"
                 | "LINENO"
         )
+        || (matches!(name, "terminfo" | "termcap")
+            && crate::modules::feature_available(&format!("p:{}", name)))
         || (name == "ARGC" && !crate::exec::sh_emulation_pub())
         || (matches!(name, "COLUMNS" | "LINES") && terminal_size().is_some())
     {
@@ -1099,6 +1101,11 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
     if placeholder {
         return set_ref_target(name, value);
     }
+    if !with_shell(|s| s.param(name).is_some_and(|p| p.level > 0))
+        && crate::modules::has_autoparam(name)
+    {
+        let _ = crate::modules::autoload_feature(&format!("p:{}", name));
+    }
     let r = with_shell(|s| s.resolve_ref_target(name));
     if r.missing_upper {
         REF_MISSING_UPPER.with(|e| e.set(true));
@@ -1248,10 +1255,13 @@ fn var_set_inner(name: &str, value: &str, export: bool) -> bool {
 }
 
 /// Stores items into array `name`, honoring -U and readonly.
-pub fn array_set(name: &str, items: Vec<String>) -> bool {
+pub fn array_set(name: &str, mut items: Vec<String>) -> bool {
     let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
+    if name == "region_highlight" {
+        items = crate::zle::refresh::normalize_region_highlight(items);
+    }
     if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
         shell_err(&format!(
             "{}: attempt to assign array value to non-array",
@@ -1279,8 +1289,12 @@ pub fn array_set(name: &str, items: Vec<String>) -> bool {
             shell_err("bad set of key/value pairs for associative array");
             return false;
         }
+        let lvl = shell.param(name).map(|p| p.level).unwrap_or(0);
         let assoc = assoc_from_items(items);
+        let copy = assoc.clone();
         shell.store(name, Value::Assoc(assoc));
+        drop(shell);
+        crate::zgdbm::on_replace_all(name, lvl, &copy);
         return true;
     }
     // A scalar given an array value becomes a plain array: its scalar
@@ -1486,18 +1500,25 @@ fn array_splice_inner(name: &str, sub: &str, items: Vec<String>) -> bool {
     }
 }
 
-pub fn array_append(name: &str, items: Vec<String>) -> bool {
+pub fn array_append(name: &str, mut items: Vec<String>) -> bool {
     let _swap = crate::shell::RefSwap::enter(name);
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
+    if name == "region_highlight" {
+        items = crate::zle::refresh::normalize_region_highlight(items);
+    }
     let mut shell = SHELL.shell.lock().unwrap();
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
     if let Some(existing) = shell.assoc(name).cloned() {
+        let lvl = shell.param(name).map(|p| p.level).unwrap_or(0);
+        let added = assoc_from_items(items);
         let mut assoc = existing;
-        assoc.extend(assoc_from_items(items));
+        assoc.extend(added.clone());
         shell.store(name, Value::Assoc(assoc));
+        drop(shell);
+        crate::zgdbm::on_append_all(name, lvl, &added);
         return true;
     }
     let mut combined = match shell.param(name).map(|p| &p.value) {
@@ -1548,15 +1569,22 @@ pub fn array_set_subscript(name: &str, subscript: &str, value: String, append: b
     if !prepare_array_mutation(&mut shell, name) {
         return false;
     }
-    if let Some(assoc) = shell.assoc_mut(name) {
-        let new_value = if append {
-            let mut current = assoc.get(subscript).cloned().unwrap_or_default();
-            current.push_str(&value);
-            current
-        } else {
-            value
+    if shell.assoc(name).is_some() {
+        let lvl = shell.param(name).map(|p| p.level).unwrap_or(0);
+        let new_value = {
+            let assoc = shell.assoc_mut(name).unwrap();
+            let nv = if append {
+                let mut current = assoc.get(subscript).cloned().unwrap_or_default();
+                current.push_str(&value);
+                current
+            } else {
+                value
+            };
+            assoc.insert(subscript.to_string(), nv.clone());
+            nv
         };
-        assoc.insert(subscript.to_string(), new_value);
+        drop(shell);
+        crate::zgdbm::on_set_key(name, lvl, subscript, &new_value);
         return true;
     }
 
@@ -1660,6 +1688,20 @@ pub fn assoc_set(name: &str, key: &str, value: &str) {
 pub fn assoc_get(name: &str, key: &str) -> Option<String> {
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
+    let param_lvl = {
+        let shell = SHELL.shell.lock().unwrap();
+        shell.param(name).filter(|p| p.is_assoc()).map(|p| p.level)
+    };
+    if let Some(lvl) = param_lvl {
+        crate::zgdbm::on_read_refresh(name, lvl);
+    } else {
+        if name == "terminfo" && crate::modules::feature_available("p:terminfo") {
+            return crate::zle::refresh::refresh_term::terminfo_lookup(key);
+        }
+        if name == "termcap" && crate::modules::feature_available("p:termcap") {
+            return crate::zle::refresh::refresh_term::termcap_lookup(key);
+        }
+    }
     let shell = SHELL.shell.lock().unwrap();
     shell.assoc(name).and_then(|m| m.get(key).cloned())
 }
@@ -1667,6 +1709,28 @@ pub fn assoc_get(name: &str, key: &str) -> Option<String> {
 pub fn assoc_values(name: &str) -> Option<Vec<String>> {
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
+    let has_param = {
+        let shell = SHELL.shell.lock().unwrap();
+        shell.assoc(name).is_some()
+    };
+    if !has_param {
+        if name == "terminfo" && crate::modules::feature_available("p:terminfo") {
+            return Some(
+                crate::zle::refresh::refresh_term::terminfo_entries()
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect(),
+            );
+        }
+        if name == "termcap" && crate::modules::feature_available("p:termcap") {
+            return Some(
+                crate::zle::refresh::refresh_term::termcap_entries()
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .collect(),
+            );
+        }
+    }
     let keys = assoc_keys(name)?;
     let shell = SHELL.shell.lock().unwrap();
     let m = shell.assoc(name)?;
@@ -1680,6 +1744,30 @@ pub fn assoc_values(name: &str) -> Option<Vec<String>> {
 pub fn assoc_keys(name: &str) -> Option<Vec<String>> {
     let resolved = split_target(&resolve_ref(name)).0;
     let name = resolved.as_str();
+    let param_lvl = {
+        let shell = SHELL.shell.lock().unwrap();
+        shell.param(name).filter(|p| p.is_assoc()).map(|p| p.level)
+    };
+    if let Some(lvl) = param_lvl {
+        crate::zgdbm::on_read_refresh(name, lvl);
+    } else {
+        if name == "terminfo" && crate::modules::feature_available("p:terminfo") {
+            return Some(
+                crate::zle::refresh::refresh_term::terminfo_entries()
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect(),
+            );
+        }
+        if name == "termcap" && crate::modules::feature_available("p:termcap") {
+            return Some(
+                crate::zle::refresh::refresh_term::termcap_entries()
+                    .into_iter()
+                    .map(|(k, _)| k)
+                    .collect(),
+            );
+        }
+    }
     let shell = SHELL.shell.lock().unwrap();
     shell.assoc(name).map(|m| {
         let mut keys: Vec<String> = m.keys().cloned().collect();
@@ -1762,6 +1850,8 @@ pub fn push_scope() {
 }
 
 pub fn pop_scope() {
+    let popped_level = SHELL.shell.lock().unwrap().local_scopes.len();
+    crate::zgdbm::on_scope_pop(popped_level);
     let (changed, loop_errs) = SHELL.shell.lock().unwrap().pop_scope();
     if changed {
         crate::zle::termctl::cursor_form_param_changed();
@@ -2457,7 +2547,7 @@ fn color_code(name: &str) -> Option<u16> {
 
 fn color_fg(name: &str) -> String {
     if let Some((r, g, b)) = hex_color(name) {
-        return format!("\x1b[38;2;{};{};{}m", r, g, b);
+        return crate::zle::refresh::refresh_attr::prompt_hex_color(r, g, b, true);
     }
     match color_code(name) {
         Some(n) if n < 8 => format!("\x1b[{}m", 30 + n),
@@ -2469,7 +2559,7 @@ fn color_fg(name: &str) -> String {
 
 fn color_bg(name: &str) -> String {
     if let Some((r, g, b)) = hex_color(name) {
-        return format!("\x1b[48;2;{};{};{}m", r, g, b);
+        return crate::zle::refresh::refresh_attr::prompt_hex_color(r, g, b, false);
     }
     match color_code(name) {
         Some(n) if n < 8 => format!("\x1b[{}m", 40 + n),

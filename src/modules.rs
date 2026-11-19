@@ -151,6 +151,16 @@ const DESCS: &[ModDesc] = &[
         ]),
     },
     ModDesc {
+        name: "zsh/db/gdbm",
+        features: Some(&[
+            "b:ztie",
+            "b:zuntie",
+            "b:zgdbmpath",
+            "b:zgdbmclear",
+            "p:zgdbm_tied",
+        ]),
+    },
+    ModDesc {
         name: "zsh/langinfo",
         features: Some(&["p:langinfo"]),
     },
@@ -172,6 +182,15 @@ const DESCS: &[ModDesc] = &[
         features: Some(PARAMETER_FEATURES),
     },
     ModDesc {
+        name: "zsh/pcre",
+        features: Some(&[
+            "b:pcre_compile",
+            "b:pcre_match",
+            "b:pcre_study",
+            "C:pcre-match",
+        ]),
+    },
+    ModDesc {
         name: "zsh/random",
         features: Some(&["f:zrand_float", "f:zrand_int", "p:SRANDOM"]),
     },
@@ -186,6 +205,18 @@ const DESCS: &[ModDesc] = &[
     ModDesc {
         name: "zsh/stat",
         features: Some(&["b:stat", "b:zstat"]),
+    },
+    ModDesc {
+        name: "zsh/termcap",
+        features: Some(&["b:echotc", "p:termcap"]),
+    },
+    ModDesc {
+        name: "zsh/terminfo",
+        features: Some(&["b:echoti", "p:terminfo"]),
+    },
+    ModDesc {
+        name: "zsh/watch",
+        features: Some(&["b:log", "p:WATCH", "p:watch"]),
     },
     ModDesc {
         name: "zsh/system",
@@ -271,6 +302,9 @@ const STARTUP: &[(&str, &[&str], &[&str])] = &[
         &["p:widgets", "p:keymaps"],
         &["zsh/zle"],
     ),
+    ("zsh/termcap", &["b:echotc", "p:termcap"], &[]),
+    ("zsh/terminfo", &["b:echoti", "p:terminfo"], &[]),
+    ("zsh/watch", &["b:log", "p:WATCH", "p:watch"], &[]),
 ];
 
 // zsh -f has zsh/main loaded; Test/ztst.zsh also loads zsh/parameter.
@@ -608,6 +642,14 @@ pub fn builtin_zmodload(words: &[String]) -> i32 {
         if !crate::shell::array_set(&name, items) {
             ret = 1;
         }
+    }
+    if modules_param()
+        .get("zsh/db/gdbm")
+        .is_some_and(|s| s == "loaded")
+    {
+        crate::zgdbm::ensure_tied_param();
+    } else if ops.set.contains(&'u') && args.iter().any(|a| a == "zsh/db/gdbm") {
+        crate::zgdbm::on_unload_module();
     }
     ret
 }

@@ -1254,6 +1254,8 @@ pub fn set_subscripted(name: &str, sub: &str, v: &str, append: bool) -> Result<b
             Some(k) => crate::expand::assoc_key(k).map_err(|e| e.status)?,
             None => crate::expand::assoc_key(sub).map_err(|e| e.status)?,
         }
+    } else if let Some(r) = crate::expand::search_subscript_range(name, sub) {
+        r.map_err(|e| e.status)?
     } else {
         let idx = expand_string(sub).map_err(|e| e.status)?;
         match crate::arith::eval(&idx) {

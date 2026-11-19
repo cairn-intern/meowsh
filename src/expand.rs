@@ -2096,6 +2096,25 @@ fn param_value(name: &str, sub: Option<&str>) -> ExpResult<Val> {
         let key = expand_string(sub)?;
         return Ok(crate::zsystem::sysparam(&key).map_or(Val::Unset, Val::Str));
     }
+    // zsh/terminfo's $terminfo and zsh/termcap's $termcap.
+    if name == "terminfo"
+        && crate::modules::feature_available("p:terminfo")
+        && !with_shell(|s| s.assoc("terminfo").is_some())
+    {
+        let key = assoc_key(sub)?;
+        return Ok(
+            crate::zle::refresh::refresh_term::terminfo_lookup(&key).map_or(Val::Unset, Val::Str)
+        );
+    }
+    if name == "termcap"
+        && crate::modules::feature_available("p:termcap")
+        && !with_shell(|s| s.assoc("termcap").is_some())
+    {
+        let key = assoc_key(sub)?;
+        return Ok(
+            crate::zle::refresh::refresh_term::termcap_lookup(&key).map_or(Val::Unset, Val::Str)
+        );
+    }
     // zsh/parameter's $functions: a function's body as text.
     if name == "functions" && !with_shell(|s| s.assoc("functions").is_some()) {
         let key = expand_string(sub)?;

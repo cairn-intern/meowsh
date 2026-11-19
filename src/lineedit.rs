@@ -903,9 +903,6 @@ pub fn run_interactive() -> i32 {
             }
         },
     );
-    if !matches!(crate::exec::flow(), crate::types::Flow::Exit(_)) {
-        crate::sys::err_line("exit");
-    }
     status
 }
 
@@ -1032,9 +1029,6 @@ fn run_zle() -> i32 {
             }
         },
     );
-    if !matches!(crate::exec::flow(), crate::types::Flow::Exit(_)) {
-        crate::sys::err_line("exit");
-    }
     status
 }
 

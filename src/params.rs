@@ -138,6 +138,7 @@ pub const DEFAULT_TIES: &[(&str, &str)] = &[
     ("MODULE_PATH", "module_path"),
     ("MAILPATH", "mailpath"),
     ("FIGNORE", "fignore"),
+    ("WATCH", "watch"),
 ];
 
 pub fn split_tied(value: &str, sep: &str) -> Vec<String> {
