@@ -814,6 +814,17 @@ fn rprompt_is_drawn_at_the_right_edge() {
 }
 
 #[test]
+fn paste_after_quoted_insert_runs_the_line_as_drawn() {
+    // Ctrl-V, then a bracketed paste: the start marker used to stay in
+    // the word and fail as a bad pattern.
+    let out = on_terminal(
+        "PROMPT='> '\n",
+        "print -r -- A \x16\x1b[200~bio\x1b[201~ \"[ri\"\"ght]\"\r",
+    );
+    assert!(out.contains("A bio [right]"), "output: {:?}", out);
+}
+
+#[test]
 fn read_k_honours_its_timeout() {
     // The harness for zsh's ZLE tests waits this way between keys; it
     // used to block until the writer went away.

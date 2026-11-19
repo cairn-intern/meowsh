@@ -819,6 +819,13 @@ pub fn run_fd(fd: i32, prompts: bool) -> i32 {
     )
 }
 
+// A paste right after Ctrl-V (quoted insert) leaves the terminal's
+// start-of-paste marker in the line as text. The terminal swallows it when
+// the line is drawn, so the command would not be the one on screen.
+fn strip_paste_markers(line: &str) -> String {
+    line.replace("\x1b[200~", "").replace("\x1b[201~", "")
+}
+
 /// The interactive read-eval loop with line editing and history.
 pub fn run_interactive() -> i32 {
     // A terminal without cursor control gets plain line reading: the
@@ -881,7 +888,7 @@ pub fn run_interactive() -> i32 {
             crate::menu::reset();
             let line = rl.borrow_mut().readline(&prompt);
             match line {
-                Ok(line) => InputLine::Line(line + "\n"),
+                Ok(line) => InputLine::Line(strip_paste_markers(&line) + "\n"),
                 Err(ReadlineError::Interrupted) => InputLine::Interrupted,
                 Err(ReadlineError::Eof) => InputLine::Eof,
                 Err(err) => {
